@@ -131,6 +131,11 @@ pub const FEATURE_HASH_ALGO: u8 = 0x10;
 /// Emitted before the file body (and before any hash trailer). On non-unix
 /// platforms the encoder emits `n_attrs=0` so the format stays consistent.
 pub const FEATURE_XATTRS: u8 = 0x20;
+/// Delta pre-filter applied to the body stream between the archive and the
+/// compressor (cheap win on PCM / rasters). When set, the preamble carries
+/// an extra u8 `delta_stride` (1, 2, or 4) right before `dict_len`. Mutually
+/// exclusive with REP/SREP and with the PPMd backend (enforced by cmd_add).
+pub const FEATURE_DELTA: u8 = 0x40;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +224,7 @@ pub fn write_preamble<W: Write>(
     ppmd: Option<PpmdParams>,
     comment: Option<&str>,
     hash_algo: Option<HashAlgo>,
+    delta_stride: Option<u8>,
 ) -> Result<()> {
     w.write_all(MAGIC)?;
     w.write_u8(backend as u8)?;
@@ -236,6 +242,10 @@ pub fn write_preamble<W: Write>(
         let algo = hash_algo.ok_or_else(|| anyhow!("FEATURE_HASH_ALGO set without algo"))?;
         w.write_u8(algo as u8)?;
     }
+    if preproc & FEATURE_DELTA != 0 {
+        let s = delta_stride.ok_or_else(|| anyhow!("FEATURE_DELTA set without stride"))?;
+        w.write_u8(s)?;
+    }
     w.write_u32::<LittleEndian>(dict.len() as u32)?;
     if !dict.is_empty() {
         w.write_all(dict)?;
@@ -250,7 +260,7 @@ pub fn write_preamble<W: Write>(
 
 pub fn read_preamble<R: Read>(
     r: &mut R,
-) -> Result<(Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>)> {
+) -> Result<(Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>, Option<u8>)> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     if &buf != MAGIC {
@@ -276,6 +286,15 @@ pub fn read_preamble<R: Read>(
     } else {
         None
     };
+    let delta_stride = if preproc & FEATURE_DELTA != 0 {
+        let s = r.read_u8()?;
+        if !crate::delta::is_valid_stride(s) {
+            return Err(anyhow!("invalid delta stride {s} (expected 1, 2, or 4)"));
+        }
+        Some(s)
+    } else {
+        None
+    };
     let dict_len = r.read_u32::<LittleEndian>()? as usize;
     let mut dict = vec![0u8; dict_len];
     if dict_len > 0 {
@@ -288,7 +307,7 @@ pub fn read_preamble<R: Read>(
     } else {
         None
     };
-    Ok((backend, preproc, dict, ppmd, comment, hash_algo))
+    Ok((backend, preproc, dict, ppmd, comment, hash_algo, delta_stride))
 }
 
 /// Gather up to DICT_SAMPLES_CAP bytes of sample data from regular files in

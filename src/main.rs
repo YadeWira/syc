@@ -1,5 +1,6 @@
 mod archive;
 mod cli;
+mod delta;
 mod rep;
 mod srep;
 
@@ -624,6 +625,20 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     if opts.xattrs {
         preproc |= archive::FEATURE_XATTRS;
     }
+    if let Some(stride) = opts.delta {
+        if backend == Backend::Ppmd {
+            return Err(anyhow!("-delta is not supported with the PPMd backend"));
+        }
+        if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+            return Err(anyhow!(
+                "-delta cannot combine with REP/SREP (pass -nopreproc or drop -delta)"
+            ));
+        }
+        preproc |= archive::FEATURE_DELTA;
+        if !opts.summary {
+            eprintln!("delta   stride {}  (pre-filter before compressor)", stride);
+        }
+    }
     let ppmd_params = if backend == Backend::Ppmd {
         Some(pick_ppmd_params(opts.level))
     } else {
@@ -631,7 +646,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     };
     write_preamble(
         &mut bw, backend, preproc, &dict, ppmd_params,
-        opts.comment.as_deref(), hash_algo,
+        opts.comment.as_deref(), hash_algo, opts.delta,
     )?;
 
     let mut total_bytes: u64 = 0;
@@ -661,10 +676,19 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 let _ = enc.set_parameter(CParameter::SearchLog(10));
                 let _ = enc.set_parameter(CParameter::TargetLength(999));
             }
-            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
-            let bw = enc.finish()?;
-            let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
-            inner.flush()?;
+            if let Some(stride) = opts.delta {
+                let mut dw = delta::DeltaWriter::new(enc, stride);
+                pack_all(&mut dw, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = dw.finish()?;
+                let bw = enc.finish()?;
+                let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+                inner.flush()?;
+            } else {
+                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let bw = enc.finish()?;
+                let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+                inner.flush()?;
+            }
         }
         Backend::Lzma => {
             // BCJ selection order: -bcj CLI flag → SYC_BCJ env → auto-detect.
@@ -684,7 +708,13 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             }
             let stream = build_lzma_stream(opts.level, opts.threads, total_raw, bcj)?;
             let enc = xz2::write::XzEncoder::new_stream(bw, stream);
-            if preproc & PREPROC_SREP != 0 {
+            if let Some(stride) = opts.delta {
+                let mut dw = delta::DeltaWriter::new(enc, stride);
+                pack_all(&mut dw, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = dw.finish()?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
+            } else if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
                 pack_all(&mut pp, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = pp.finish()?;
@@ -833,7 +863,7 @@ fn cmd_add_append(
         .with_context(|| format!("open {}", archive.display()))?;
     let size_before = rd.metadata()?.len();
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (backend, preproc, dict, ppmd_params, existing_comment, hash_algo) =
+    let (backend, preproc, dict, ppmd_params, existing_comment, hash_algo, delta_stride) =
         read_preamble(&mut br)?;
     drop(br);
 
@@ -847,6 +877,12 @@ fn cmd_add_append(
         return Err(anyhow!(
             "-append: archive uses REP/SREP preprocessor; per-frame match \
              state would diverge. Repack without REP/SREP first."
+        ));
+    }
+    if delta_stride.is_some() {
+        return Err(anyhow!(
+            "-append: archive uses delta pre-filter; ring-buffer state would \
+             diverge across frames. Repack without -delta first."
         ));
     }
 
@@ -1190,7 +1226,7 @@ fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
 fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Option<String>, bool)> {
     let rd = open_input(archive)?;
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (backend, preproc, dict, ppmd, comment, hash_algo) = read_preamble(&mut br)?;
+    let (backend, preproc, dict, ppmd, comment, hash_algo, delta_stride) = read_preamble(&mut br)?;
     let has_xattrs = preproc & archive::FEATURE_XATTRS != 0;
     let raw: Box<dyn Read> = match backend {
         Backend::Zstd => {
@@ -1215,10 +1251,15 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
         }
     };
     // Both REP and SREP emit the same wire format, so RepReader handles both.
-    let dec: Box<dyn Read> = if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+    let pre_delta: Box<dyn Read> = if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
         Box::new(rep::RepReader::new(raw))
     } else {
         raw
+    };
+    let dec: Box<dyn Read> = if let Some(stride) = delta_stride {
+        Box::new(delta::DeltaReader::new(pre_delta, stride))
+    } else {
+        pre_delta
     };
     Ok((dec, hash_algo, comment, has_xattrs))
 }

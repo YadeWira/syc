@@ -236,6 +236,44 @@ fn roundtrip_append(level: &str, tag: &str) {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn roundtrip_delta(level: &str, stride: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    // 16-bit LE PCM sawtooth — realistic delta-2 target. Delta should
+    // reduce this to nearly-constant output, so LZMA crushes it.
+    let mut pcm = Vec::with_capacity(16 * 1024);
+    for i in 0..8192i32 {
+        let v: i16 = ((i * 37) & 0x7FFF) as i16;
+        pcm.extend_from_slice(&v.to_le_bytes());
+    }
+    write_file(&src.join("tone.raw"), &pcm);
+    // Also a non-PCM file to verify the filter doesn't corrupt heterogeneous
+    // data — only compression ratio suffers, correctness must hold.
+    write_file(&src.join("readme.txt"), b"hello, delta\n");
+
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level, "-delta", stride],
+        &[],
+    );
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    // Also test/list should decode cleanly through the DeltaReader.
+    run_syc(&["t", archive.to_str().unwrap()], &[]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_delta_zstd_s2() { roundtrip_delta("1", "2", "delta-zstd-s2"); }
+
+#[test]
+fn roundtrip_delta_lzma_s2() { roundtrip_delta("5", "2", "delta-lzma-s2"); }
+
+#[test]
+fn roundtrip_delta_lzma_s4() { roundtrip_delta("5", "4", "delta-lzma-s4"); }
+
 #[test]
 fn roundtrip_append_zstd() { roundtrip_append("1", "append-zstd"); }
 

@@ -33,6 +33,7 @@ pub struct Opts {
     pub hash: Option<String>,
     pub xattrs: bool,
     pub append: bool,
+    pub delta: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -222,6 +223,13 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "hash" => {
                     opts.hash = Some(arg_val(args, &mut i, flag)?.to_string());
                 }
+                "delta" => {
+                    let v: u8 = arg_val(args, &mut i, flag)?.parse()?;
+                    if !matches!(v, 1 | 2 | 4) {
+                        return Err(anyhow!("-delta: stride must be 1, 2, or 4 (got {v})"));
+                    }
+                    opts.delta = Some(v);
+                }
                 _ => return Err(anyhow!("unknown flag: -{flag}")),
             }
         } else {
@@ -300,6 +308,7 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -xattrs       preserve Linux extended attributes (user.*, etc.)
            -append       append a new compressed frame to an existing archive
                          (antiransomware: existing bytes are never rewritten)
+           -delta N      delta pre-filter stride (1|2|4), for PCM / rasters
            -nodict       force dict training off (opposite of -dict)
 
 Env      : SYC_BACKEND=ppmd   force PPMd7 (experimental, needs Dict/LZP)
