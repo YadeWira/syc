@@ -295,6 +295,15 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.10 — progress format zpaqfranz + spinner + flushing live ticker (2026-04-16)
+
+`src/progress.rs` reescrito:
+
+- Formato igual a `zpaqfranz.cpp:63480`: `       PCT.PP% HH:MM:SS  (done)=>(total) rate/s spin`. Sin label "pack"/"extract", percent con 2 decimales, paréntesis y `=>` flecha como zpaqfranz. Cuando `total == 0` (extract/test) percent colapsa a `--` y se omite el `=>`.
+- Spinner `|/-\` rota cada tick. Razón: aunque la ratio de rendering subió a 8 Hz (125 ms vs 250 ms), jobs sub-segundo todavía se sentían "estaticos" — el spinner garantiza percepción de movimiento incluso cuando los bytes apenas cambian entre frames.
+- `flushing()` ahora spawn-ea un thread que re-renderiza cada 125 ms con elapsed actualizado + spinner. Bug: el LZMA-MT `enc.finish()` con archivos grandes bloqueaba el main thread por minutos sin updates a la barra (input ya consumido, no más `advance()`); el ticker independiente mantiene la línea viva. Stop signalizado vía `Arc<AtomicBool>`, joineado en `finish()` y `Drop`.
+- Throttle subido a 8 Hz (era 4 Hz). zpaqfranz usa 1 Hz pero ahí se nota más estatica en jobs cortos.
+
 ## v0.1.9 — chunk rotation = zpaqfranz semantics + Drop announce (2026-04-16)
 
 **ChunkedWriter::write** ahora replica la mecánica de `myfwrite` en zpaqfranz (`zpaqfranz.cpp:44083`): escribe el buffer entero a la parte actual y rota DESPUÉS si `written_in_part > chunk_size`. Las partes terminan ligeramente más grandes que `-chunk SIZE` (por hasta un upstream-write, típicamente decenas/cientos de KiB), pero cada rotación cae en una frontera de write limpia en vez de partir un buffer al medio. Decisión del usuario: "no importa la exactitud", queremos clon de zpaqfranz.
