@@ -1,5 +1,6 @@
 mod archive;
 mod cli;
+mod color;
 mod delta;
 mod fastcdc;
 mod lzp;
@@ -25,10 +26,15 @@ use crate::cli::{Cmd, Opts};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Pre-scan before the parser runs so the banner honors -nocolor even on
+    // parse errors. Both spellings match zpaqfranz (`-nocolor`) and a terse
+    // alias (`-nc`).
+    let cli_nocolor = args.iter().any(|a| a == "-nocolor" || a == "-nc");
+    color::init(cli_nocolor);
     let cmd = match cli::parse(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("syc: {e}");
+            eprintln!("{}", color::r(&format!("syc: {e}")));
             std::process::exit(2);
         }
     };
@@ -85,7 +91,8 @@ fn main() {
         Err(_) => ("error", exec_error.as_deref()),
     };
     if let Err(e) = &res {
-        eprintln!("syc: {e:#}");
+        eprintln!("{}", color::r(&format!("syc: {e:#}")));
+        eprintln!("{}", color::r("(with errors)"));
     }
     if let (Some(cmd), Some(archive)) = (hook, archive_for_hook.as_ref()) {
         run_exec_hook(cmd, archive, status);
@@ -138,10 +145,11 @@ fn end_footer(elapsed: std::time::Duration, processed_bytes: u64) {
     };
     let rate_s = human_si(rate).replace(' ', "");
     eprintln!(
-        "{:.3}s ({},{}) (all OK)",
+        "{:.3}s ({},{}) {}",
         secs,
         hms(elapsed.as_secs()),
-        rate_s
+        rate_s,
+        color::g("(all OK)"),
     );
 }
 
@@ -1052,9 +1060,20 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             mbps,
         );
         eprintln!("Files added +{}", n_files);
+        // Tag the ratio green if it compressed well (<0.80), yellow if the
+        // data resisted compression (>=0.95). Mirrors zpaqfranz's list color
+        // signal for "this file didn't compress".
+        let ratio_s = format!("{:.3}", ratio);
+        let ratio_col = if ratio >= 0.95 {
+            color::y(&ratio_s)
+        } else if ratio < 0.80 {
+            color::g(&ratio_s)
+        } else {
+            ratio_s
+        };
         eprintln!(
-            "syc-l{}  backend {}  threads {}  ratio {:.3}",
-            opts.level, backend_name, opts.threads, ratio,
+            "syc-l{}  backend {}  threads {}  ratio {}",
+            opts.level, backend_name, opts.threads, ratio_col,
         );
     }
     end_footer(elapsed, total_bytes);
@@ -1952,7 +1971,8 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
             eu_num(total_bytes), eu_num(total_bytes), mbps,
         );
         eprintln!(
-            "VERDICT         : OK                   ({} stored vs decompressed)",
+            "VERDICT         : {}                   ({} stored vs decompressed)",
+            color::g("OK"),
             algo_name,
         );
         let _ = arc_size;

@@ -45,6 +45,7 @@ pub struct Opts {
     pub fastcdc: bool,
     pub snapshot: bool,
     pub noprogress: bool,
+    pub nocolor: bool,
 }
 
 #[derive(Debug)]
@@ -189,6 +190,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "dedup" => opts.dedup = true,
                 "fastcdc" => opts.fastcdc = true,
                 "snapshot" => opts.snapshot = true,
+                "nocolor" | "nc" => opts.nocolor = true,
                 "noprogress" | "noeta" => opts.noprogress = true,
                 "nolong" => opts.nolong = true,
                 "nopreproc" => opts.nopreproc = true,
@@ -296,12 +298,13 @@ fn arg_val<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str>
 /// zpaqfranz). Uses eprintln so it stays on stderr and won't contaminate
 /// piped archive streams.
 pub fn banner() {
-    eprintln!(
-        "syc v{VERSION}-zstd,lzma,ppmd,xattr,({BUILD_DATE})",
+    let line = format!(
+        "syc v{VERSION}-zstd,lzma,ppmd,xattr,HW xxh3/blake3,({BUILD_DATE})",
         VERSION = VERSION,
         BUILD_DATE = BUILD_DATE,
     );
-    eprintln!("Streaming archiver + compressor  (pure-ish Rust)");
+    eprintln!("{}", crate::color::g(&line));
+    eprintln!("Streaming archiver w/ dedup (pure-ish Rust)");
 }
 
 /// Full command index — printed by `syc h` (no args) or `syc` with no args.
@@ -346,6 +349,7 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          catches partial overlap, e.g. near-duplicate backups
            -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
                          falls back to live tree on unsupported FS or non-root
+           -nocolor      disable ANSI colors (alias: -nc; honors NO_COLOR env)
            -noprogress   suppress the progress bar (auto-off when stderr
                          isn't a TTY; alias: -noeta)
            -nodict       force dict training off (opposite of -dict)
