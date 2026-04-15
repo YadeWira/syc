@@ -23,11 +23,11 @@ Pre-built binaries on the [releases page](https://github.com/YadeWira/syc/releas
 Linux:
 
 ```sh
-tar xzf syc-v0.1.0-alpha-linux-x86_64.tar.gz
-./syc-v0.1.0-alpha-linux-x86_64 h
+chmod +x syc-0.1.6-linux-x86_64
+./syc-0.1.6-linux-x86_64 h
 ```
 
-Windows: download `syc-v0.1.0-alpha-windows-x86_64.exe`, run from `cmd` or
+Windows: download `syc-0.1.6-windows-x86_64.exe`, run from `cmd` or
 PowerShell.
 
 Or build from source (stable Rust, edition 2021):
@@ -57,9 +57,16 @@ Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
 ## Features
 
 **Backends**
-- `zstd` (default, levels 0–4) with multithread + long-range matching
-- `LZMA` (levels 5–10) via `xz2`, with auto-MT gate by corpus size
-- `PPMd7` opt-in: `SYC_BACKEND=ppmd`
+- `zstd` (default, levels 0–4) with long-range matching
+- `LZMA` (levels 5–10) via `xz2`
+- `PPMd7` opt-in: `SYC_BACKEND=ppmd` (single-threaded — model is sequential)
+
+**Threads**
+- Auto: when `-threads` is omitted **and** input ≥ 256 MiB, syc picks
+  `min(cores, 8)` and forwards to both zstd's MT path and the LZMA
+  `MtStreamBuilder`. zstd MT costs ~0.1% ratio; LZMA MT splits at 3× dict
+  per block (RAM cost: N × 128 MiB at default).
+- Manual: `-threads N`. `-threads 1` forces single-threaded.
 
 **Preprocessors** (applied between the archive body and the compressor)
 - **REP / SREP** — long-repeat finder, auto-enabled for corpora > 1 GiB
@@ -67,6 +74,9 @@ Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
   in the sample and applies x86 when the majority matches (`-bcj off` to skip,
   or pick explicitly)
 - **Delta** — `-delta N` (stride 1, 2, or 4) for PCM / raster data
+- **LZP** — `-lzp` context-hash predictor; pairs well with PPMd
+- **FastCDC** — `-fastcdc` content-defined chunking for cross-file dedup at
+  sub-file granularity
 
 **Archive modes**
 - `-append` — writes a new compressed frame to the end of an existing archive;
@@ -85,10 +95,12 @@ Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
   `xxh3` is fastest; `crc32` is smallest. `-nochecksum` to skip.
 
 **Metadata**
-- Unix mode preserved, symlinks preserved.
+- Unix mode preserved, symlinks preserved, mtime restored on extract.
 - Linux extended attributes with `-xattrs` (`user.*` / `system.*` /
   `security.*`).
 - Archive-level `-comment TEXT`, shown by `syc l`.
+- Optional `-snapshot` takes a btrfs / zfs read-only snapshot before walking
+  the tree (silent fallback to the live tree on unsupported FS).
 
 **Solid / dict**
 - Solid sort groups files by `(kind, extension, parent dir, size, path)` so
@@ -102,6 +114,15 @@ Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
 - `-chunk N_MiB` — split output into `archive.001`, `.002`, …
 - Pipe support: `-` as archive path reads from stdin / writes to stdout
 - `-exec_ok CMD` / `-exec_error CMD` hooks
+
+**UX (zpaqfranz-flavored)**
+- Live progress bar (4 Hz, stderr, auto-off without a TTY): `pack 42% ETA
+  00:01:13  720 MB of 1.75 GB  450 MB/s`. Disable with `-noprogress`. After
+  100% it switches to `flushing...` while the encoder finalizes.
+- Numbered red errors (`00042! …`) and yellow warnings (`00042: …`) with a
+  count footer.
+- Atomic write: pack streams to `<archive>.tmp` and renames on success.
+  Cancelled runs leave the `.tmp` behind; the final name is never half-written.
 
 ## Commands
 
