@@ -1,0 +1,8 @@
+/target
+# Test fixtures (pesados, no en git)
+/test-files.tar
+/test-files2.tar
+# Binarios de referencia local
+/Arc.exe
+# Archivos de probe / scratch
+/_probe.txt

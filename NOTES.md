@@ -1,0 +1,249 @@
+# syc — bitácora del proyecto
+
+Compresor/archivador en Rust, optimizado para hardware modesto
+(AMD A8-6600K, 4 cores, 7 GiB RAM, Debian 13).
+
+## Estado actual: v0.2.0 — dict training + long mode + solid sort
+
+### Misiones encaradas (en orden cronológico)
+
+1. **Empatar a `zstd + tar`** — logrado: ganamos ratio (~17% mejor) y velocidad
+   de compresión; descompresión ~6% debajo (cerrable con buffers más grandes).
+2. **Ganar a FreeArc/ARC.exe en ratio + descompresión** — objetivo actual.
+   - Descompresión: ✅ **12× más rápido** que ARC en todos los niveles
+   - Ratio: 🚧 ganamos -m1, -m2, -m3, -m4. Perdiendo por ~6-12% vs -m5, -mx.
+
+### Decisiones de diseño
+
+- **Formato propio `SYC2`** (antes `SYC1`): `[magic 4B][u32 dict_len][dict bytes][zstd stream]`.
+  El stream es un solid: concatenación de `[header][body]...` comprimida de
+  corrido. Sin índice final → unpack streaming puro, sin seek.
+- **Compresión**: zstd (crate `zstd` 0.13 con features `zstdmt` + `zdict_builder`).
+  - Long-range matching (`window_log=27`, 128 MiB) **por defecto** — encuentra
+    matches entre archivos (análogo al REP de FreeArc).
+  - Flag `-nolong` para desactivar (si se prioriza RAM baja en decomp).
+- **Solid sort** (idea 7-zip/RAR): antes de streamear, ordenamos entradas por
+  `(KindRank, extensión, tamaño, path)`. Archivos similares quedan contiguos
+  → mejor compartición del diccionario móvil de zstd. `sort_by_cached_key`
+  para evitar N·log(N) syscalls.
+- **Dict training opcional** (`-dict`): entrena un zstd-dict con muestras del
+  input (hasta 16 MiB totales, ≤256 KiB por archivo) y lo embebe en la preamble.
+  Mejora 15-30% en datasets de muchos archivos pequeños similares.
+  Descompresión: **igual de rápida** (dict se carga 1 vez al abrir).
+  No siempre ayuda (archivos grandes/variados pierden vs el costo de ~110 KiB
+  del dict) → opt-in.
+- **Buffers**: CHUNK = 256 KiB, IO_BUF = 1 MiB (`BufReader`/`BufWriter`).
+- **Seguridad**: `sanitize_rel` rechaza paths absolutos y `..` al desempacar.
+- **Symlinks/permisos Unix** preservados.
+
+### CLI (inspirada en zpaqfranz)
+
+Parser propio (`src/cli.rs`), **sin dependencia de clap**.
+
+```
+Core : a, x, l, t
+Info : h, v
+```
+
+- `syc a <archive> <src...> [-level N] [-threads N] [-dict] [-store] ...`
+- `syc x <archive> -to <dir> [-force] [-summary] [-verbose]`
+- `syc l <archive> [-find TEXT] [-summary]`
+- `syc t <archive> [-verbose]`
+
+Switches: `-level N`, `-threads N`, `-to DIR`, `-find TEXT`,
+`-verbose`, `-summary`, `-force`, `-store`, `-nochecksum`,
+`-nosort` (desactiva solid sort), `-dict` (activa dict training),
+`-nolong` (desactiva long-range matching).
+
+### Benchmarks
+
+#### vs ARC.exe (FreeArc 0.67.1 vía wine), dataset `/usr/share/doc/python3.13` (68.2 MiB, 1502 archivos)
+
+| Método | Ratio | Decomp speed |
+|--------|-------|--------------|
+| ARC -m1 | 0.228 | 24.0 MiB/s |
+| ARC -m2 | 0.173 | — |
+| ARC -m3 | 0.166 | 21.1 MiB/s |
+| ARC -m4 | 0.162 | — |
+| ARC -m5 | 0.146 | 8.4 MiB/s |
+| ARC -m6..m9 | 0.139 | ~7.4 MiB/s (plateau) |
+| **ARC -mx (tope)** | **0.139** | 7.3 MiB/s |
+| syc -l3  (long) | 0.202 | 220 MiB/s |
+| syc -l9  (long) | 0.183 | 227 MiB/s |
+| syc -l15 (long) | 0.172 | 227 MiB/s |
+| syc -l19 (long) | 0.155 | 207 MiB/s (48s comp, inviable) |
+
+→ **Descompresión: 12-38× más rápido que ARC.**
+→ **Ratio: ganamos hasta ARC -m4; perdemos ~6% vs -m5, ~12% vs -mx.**
+
+#### vs `tar + zstd` (para referencia), dataset `/usr/share/doc` (412 MiB, 54k archivos)
+
+| Modo | syc (long+sort) | tar+zstd | Δ |
+|------|-----------------|----------|---|
+| l3/j4 | 0.204, 150 MiB/s | 0.243, 186 MiB/s | syc ratio +17% |
+| l9/j4 | 0.184, 57 MiB/s | 0.224, 80 MiB/s | syc ratio +18% |
+| l19/j4 | 0.155 | 0.211 | syc ratio +27% |
+
+### Escala de niveles 0..10 (v0.3.0)
+
+Se remapeó la escala de syc de `1..22` (crudo de zstd) a `0..10` — más
+cercana a la de ARC (`m1..m9`). Default: `-l5`.
+
+| syc | zstd | Ratio  | Tiempo | Gana vs ARC |
+|-----|------|--------|--------|-------------|
+| l0  | -5   | 0.2774 | 0.34s  | — (draft/rápido) |
+| l1  |  1   | 0.2142 | 0.35s  | m1 |
+| l2  |  3   | 0.2020 | 0.43s  | m1 |
+| l3  |  5   | 0.1940 | 0.65s  | m1 |
+| l4  |  7   | 0.1860 | 0.86s  | m1 |
+| l5  |  9   | 0.1826 | 1.16s  | m1 (default, sweet spot) |
+| l6  | 11   | 0.1788 | 2.60s  | m1 |
+| l7  | 13   | 0.1748 | 3.84s  | m1 |
+| l8  | 15   | 0.1720 | 7.44s  | m1, **m2** |
+| l9  | 17   | 0.1644 | 14.08s | m1, m2, **m3** |
+| l10 | 19   | 0.1546 | 48.68s | m1, m2, m3, **m4** |
+
+**m5 (0.146) queda fuera de alcance con backend zstd** — brecha estructural:
+ARC usa LZMA/PPMD, syc usa zstd puro. Cerrar el gap requeriría cambiar
+backend, lo que rompería el formato SYC2 y mataría la ventaja de decomp (24-33× más rápido que ARC).
+
+### Ideas que no funcionaron (documentado para no repetir)
+
+- **BufReader en cadena sobre el Decoder de zstd**: doble buffer → más memcpy,
+  descompresión **más lenta** (196→175 MiB/s). Revertido.
+- **Dict training siempre activo**: en datasets de archivos grandes y variados
+  (python docs, avg 46 KiB/archivo), el dict (~110 KiB) es overhead neto.
+  Pasa a **opt-in** (`-dict`).
+- **Sort sin cachear la key**: `sort_by` llama `symlink_metadata` 2× por
+  comparación → 860k syscalls en un dataset de 54k entradas. Fix:
+  `sort_by_cached_key`.
+
+### Dependencias
+- `zstd` 0.13 + features `zstdmt` + `zdict_builder`
+- `walkdir` 2.5
+- `anyhow` 1.0
+- `byteorder` 1.5
+- `crc32fast` 1.5 (reservado, aún no cableado)
+
+### Pendientes para cerrar el último gap vs ARC -m5/-mx
+
+- [ ] **Chunk-level dedup (FastCDC)**: idea de restic/borg/zpaqfranz. Quita
+      redundancia inter-archivo antes del compresor. Dominante cuando hay
+      versiones de los mismos datos.
+- [ ] **BCJ/exe filter** para binarios ELF/PE (idea LZMA2/7z). Transforma
+      jumps relativos → absolutos para mejor compresión.
+- [ ] **Delta filter** para WAV/multimedia (idea FreeArc mm).
+- [ ] **Per-extension routing**: zstd para texto, compresor distinto para
+      multimedia. Hoy usamos zstd para todo.
+- [ ] **Dict adaptativo**: entrenar, hacer trial-compress sobre sample,
+      guardar sólo si mejora neta. Evita el regression observado en python3.13.
+- [ ] Checksum CRC32 por archivo.
+- [ ] Tests de integración en `tests/`.
+- [ ] **Port Dict (FreeArc)**: substitución de palabras inglesas comunes.
+      Probablemente 3–5% de mejora en texto (lo que separa `0.1479` de `0.139`).
+      1439 líneas C++ en `/tmp/freearc-ref/Compression/Dict/dict.cpp`.
+- [ ] **Port LZP (FreeArc)**: predictor largo alcance. ~323 líneas C++ en
+      `/tmp/freearc-ref/Compression/LZP/C_LZP.cpp`. Complementario a Dict.
+
+### Estado al 2026-04-15 (bench limpio, `bench_arc.sh`, re-confirmado post BCJ)
+
+**Ratio sobre `python3.13` docs (71 MiB, 1502 archivos):**
+
+| Nivel | syc ratio | ARC ratio | Veredicto ratio |
+|-------|-----------|-----------|-----------------|
+| l1/m1 | 0.214     | 0.228     | ✅ syc −6%      |
+| l3/m3 | 0.155     | 0.166     | ✅ syc −7%      |
+| l5/m5 | 0.148     | 0.146     | ❌ syc +1.3%    |
+| l9/m9 | 0.148     | 0.139     | ❌ syc +6.5%    |
+
+- Ganamos ratio hasta `m4`. A partir de `m5` ARC activa su preset de texto
+  (`dict + lzp + ppmd`) y nos saca ventaja.
+- `l5..l10` saturan en `0.1479` — LZMA puro al máximo no basta.
+
+**Velocidad compresión (MiB/s sobre mismos datos):**
+
+| Nivel | syc   | ARC  | ventaja syc |
+|-------|-------|------|-------------|
+| l1/m1 | 207   | 19   | 10.9× más rápido |
+| l3/m3 | 1.5   | 18   | ARC 12×  (ARC usa su preset rápido; syc l3 = zstd l19 que es lento) |
+| l5/m5 | 1.5   | 6.7  | ARC 4.5× (xz preset 9 single-thread en 71 MiB, el gate MT no se activa por ser chico) |
+
+**Velocidad descompresión (nuestra gran ventaja):**
+
+| Nivel | syc MiB/s | ARC MiB/s | ventaja syc |
+|-------|-----------|-----------|-------------|
+| l1/m1 | 213       | 22        | **9.7×**    |
+| l3/m3 | 207       | 20        | **10.4×**   |
+| l5/m5 | 124       | 8         | **14.9×**   |
+| l9/m9 | 129       | 7         | **17.9×**   |
+
+- Descompresión syc es dominante en todos los niveles (~10–18× ARC).
+- La rapidez sale de: zstd para niveles bajos; xz decoder liblzma (C) single-threaded pero con window_log corto y sin stages de Dict/LZP que sí tendría que invertir ARC.
+
+**Big bench `test-files.tar` (2.29 GB):**
+- `l5` sin preproc, t=1: ratio 0.6652, 1363s
+- `l5` con SREP, t=1:    ratio 0.6603
+- `l5` con SREP + MT (t=4, auto): ratio **0.6604**, **461s** (2.96× más rápido, mismo ratio)
+- SREP ahorra ~11 MB (0.5%). Heurística actualizada: `>1 GiB → SREP`, si no → nada. REP quedó deshabilitado por default: en subset 200 MiB aparece 0.1% peor y 35% más lento (el dict LZMA de 128 MiB ya hace ese trabajo).
+
+**Level table test-files.tar (2.29 GB, tar de binarios, con MT auto):**
+
+| Nivel | Ratio | Tiempo |
+|-------|-------|--------|
+| l1    | 0.7980 | 11s  |
+| l3    | 0.6823 | 435s |
+| l5    | 0.6604 | 456s |
+| l9    | 0.6599 | 666s |
+
+- l5 casi empata con l9 (0.6604 vs 0.6599), 45% más rápido → l5 es el sweet-spot en datos binarios grandes.
+- l1 (zstd) baseline brutalmente rápido pero ratio de ~0.80.
+
+**LZMA multi-thread (nuevo 2026-04-15):**
+Activado automáticamente con `-threads >1` cuando `total_raw ≥ 2 × block_size`
+(`block_size = 3 × dict` por default, override vía `SYC_LZMA_BLOCK_MIB`).
+- python docs 71 MiB: gate lo mantiene single-thread → ratio 0.1479 intacto
+- subset 200 MiB: gate lo mantiene single-thread (no daña ratio)
+- subset 600 MiB: t=1 → 0.6598 en 372s; t=4 → 0.6601 en 149s (**2.5× más rápido**, 0.05% ratio)
+- Rationale: MT parte el stream en bloques independientes; cada bloque reinicia el estado LZMA → hit pequeño al ratio. Gate en `2 × block_size` garantiza que datasets que caben en un solo bloque no pierden nada.
+
+**PPMd7 (via `ppmd-rust 1.4`):**
+- Backend integrado pero **opt-in** vía `SYC_BACKEND=ppmd`. Razón: PPMd solo
+  no supera a LZMA tuneado en este dataset (0.1487 @ order=16/mem=512M vs
+  LZMA 0.1479). La ventaja real viene de Dict+LZP+PPMd combinados (receta
+  FreeArc `m5t`/`m9t`), aún sin portar. Plumbing listo para cuando lleguen.
+
+**Formato actualizado:**
+- Preamble ahora incluye `(u8 order, u32 mem_mb)` al final cuando `backend = 2` (Ppmd).
+- `Backend::Ppmd = 2` añadido al enum. Compatible con archivos SYC4 anteriores
+  mientras el backend no sea Ppmd.
+
+**BCJ filter (2026-04-15):**
+- Selección: `-bcj TYPE` CLI flag → `SYC_BCJ=...` env → **auto-detect**.
+  Tipos: `x86|arm|armt|ia64|sparc|off`.
+- Sin cambio de formato: xz block header guarda el filter chain → decoder
+  re-descubre la cadena automáticamente al desempacar.
+- Auto-detect (solo LZMA backend): samplea hasta 64 archivos regulares,
+  cuenta los que empiezan con ELF x86/x86_64 (magic + e_machine 0x03/0x3E)
+  o PE (`MZ`); si ≥30 % → `Bcj::X86`. Con ≥4 samples mínimo (evita disparar
+  en inputs tiny).
+- Medición directorio ELF (120 binarios de `/usr/bin`, 24 MiB, l5):
+  - auto / `-bcj x86`: `ratio 0.2591`, 14.4s
+  - `-bcj off`:        `ratio 0.2689`, 15.5s → **−3.6 % tamaño, −7 % tiempo**
+- Medición texto (python docs 71 MiB, l5):
+  - auto no dispara (samples no son ELF): `ratio 0.14787`, 46.4s — intacto.
+- Roundtrip verificado (integration test `roundtrip_lzma_bcj_x86`).
+
+### Cómo compilar / ejecutar
+
+```bash
+. "$HOME/.cargo/env"
+cargo build --release
+./target/release/syc a data.syc ./mydir -level 19 -threads 4 -summary
+./target/release/syc x data.syc -to ./restored
+./target/release/syc t data.syc
+```
+
+### Benchmark harness
+
+- `bench.sh <dir>` — syc vs tar+zstd (compresión + descompresión)
+- `bench_arc.sh <dir>` — syc vs ARC.exe (FreeArc vía wine), -m1..-m9 + -mx

@@ -1,0 +1,233 @@
+//! End-to-end roundtrip tests: archive then extract, verify contents match.
+//! Exercises each backend (zstd, lzma, ppmd) and the REP/SREP preprocessors
+//! via the actual CLI binary so format changes can't silently diverge.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn syc_bin() -> PathBuf {
+    // cargo sets CARGO_BIN_EXE_<name> for binaries declared in the package.
+    PathBuf::from(env!("CARGO_BIN_EXE_syc"))
+}
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    p.push(format!("syc-test-{tag}-{pid}-{nanos}"));
+    let _ = fs::remove_dir_all(&p);
+    fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn write_file(path: &Path, bytes: &[u8]) {
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p).unwrap();
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+fn make_fixture(root: &Path) {
+    write_file(&root.join("hello.txt"), b"Hello, world!\n");
+    // Several sizes to exercise chunking, plus repetitive content to exercise
+    // the compressors.
+    let filler: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+    write_file(&root.join("nested/a.bin"), &filler);
+    let repeated: Vec<u8> = b"abcdefgh".repeat(4096);
+    write_file(&root.join("nested/deep/b.bin"), &repeated);
+    // Empty file and a zero-filled one.
+    write_file(&root.join("empty"), b"");
+    write_file(&root.join("zeros.bin"), &vec![0u8; 65537]);
+}
+
+fn assert_same_tree(a: &Path, b: &Path) {
+    let mut entries_a = Vec::new();
+    let mut entries_b = Vec::new();
+    walk(a, a, &mut entries_a);
+    walk(b, b, &mut entries_b);
+    entries_a.sort();
+    entries_b.sort();
+    assert_eq!(entries_a, entries_b, "directory listings differ");
+    for (rel, kind, size) in &entries_a {
+        if *kind == 'f' {
+            let fa = fs::read(a.join(rel)).unwrap();
+            let fb = fs::read(b.join(rel)).unwrap();
+            assert_eq!(fa.len() as u64, *size);
+            assert_eq!(fa, fb, "content mismatch for {}", rel.display());
+        }
+    }
+}
+
+fn walk(base: &Path, here: &Path, out: &mut Vec<(PathBuf, char, u64)>) {
+    for entry in fs::read_dir(here).unwrap() {
+        let entry = entry.unwrap();
+        let p = entry.path();
+        let rel = p.strip_prefix(base).unwrap().to_path_buf();
+        let md = fs::symlink_metadata(&p).unwrap();
+        if md.is_dir() {
+            out.push((rel.clone(), 'd', 0));
+            walk(base, &p, out);
+        } else if md.file_type().is_symlink() {
+            out.push((rel, 'l', 0));
+        } else {
+            out.push((rel, 'f', md.len()));
+        }
+    }
+}
+
+fn run_syc(args: &[&str], envs: &[(&str, &str)]) {
+    let mut cmd = Command::new(syc_bin());
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn syc");
+    assert!(
+        out.status.success(),
+        "syc {:?} failed: stderr={}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn roundtrip_at_level(level: &str, envs: &[(&str, &str)], tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+
+    run_syc(
+        &[
+            "a",
+            archive.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-level",
+            level,
+            "-threads",
+            "2",
+        ],
+        envs,
+    );
+    run_syc(
+        &["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()],
+        &[],
+    );
+    // Archive stores `src` as a directory; extraction writes it under dst.
+    assert_same_tree(&src, &dst);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_zstd_l1() {
+    roundtrip_at_level("1", &[], "zstd-l1");
+}
+
+#[test]
+fn roundtrip_zstd_l4() {
+    roundtrip_at_level("4", &[], "zstd-l4");
+}
+
+#[test]
+fn roundtrip_lzma_l5() {
+    roundtrip_at_level("5", &[], "lzma-l5");
+}
+
+#[test]
+fn roundtrip_ppmd_l7() {
+    roundtrip_at_level("7", &[("SYC_BACKEND", "ppmd")], "ppmd-l7");
+}
+
+fn roundtrip_hash(algo: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", "1", "-hash", algo],
+        &[],
+    );
+    run_syc(&["t", archive.to_str().unwrap()], &[]);
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn roundtrip_xattrs() {
+    let root = tmp_root("xattrs");
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+    // Set a user.* xattr on one file. Skip the test (don't fail) if the
+    // filesystem rejects it — some CI containers run on tmpfs without
+    // xattr support.
+    let attr_path = src.join("hello.txt");
+    if xattr::set(&attr_path, "user.syc_test", b"roundtrip").is_err() {
+        eprintln!("xattrs not supported on this fs; skipping");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", "1", "-xattrs"],
+        &[],
+    );
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    let got = xattr::get(dst.join("hello.txt"), "user.syc_test")
+        .expect("getxattr after extract")
+        .expect("xattr missing after extract");
+    assert_eq!(got, b"roundtrip");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_hash_crc32() { roundtrip_hash("crc32", "hash-crc32"); }
+
+#[test]
+fn roundtrip_hash_xxh3() { roundtrip_hash("xxh3", "hash-xxh3"); }
+
+#[test]
+fn roundtrip_hash_blake3() { roundtrip_hash("blake3", "hash-blake3"); }
+
+#[test]
+fn roundtrip_lzma_bcj_x86() {
+    // SYC_BCJ=x86 inserts a BCJ filter before LZMA2. xz stores the filter
+    // chain in the block header, so the decoder rediscovers it without needing
+    // the env var at extract time.
+    roundtrip_at_level("5", &[("SYC_BCJ", "x86")], "lzma-bcj-x86");
+}
+
+#[test]
+fn roundtrip_store() {
+    let root = tmp_root("store");
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+
+    run_syc(
+        &[
+            "a",
+            archive.to_str().unwrap(),
+            src.to_str().unwrap(),
+            "-store",
+        ],
+        &[],
+    );
+    run_syc(
+        &["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()],
+        &[],
+    );
+    assert_same_tree(&src, &dst);
+    let _ = fs::remove_dir_all(&root);
+}

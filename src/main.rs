@@ -1,0 +1,1237 @@
+mod archive;
+mod cli;
+mod rep;
+mod srep;
+
+use anyhow::{anyhow, Context, Result};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use crate::archive::{
+    collect_entries, gather_samples, pack_entry, read_preamble, solid_sort, train_dict,
+    unpack_entry, write_preamble, Backend, EntryHasher, EntryHeader, EntryKind, HashAlgo,
+    PpmdParams, CHUNK,
+    PREPROC_REP, PREPROC_SREP,
+};
+use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder};
+use crate::cli::{Cmd, Opts};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = match cli::parse(args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("syc: {e}");
+            std::process::exit(2);
+        }
+    };
+    let (archive_for_hook, exec_ok, exec_error) = match &cmd {
+        Cmd::Add { archive, opts, .. }
+        | Cmd::Extract { archive, opts }
+        | Cmd::List { archive, opts }
+        | Cmd::Test { archive, opts } => (
+            Some(archive.clone()),
+            opts.exec_ok.clone(),
+            opts.exec_error.clone(),
+        ),
+        Cmd::Compare { left, opts, .. } => (
+            Some(left.clone()),
+            opts.exec_ok.clone(),
+            opts.exec_error.clone(),
+        ),
+        Cmd::Dedupe { root, opts } => (
+            Some(root.clone()),
+            opts.exec_ok.clone(),
+            opts.exec_error.clone(),
+        ),
+        Cmd::Verify { archive, opts, .. } => (
+            Some(archive.clone()),
+            opts.exec_ok.clone(),
+            opts.exec_error.clone(),
+        ),
+        _ => (None, None, None),
+    };
+    let res = match cmd {
+        Cmd::Banner => {
+            cli::banner();
+            Ok(())
+        }
+        Cmd::Help { topic } => {
+            cli::help(topic);
+            Ok(())
+        }
+        Cmd::Add { archive, sources, opts } => cmd_add(archive, sources, opts),
+        Cmd::Extract { archive, opts } => cmd_extract(archive, opts),
+        Cmd::List { archive, opts } => cmd_list(archive, opts),
+        Cmd::Test { archive, opts } => cmd_test(archive, opts),
+        Cmd::Compare { left, right, opts } => cmd_compare(left, right, opts),
+        Cmd::Dedupe { root, opts } => cmd_dedupe(root, opts),
+        Cmd::Verify { archive, source, opts } => cmd_verify(archive, source, opts),
+    };
+    let (status, hook) = match &res {
+        Ok(()) => ("ok", exec_ok.as_deref()),
+        Err(_) => ("error", exec_error.as_deref()),
+    };
+    if let Err(e) = &res {
+        eprintln!("syc: {e:#}");
+    }
+    if let (Some(cmd), Some(archive)) = (hook, archive_for_hook.as_ref()) {
+        run_exec_hook(cmd, archive, status);
+    }
+    if res.is_err() {
+        std::process::exit(1);
+    }
+}
+
+/// Filter walked entries in-place per -exclude / -minsize / -maxsize /
+/// -datefrom / -dateto. Exclude patterns match as case-sensitive substrings
+/// against the relative path. Size and date filters only apply to regular
+/// files — dirs and symlinks pass.
+fn apply_selectors(all: &mut Vec<(PathBuf, PathBuf)>, opts: &Opts) {
+    if opts.exclude.is_empty()
+        && opts.minsize.is_none()
+        && opts.maxsize.is_none()
+        && opts.datefrom.is_none()
+        && opts.dateto.is_none()
+    {
+        return;
+    }
+    let needs_meta = opts.minsize.is_some()
+        || opts.maxsize.is_some()
+        || opts.datefrom.is_some()
+        || opts.dateto.is_some();
+    all.retain(|(full, rel)| {
+        let rel_s = rel.to_string_lossy();
+        for pat in &opts.exclude {
+            if rel_s.contains(pat.as_str()) {
+                return false;
+            }
+        }
+        if needs_meta {
+            match std::fs::symlink_metadata(full) {
+                Ok(m) if m.is_file() => {
+                    let sz = m.len();
+                    if let Some(mn) = opts.minsize { if sz < mn { return false; } }
+                    if let Some(mx) = opts.maxsize { if sz > mx { return false; } }
+                    if opts.datefrom.is_some() || opts.dateto.is_some() {
+                        let mtime = m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        if let Some(from) = opts.datefrom { if mtime < from { return false; } }
+                        if let Some(to)   = opts.dateto   { if mtime > to   { return false; } }
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    });
+}
+
+/// Read additional source paths from a file (one per line, blank lines and
+/// lines starting with '#' ignored).
+fn load_filelist(path: &Path) -> Result<Vec<PathBuf>> {
+    let s = std::fs::read_to_string(path)
+        .with_context(|| format!("read filelist {}", path.display()))?;
+    Ok(s.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(PathBuf::from)
+        .collect())
+}
+
+fn run_exec_hook(shell_cmd: &str, archive: &Path, status: &str) {
+    let sh = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(shell_cmd)
+        .env("SYC_ARCHIVE", archive.as_os_str())
+        .env("SYC_STATUS", status)
+        .status();
+    if let Err(e) = sh {
+        eprintln!("syc: exec hook failed: {e}");
+    }
+}
+
+/// Walk a directory and fingerprint every regular file as (size, crc32).
+/// Symlinks and dirs are indexed with size 0, crc32 0 — presence matters only.
+fn index_dir(root: &Path) -> Result<std::collections::HashMap<PathBuf, (u64, u32)>> {
+    use std::collections::HashMap;
+    let root_abs = root.canonicalize().with_context(|| format!("canonicalize {}", root.display()))?;
+    let mut map: HashMap<PathBuf, (u64, u32)> = HashMap::new();
+    for entry in walkdir::WalkDir::new(&root_abs).follow_links(false) {
+        let entry = entry?;
+        let rel = match entry.path().strip_prefix(&root_abs) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = entry.path().symlink_metadata()?;
+        if meta.is_file() {
+            let mut h = crc32fast::Hasher::new();
+            let mut f = BufReader::with_capacity(archive::IO_BUF, File::open(entry.path())?);
+            let mut buf = [0u8; CHUNK];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            map.insert(rel, (meta.len(), h.finalize()));
+        } else {
+            map.insert(rel, (0, 0));
+        }
+    }
+    Ok(map)
+}
+
+fn cmd_compare(left: PathBuf, right: PathBuf, opts: Opts) -> Result<()> {
+    let started = Instant::now();
+    let a = index_dir(&left)?;
+    let b = index_dir(&right)?;
+    let mut only_a: Vec<&PathBuf> = Vec::new();
+    let mut only_b: Vec<&PathBuf> = Vec::new();
+    let mut differing: Vec<&PathBuf> = Vec::new();
+    let mut same: u64 = 0;
+    for (k, v) in &a {
+        match b.get(k) {
+            None => only_a.push(k),
+            Some(v2) if v2 != v => differing.push(k),
+            Some(_) => same += 1,
+        }
+    }
+    for k in b.keys() {
+        if !a.contains_key(k) {
+            only_b.push(k);
+        }
+    }
+    only_a.sort();
+    only_b.sort();
+    differing.sort();
+    if opts.verbose {
+        for p in &only_a     { println!("<  {}", p.display()); }
+        for p in &only_b     { println!(">  {}", p.display()); }
+        for p in &differing  { println!("!= {}", p.display()); }
+    }
+    let status = if only_a.is_empty() && only_b.is_empty() && differing.is_empty() {
+        "match"
+    } else {
+        "diff"
+    };
+    eprintln!(
+        "{}  only<A {}  only>B {}  differ {}  match {}  [{:.2}s]",
+        status,
+        only_a.len(),
+        only_b.len(),
+        differing.len(),
+        same,
+        started.elapsed().as_secs_f64()
+    );
+    if status == "diff" {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// Build the per-part path for -chunk output: base becomes base.001, .002, ...
+fn part_path(base: &Path, n: u32) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(format!(".{:03}", n));
+    PathBuf::from(s)
+}
+
+/// Rotating-file writer for -chunk. Emits base.001, .002, ... of `chunk_size`
+/// bytes each. The compressed stream is just split byte-for-byte — concat the
+/// parts back and you get the original archive.
+struct ChunkedWriter {
+    base: PathBuf,
+    part: u32,
+    current: File,
+    written_in_part: u64,
+    chunk_size: u64,
+}
+
+impl ChunkedWriter {
+    fn new(base: PathBuf, chunk_size: u64) -> std::io::Result<Self> {
+        let path = part_path(&base, 1);
+        let current = File::create(&path)?;
+        Ok(Self { base, part: 1, current, written_in_part: 0, chunk_size })
+    }
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.current.flush()?;
+        self.part += 1;
+        self.current = File::create(part_path(&self.base, self.part))?;
+        self.written_in_part = 0;
+        Ok(())
+    }
+}
+
+impl Write for ChunkedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written_in_part >= self.chunk_size {
+            self.rotate()?;
+        }
+        let room = (self.chunk_size - self.written_in_part) as usize;
+        let to_write = buf.len().min(room);
+        let n = self.current.write(&buf[..to_write])?;
+        self.written_in_part += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.current.flush() }
+}
+
+/// Reader that transparently concatenates base.001, .002, ... when the plain
+/// base path doesn't exist.
+struct ChunkedReader {
+    base: PathBuf,
+    part: u32,
+    current: Option<BufReader<File>>,
+}
+
+impl ChunkedReader {
+    fn open(base: PathBuf) -> Result<Self> {
+        let path = part_path(&base, 1);
+        let f = File::open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        Ok(Self { base, part: 1, current: Some(BufReader::with_capacity(archive::IO_BUF, f)) })
+    }
+    fn advance(&mut self) -> std::io::Result<()> {
+        self.part += 1;
+        let path = part_path(&self.base, self.part);
+        if path.exists() {
+            self.current = Some(BufReader::with_capacity(archive::IO_BUF, File::open(path)?));
+        } else {
+            self.current = None;
+        }
+        Ok(())
+    }
+}
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.current.as_mut() {
+                None => return Ok(0),
+                Some(r) => {
+                    let n = r.read(buf)?;
+                    if n > 0 { return Ok(n); }
+                    self.advance()?;
+                }
+            }
+        }
+    }
+}
+
+/// Open the archive path for writing. Path "-" means stdout. If chunk_mib is
+/// set, output is split into archive.001, .002, ... (stdout + chunk is an error).
+fn open_output(archive: &Path, chunk_mib: Option<u64>) -> Result<Box<dyn Write>> {
+    if archive.as_os_str() == "-" {
+        if chunk_mib.is_some() {
+            return Err(anyhow!("-chunk cannot be combined with stdout (`-`)"));
+        }
+        return Ok(Box::new(std::io::stdout().lock()));
+    }
+    if let Some(mib) = chunk_mib {
+        let chunk_size = mib.saturating_mul(1024 * 1024).max(1);
+        Ok(Box::new(ChunkedWriter::new(archive.to_path_buf(), chunk_size)?))
+    } else {
+        Ok(Box::new(
+            File::create(archive).with_context(|| format!("create {}", archive.display()))?,
+        ))
+    }
+}
+
+/// Open the archive path for reading. Path "-" means stdin. If the plain path
+/// is missing but `archive.001` exists, concatenate the parts transparently.
+fn open_input(archive: &Path) -> Result<Box<dyn Read>> {
+    if archive.as_os_str() == "-" {
+        return Ok(Box::new(std::io::stdin().lock()));
+    }
+    if archive.exists() {
+        return Ok(Box::new(
+            File::open(archive).with_context(|| format!("open {}", archive.display()))?,
+        ));
+    }
+    let first = part_path(archive, 1);
+    if first.exists() {
+        return Ok(Box::new(ChunkedReader::open(archive.to_path_buf())?));
+    }
+    Err(anyhow!("archive not found: {} (nor {})", archive.display(), first.display()))
+}
+
+fn is_stream_path(archive: &Path) -> bool {
+    archive.as_os_str() == "-"
+}
+
+fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
+    let started = Instant::now();
+    let source_abs = source
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", source.display()))?;
+    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    if let Some(c) = comment.as_deref() {
+        if !opts.summary { eprintln!("comment {}", c); }
+    }
+    let mut buf = vec![0u8; CHUNK];
+    let mut live = vec![0u8; CHUNK];
+    let mut checked: u64 = 0;
+    let mut mismatches: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+        if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
+        if opts.verbose {
+            eprintln!("? {}", header.path);
+        }
+        match header.kind {
+            EntryKind::File => {
+                let live_path = source_abs.join(&header.path);
+                let mut live_f = match File::open(&live_path) {
+                    Ok(f) => Some(BufReader::with_capacity(archive::IO_BUF, f)),
+                    Err(_) => {
+                        eprintln!("miss {}", header.path);
+                        mismatches += 1;
+                        None
+                    }
+                };
+                let mut remaining = header.size;
+                total_bytes += remaining;
+                let mut hasher = hash_algo.map(EntryHasher::new);
+                let mut this_mismatch = false;
+                while remaining > 0 {
+                    let want = remaining.min(buf.len() as u64) as usize;
+                    dec.read_exact(&mut buf[..want])?;
+                    if let Some(h) = hasher.as_mut() { h.update(&buf[..want]); }
+                    if let Some(lf) = live_f.as_mut() {
+                        if lf.read_exact(&mut live[..want]).is_err() || live[..want] != buf[..want] {
+                            this_mismatch = true;
+                            live_f = None;
+                        }
+                    }
+                    remaining -= want as u64;
+                }
+                if let (Some(h), Some(algo)) = (hasher, hash_algo) {
+                    let tb = algo.trailer_bytes();
+                    let mut stored = [0u8; 32];
+                    dec.read_exact(&mut stored[..tb])?;
+                    let mut computed = [0u8; 32];
+                    h.finalize_into(&mut computed[..tb]);
+                    if stored[..tb] != computed[..tb] {
+                        return Err(anyhow!("{} mismatch on {} (archive corruption)", algo.name(), header.path));
+                    }
+                }
+                if let Some(mut lf) = live_f {
+                    let mut tail = [0u8; 1];
+                    if lf.read(&mut tail)? > 0 {
+                        this_mismatch = true;
+                    }
+                }
+                if this_mismatch {
+                    eprintln!("diff {}", header.path);
+                    mismatches += 1;
+                }
+                checked += 1;
+            }
+            EntryKind::Dir | EntryKind::Symlink => {
+                // Presence-only check for non-file entries.
+                let live_path = source_abs.join(&header.path);
+                if !live_path.exists() && live_path.symlink_metadata().is_err() {
+                    eprintln!("miss {}", header.path);
+                    mismatches += 1;
+                }
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    if mismatches == 0 {
+        eprintln!(
+            "verify OK  {} files, {:.2} MiB matched  [{:.2}s]",
+            checked,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            elapsed.as_secs_f64()
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "verify FAIL  {} mismatches out of {} files  [{:.2}s]",
+            mismatches, checked, elapsed.as_secs_f64()
+        );
+        std::process::exit(2);
+    }
+}
+
+fn cmd_dedupe(root: PathBuf, opts: Opts) -> Result<()> {
+    use std::collections::HashMap;
+    let started = Instant::now();
+    let root_abs = root.canonicalize().with_context(|| format!("canonicalize {}", root.display()))?;
+    // First pass: group candidates by size (so we only hash collisions)
+    let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    for entry in walkdir::WalkDir::new(&root_abs).follow_links(false) {
+        let entry = entry?;
+        let meta = entry.path().symlink_metadata()?;
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        by_size.entry(meta.len()).or_default().push(entry.path().to_path_buf());
+    }
+    // Second pass: hash each size-collision group
+    let mut groups: HashMap<(u64, u32), Vec<PathBuf>> = HashMap::new();
+    let mut total_files: u64 = 0;
+    for (size, paths) in &by_size {
+        total_files += paths.len() as u64;
+        if paths.len() < 2 {
+            continue;
+        }
+        for p in paths {
+            let mut h = crc32fast::Hasher::new();
+            let mut f = BufReader::with_capacity(archive::IO_BUF, File::open(p)?);
+            let mut buf = [0u8; CHUNK];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            groups.entry((*size, h.finalize())).or_default().push(p.clone());
+        }
+    }
+    let mut dup_groups: u64 = 0;
+    let mut dup_files: u64 = 0;
+    let mut wasted: u64 = 0;
+    let mut sorted_keys: Vec<_> = groups.iter().filter(|(_, v)| v.len() >= 2).collect();
+    sorted_keys.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+    for ((size, _crc), paths) in sorted_keys {
+        let mut paths = paths.clone();
+        paths.sort();
+        dup_groups += 1;
+        dup_files += paths.len() as u64 - 1;
+        wasted += size * (paths.len() as u64 - 1);
+        if opts.verbose {
+            println!("dup  size={}  n={}", size, paths.len());
+            for (i, p) in paths.iter().enumerate() {
+                let tag = if i == 0 { "keep" } else { "dupe" };
+                println!("  {}  {}", tag, p.display());
+            }
+        }
+    }
+    eprintln!(
+        "scanned {} files, {} dup-groups, {} redundant files, {:.2} MiB wasted  [{:.2}s]",
+        total_files, dup_groups, dup_files,
+        wasted as f64 / (1024.0 * 1024.0),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
+    let started = Instant::now();
+
+    if !(0..=10).contains(&opts.level) {
+        return Err(anyhow!("level must be 0..=10 (got {})", opts.level));
+    }
+
+    let mut all: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for src in &sources {
+        all.extend(collect_entries_or_single(src)?);
+    }
+    if let Some(fl) = opts.filelist.as_deref() {
+        for src in load_filelist(fl)? {
+            all.extend(collect_entries_or_single(&src)?);
+        }
+    }
+    let before = all.len();
+    apply_selectors(&mut all, &opts);
+    let skipped = before - all.len();
+    if skipped > 0 && !opts.summary {
+        eprintln!("filter  {} entries skipped (exclude/minsize/maxsize)", skipped);
+    }
+    if !opts.nosort {
+        solid_sort(&mut all);
+    }
+
+    let backend = pick_backend(opts.level, opts.store);
+
+    let total_raw: u64 = all
+        .iter()
+        .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+
+    // Dict is opt-in via `-dict` (we don't auto-enable). In solid mode the
+    // zstd stream already sees all shared templates inline, so a precomputed
+    // dict is redundant at best and net-negative at worst (measured: +5..10 %
+    // output on /usr/include at L1 and L4, both slower). Keep the flag for
+    // experimentation and for future non-solid modes. Size adapts to corpus:
+    // a 110 KiB dict is dead weight on a 4 MiB archive.
+    let want_dict = backend == Backend::Zstd && !opts.store && !opts.nodict && opts.dict;
+    let dict: Vec<u8> = if want_dict {
+        let samples = gather_samples(&all)?;
+        let target = archive::adaptive_dict_target(total_raw);
+        let d = train_dict(&samples, target);
+        if !d.is_empty() && !opts.summary {
+            eprintln!("dict    {} KiB trained from {} samples (target {})",
+                d.len() / 1024, samples.len(), target);
+        }
+        d
+    } else {
+        Vec::new()
+    };
+
+    let is_stream = is_stream_path(&archive);
+    let is_chunked = opts.chunk_mib.is_some() && !is_stream;
+    let mut bw = BufWriter::with_capacity(archive::IO_BUF, open_output(&archive, opts.chunk_mib)?);
+    // Pick preprocessor based on size:
+    //   <128 MiB  → none (LZMA's 128 MiB dict already covers it)
+    //   128 MiB..512 MiB → REP (catches shorter repeats too, hash still sparse)
+    //   >512 MiB  → SREP (block-sampled, scales to multi-GB without saturating)
+    // REP/SREP only pay off when long repeats live beyond LZMA's 128 MiB
+    // dict. Measurements on test-files.tar subsets (2026-04-15):
+    //   200 MiB — REP adds ~0.1% to ratio and 35% to time (net loss)
+    //   2.3 GiB — SREP saves 0.5% (net win)
+    // So default to no preproc unless the input is clearly beyond reach of
+    // LZMA's dict.
+    let preproc_eligible = matches!(backend, Backend::Lzma | Backend::Ppmd);
+    let mut preproc: u8 = if opts.nopreproc || !preproc_eligible {
+        0
+    } else if total_raw > 1024 * 1024 * 1024 {
+        PREPROC_SREP
+    } else {
+        0
+    };
+    // Per-file hash is default-on (crc32); -nochecksum disables it, -hash
+    // picks xxh3/blake3 (or crc32 explicitly).
+    let hash_algo: Option<HashAlgo> = if opts.nochecksum {
+        None
+    } else {
+        Some(parse_hash_algo(opts.hash.as_deref())?)
+    };
+    if hash_algo.is_some() {
+        preproc |= archive::FEATURE_CRC32;
+        if !matches!(hash_algo, Some(HashAlgo::Crc32)) {
+            preproc |= archive::FEATURE_HASH_ALGO;
+        }
+    }
+    if opts.comment.is_some() {
+        preproc |= archive::FEATURE_COMMENT;
+    }
+    if opts.xattrs {
+        preproc |= archive::FEATURE_XATTRS;
+    }
+    let ppmd_params = if backend == Backend::Ppmd {
+        Some(pick_ppmd_params(opts.level))
+    } else {
+        None
+    };
+    write_preamble(
+        &mut bw, backend, preproc, &dict, ppmd_params,
+        opts.comment.as_deref(), hash_algo,
+    )?;
+
+    let mut total_bytes: u64 = 0;
+    let mut n_entries: u64 = 0;
+
+    match backend {
+        Backend::Zstd => {
+            let zlevel = if opts.store { 0 } else { map_zstd_level(opts.level) };
+            let mut enc = if dict.is_empty() {
+                zstd::stream::Encoder::new(bw, zlevel)?
+            } else {
+                zstd::stream::Encoder::with_dictionary(bw, zlevel, &dict)?
+            };
+            if opts.threads > 0 {
+                let _ = enc.multithread(opts.threads);
+            }
+            let _ = enc.include_checksum(true);
+            if !opts.nolong {
+                let _ = enc.window_log(27);
+                let _ = enc.long_distance_matching(true);
+            }
+            if opts.level >= 4 && !opts.store {
+                use zstd::zstd_safe::CParameter;
+                let _ = enc.set_parameter(CParameter::Strategy(zstd::zstd_safe::Strategy::ZSTD_btultra2));
+                let _ = enc.set_parameter(CParameter::ChainLog(28));
+                let _ = enc.set_parameter(CParameter::HashLog(27));
+                let _ = enc.set_parameter(CParameter::SearchLog(10));
+                let _ = enc.set_parameter(CParameter::TargetLength(999));
+            }
+            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            let bw = enc.finish()?;
+            let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+            inner.flush()?;
+        }
+        Backend::Lzma => {
+            // BCJ selection order: -bcj CLI flag → SYC_BCJ env → auto-detect.
+            // Worth ~3–4% on x86 binary tarballs, neutral on text.
+            let bcj = if let Some(s) = opts.bcj.as_deref() {
+                parse_bcj(s.trim())
+                    .ok_or_else(|| anyhow!("-bcj: unknown filter '{s}' (x86|arm|armt|ia64|sparc|ppc|off)"))?
+            } else {
+                match std::env::var("SYC_BCJ") {
+                    Ok(v) => parse_bcj(v.trim())
+                        .ok_or_else(|| anyhow!("SYC_BCJ: unknown filter '{v}' (x86|arm|armt|ia64|sparc|ppc|off)"))?,
+                    Err(_) => auto_detect_bcj(&all),
+                }
+            };
+            if bcj != Bcj::None && !opts.summary {
+                eprintln!("bcj     {:?}  (auto)", bcj);
+            }
+            let stream = build_lzma_stream(opts.level, opts.threads, total_raw, bcj)?;
+            let enc = xz2::write::XzEncoder::new_stream(bw, stream);
+            if preproc & PREPROC_SREP != 0 {
+                let mut pp = srep::SrepWriter::new(enc);
+                pack_all(&mut pp, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = pp.finish()?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
+            } else if preproc & PREPROC_REP != 0 {
+                let mut rep = rep::RepWriter::new(enc);
+                pack_all(&mut rep, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = rep.finish()?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
+            } else {
+                let mut enc = enc;
+                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
+            }
+        }
+        Backend::Ppmd => {
+            let p = ppmd_params.expect("ppmd params");
+            let mem_bytes = (p.mem_mb as u32).saturating_mul(1024 * 1024);
+            let enc = Ppmd7Encoder::new(bw, p.order as u32, mem_bytes)
+                .map_err(|e| anyhow!("ppmd init: {e}"))?;
+            if preproc & PREPROC_SREP != 0 {
+                let mut pp = srep::SrepWriter::new(enc);
+                pack_all(&mut pp, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = pp.finish()?;
+                let mut inner = enc.finish(true)?;
+                inner.flush()?;
+            } else if preproc & PREPROC_REP != 0 {
+                let mut rep = rep::RepWriter::new(enc);
+                pack_all(&mut rep, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let enc = rep.finish()?;
+                let mut inner = enc.finish(true)?;
+                inner.flush()?;
+            } else {
+                let mut enc = enc;
+                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let mut inner = enc.finish(true)?;
+                inner.flush()?;
+            }
+        }
+    }
+
+    let out_size = if is_stream {
+        0
+    } else if is_chunked {
+        let mut total = 0u64;
+        let mut n = 1u32;
+        loop {
+            let p = part_path(&archive, n);
+            match std::fs::metadata(&p) {
+                Ok(m) => { total += m.len(); n += 1; }
+                Err(_) => break,
+            }
+        }
+        total
+    } else {
+        std::fs::metadata(&archive)?.len()
+    };
+    let elapsed = started.elapsed();
+    let ratio = if total_bytes > 0 {
+        out_size as f64 / total_bytes as f64
+    } else {
+        0.0
+    };
+    let mbps = if elapsed.as_secs_f64() > 0.0 {
+        (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    let dict_info = if dict.is_empty() {
+        "no-dict".to_string()
+    } else {
+        format!("dict {} B", dict.len())
+    };
+    let out_display = if is_stream {
+        "stream".to_string()
+    } else if is_chunked {
+        format!("{:.2} MiB across parts", out_size as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} MiB", out_size as f64 / (1024.0 * 1024.0))
+    };
+    let ratio_display = if is_stream { "?".to_string() } else { format!("{:.3}", ratio) };
+    if opts.summary {
+        eprintln!(
+            "{} entries {:.2} MiB -> {} (ratio {}) {:.2}s {:.1} MiB/s [{}]",
+            n_entries,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            out_display,
+            ratio_display,
+            elapsed.as_secs_f64(),
+            mbps,
+            dict_info
+        );
+    } else {
+        eprintln!("added   {} entries", n_entries);
+        eprintln!("in      {:.2} MiB", total_bytes as f64 / (1024.0 * 1024.0));
+        eprintln!(
+            "out     {}   (ratio {})",
+            out_display,
+            ratio_display
+        );
+        eprintln!(
+            "time    {:.2} s    ({:.1} MiB/s)",
+            elapsed.as_secs_f64(),
+            mbps
+        );
+        let backend_name = match backend {
+            Backend::Zstd => "zstd",
+            Backend::Lzma => "lzma",
+            Backend::Ppmd => "ppmd",
+        };
+        eprintln!("syc-l{}  backend {}  threads {}  [{}]", opts.level, backend_name, opts.threads, dict_info);
+    }
+    Ok(())
+}
+
+/// Which backend to use for a given syc level.
+/// l0..l4 use zstd (fast decomp, enough ratio to beat ARC m1-m4).
+/// l5..l10 default to LZMA (higher ratio).
+/// Set `SYC_BACKEND=ppmd` to force PPMd7 (experimental, usually loses to
+/// tuned LZMA until Dict/LZP preprocessors land — kept for future combo).
+fn pick_backend(syc_level: i32, store: bool) -> Backend {
+    if store || syc_level <= 4 {
+        return Backend::Zstd;
+    }
+    match std::env::var("SYC_BACKEND").ok().as_deref() {
+        Some("ppmd") => Backend::Ppmd,
+        Some("zstd") => Backend::Zstd,
+        _ => Backend::Lzma,
+    }
+}
+
+/// PPMd7 params per syc level. Order drives ratio (higher = more context,
+/// diminishing returns past ~8 for typical text). Memory caps the context
+/// tree; FreeArc's `m9t` preset uses ~192 MiB at order 12.
+fn pick_ppmd_params(syc_level: i32) -> PpmdParams {
+    let (order, mem_mb) = match syc_level {
+        7 => (8, 128),
+        8 => (10, 192),
+        9 => (12, 192),
+        _ => (16, 256), // l10
+    };
+    let order = env_u32("SYC_PPMD_ORDER", order as u32).clamp(2, 16) as u8;
+    let mem_mb = env_u32("SYC_PPMD_MEM_MB", mem_mb as u32).max(1);
+    PpmdParams { order, mem_mb }
+}
+
+/// Map syc level (0..=4) to zstd level. Each tier must beat ARC mN on the
+/// python3.13 docs benchmark. See NOTES.md.
+fn map_zstd_level(syc_level: i32) -> i32 {
+    match syc_level {
+        0 => -5, // draft
+        1 => 1,  // vs ARC m1 (0.228)  → 0.2142
+        2 => 15, // vs ARC m2 (0.173)  → 0.1720
+        3 => 19, // vs ARC m3 (0.166)  → 0.1546
+        4 => 19, // vs ARC m4 (0.162)  → 0.1507 (con ULTRA)
+        _ => 9,
+    }
+}
+
+/// Build a custom LZMA2 stream tuned per-level. Base preset is 9|EXTREME,
+/// then we override for text: lc=4, lp=0, pb=0, nice_len=273, dict grande.
+const LZMA_PRESET_EXTREME: u32 = 1 << 31;
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// BCJ filter kind for the xz filter chain. `None` means no BCJ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bcj {
+    None,
+    X86,
+    Arm,
+    ArmThumb,
+    Ia64,
+    Sparc,
+    PowerPc,
+}
+
+fn parse_hash_algo(s: Option<&str>) -> Result<HashAlgo> {
+    match s.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("crc32") | Some("crc") => Ok(HashAlgo::Crc32),
+        Some("xxh3") | Some("xxhash3") => Ok(HashAlgo::Xxh3),
+        Some("blake3") | Some("b3") => Ok(HashAlgo::Blake3),
+        Some(other) => Err(anyhow!("-hash: unknown algo '{other}' (crc32|xxh3|blake3)")),
+    }
+}
+
+fn parse_bcj(s: &str) -> Option<Bcj> {
+    match s {
+        "" | "off" | "none" | "0" => Some(Bcj::None),
+        "x86" => Some(Bcj::X86),
+        "arm" => Some(Bcj::Arm),
+        "armt" | "arm_thumb" => Some(Bcj::ArmThumb),
+        "ia64" => Some(Bcj::Ia64),
+        "sparc" => Some(Bcj::Sparc),
+        "powerpc" | "ppc" => Some(Bcj::PowerPc),
+        _ => None,
+    }
+}
+
+/// Auto-detect whether BCJ x86 is worthwhile. Samples up to 64 regular files
+/// in the pack list, peeking the first 20 bytes. Counts x86/x86_64 ELF hits
+/// (magic 7F 45 4C 46 + e_machine 0x3E or 0x03) and PE 'MZ' hits. Returns
+/// `Bcj::X86` when ≥30 % of non-empty samples look like x86 executables.
+fn auto_detect_bcj(all: &[(PathBuf, PathBuf)]) -> Bcj {
+    let mut hits: u32 = 0;
+    let mut samples: u32 = 0;
+    let mut buf = [0u8; 20];
+    for (full, _) in all.iter().take(64) {
+        let meta = match std::fs::symlink_metadata(full) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() || meta.len() < 20 {
+            continue;
+        }
+        let mut f = match File::open(full) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if f.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        samples += 1;
+        // ELF magic then e_machine at offset 0x12 (little-endian u16)
+        if &buf[0..4] == b"\x7FELF" {
+            let em = u16::from_le_bytes([buf[0x12], buf[0x13]]);
+            if em == 0x3E || em == 0x03 {
+                hits += 1;
+                continue;
+            }
+        }
+        // PE / MS-DOS stub — fuzzy but most .exe/.dll start with MZ and are x86
+        if buf[0] == b'M' && buf[1] == b'Z' {
+            hits += 1;
+        }
+    }
+    if samples >= 4 && hits * 10 >= samples * 3 {
+        Bcj::X86
+    } else {
+        Bcj::None
+    }
+}
+
+fn build_lzma_stream(syc_level: i32, threads: u32, total_raw: u64, bcj: Bcj) -> Result<xz2::stream::Stream> {
+    use xz2::stream::{Check, Filters, LzmaOptions, MtStreamBuilder, Stream};
+    let mut opts = LzmaOptions::new_preset(9 | LZMA_PRESET_EXTREME)?;
+    // Text-tuned defaults; env vars let the sweep harness override.
+    let lc = env_u32("SYC_LC", 4);
+    let lp = env_u32("SYC_LP", 0);
+    let pb = env_u32("SYC_PB", 0);
+    let nice = env_u32("SYC_NICE", 273);
+    opts.literal_context_bits(lc);
+    opts.literal_position_bits(lp);
+    opts.position_bits(pb);
+    opts.nice_len(nice);
+    let default_dict: u32 = match syc_level {
+        5 | 6 => 64 * 1024 * 1024,
+        _ => 128 * 1024 * 1024,
+    };
+    let dict = env_u32("SYC_DICT", default_dict);
+    opts.dict_size(dict);
+    let mut filters = Filters::new();
+    // Optional BCJ pre-filter for executable data (transforms relative jumps →
+    // absolute so LZMA sees repeating patterns). Decoder rediscovers the chain
+    // from the xz block header, so no format change needed.
+    match bcj {
+        Bcj::None => {}
+        Bcj::X86 => { filters.x86(); }
+        Bcj::Arm => { filters.arm(); }
+        Bcj::ArmThumb => { filters.arm_thumb(); }
+        Bcj::Ia64 => { filters.ia64(); }
+        Bcj::Sparc => { filters.sparc(); }
+        Bcj::PowerPc => { filters.powerpc(); }
+    }
+    filters.lzma2(&opts);
+
+    // Multithreaded: splits the stream into independent blocks — each block
+    // restarts the LZMA state, so ratio is slightly worse but compression
+    // scales near-linearly with cores. Only enable when the input is big
+    // enough that at least a couple of blocks get parallelism AND splitting
+    // won't tank the ratio (measured: python docs 71 MB → 4% ratio loss;
+    // test-files.tar 200 MB subset → 0.1% loss, 2.3× faster).
+    let block_bytes_default = (dict as u64).saturating_mul(3);
+    let block_bytes = env_u32("SYC_LZMA_BLOCK_MIB", 0);
+    let block_bytes = if block_bytes > 0 {
+        (block_bytes as u64) * 1024 * 1024
+    } else {
+        block_bytes_default
+    };
+    // At least 2× block_bytes of input → worth splitting. Otherwise single
+    // thread (preserves ratio, which is why we picked LZMA in the first place).
+    let mt_eligible = threads > 1 && total_raw >= block_bytes.saturating_mul(2);
+    if mt_eligible {
+        MtStreamBuilder::new()
+            .threads(threads)
+            .block_size(block_bytes)
+            .filters(filters)
+            .check(Check::Crc64)
+            .encoder()
+            .map_err(|e| anyhow!("lzma mt init: {e:?}"))
+    } else {
+        Stream::new_stream_encoder(&filters, Check::Crc64).map_err(|e| anyhow!("lzma init: {e:?}"))
+    }
+}
+
+fn pack_all<W: Write>(
+    enc: &mut W,
+    all: &[(PathBuf, PathBuf)],
+    opts: &Opts,
+    hash_algo: Option<HashAlgo>,
+    total_bytes: &mut u64,
+    n_entries: &mut u64,
+) -> Result<()> {
+    let mut buf = vec![0u8; CHUNK];
+    for (full, rel) in all {
+        if opts.verbose {
+            eprintln!("+ {}", rel.display());
+        }
+        pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs)?;
+        if let Ok(meta) = std::fs::symlink_metadata(full) {
+            if meta.is_file() {
+                *total_bytes += meta.len();
+            }
+        }
+        *n_entries += 1;
+    }
+    Ok(())
+}
+
+fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("stat {}", src.display()))?;
+    if meta.is_dir() {
+        collect_entries(src)
+    } else {
+        let rel = src
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("file"));
+        Ok(vec![(src.to_path_buf(), rel)])
+    }
+}
+
+fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Option<String>, bool)> {
+    let rd = open_input(archive)?;
+    let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
+    let (backend, preproc, dict, ppmd, comment, hash_algo) = read_preamble(&mut br)?;
+    let has_xattrs = preproc & archive::FEATURE_XATTRS != 0;
+    let raw: Box<dyn Read> = match backend {
+        Backend::Zstd => {
+            let d = if dict.is_empty() {
+                zstd::stream::Decoder::with_buffer(br)?
+            } else {
+                zstd::stream::Decoder::with_dictionary(br, &dict)?
+            };
+            Box::new(d)
+        }
+        Backend::Lzma => Box::new(xz2::read::XzDecoder::new(br)),
+        Backend::Ppmd => {
+            let p = ppmd.ok_or_else(|| anyhow!("ppmd backend missing params"))?;
+            let mem_bytes = (p.mem_mb as u32).saturating_mul(1024 * 1024);
+            let d = Ppmd7Decoder::new(br, p.order as u32, mem_bytes)
+                .map_err(|e| anyhow!("ppmd init: {e}"))?;
+            Box::new(d)
+        }
+    };
+    // Both REP and SREP emit the same wire format, so RepReader handles both.
+    let dec: Box<dyn Read> = if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+        Box::new(rep::RepReader::new(raw))
+    } else {
+        raw
+    };
+    Ok((dec, hash_algo, comment, has_xattrs))
+}
+
+fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
+    let out = opts
+        .to
+        .clone()
+        .ok_or_else(|| anyhow!("x: -to DIR is required"))?;
+    let started = Instant::now();
+    std::fs::create_dir_all(&out)?;
+    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    if let Some(c) = comment.as_deref() { if !opts.summary { eprintln!("comment {}", c); } }
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut n_entries: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+        if matches!(header.kind, EntryKind::File) {
+            total_bytes += header.size;
+        }
+        if opts.verbose {
+            eprintln!("- {}", header.path);
+        }
+        unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs)?;
+        n_entries += 1;
+    }
+
+    let mut sink = [0u8; 1024];
+    while dec.read(&mut sink)? > 0 {}
+
+    let elapsed = started.elapsed();
+    if opts.summary {
+        eprintln!(
+            "{} entries {:.2} MiB in {:.2}s",
+            n_entries,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            elapsed.as_secs_f64()
+        );
+    } else {
+        eprintln!("extracted {} entries", n_entries);
+        eprintln!(
+            "bytes     {:.2} MiB",
+            total_bytes as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!("time      {:.2} s", elapsed.as_secs_f64());
+        eprintln!("dest      {}", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
+    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    if let Some(c) = comment.as_deref() {
+        if opts.summary {
+            eprintln!("comment: {}", c);
+        } else {
+            println!("# comment: {}", c);
+        }
+    }
+
+    let mut buf = vec![0u8; CHUNK];
+    let needle = opts.find.as_deref().map(|s| s.to_lowercase());
+    let mut n_entries: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+        if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
+        let show = match &needle {
+            Some(t) => header.path.to_lowercase().contains(t),
+            None => true,
+        };
+        if matches!(header.kind, EntryKind::File) {
+            total_bytes += header.size;
+        }
+        n_entries += 1;
+        if show && !opts.summary {
+            let kind = match header.kind {
+                EntryKind::File => "f",
+                EntryKind::Dir => "d",
+                EntryKind::Symlink => "l",
+            };
+            println!(
+                "{} {:>12} {:o} {}",
+                kind,
+                header.size,
+                header.mode & 0o7777,
+                header.path
+            );
+        }
+        if matches!(header.kind, EntryKind::File) {
+            let mut remaining = header.size;
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = dec.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                remaining -= n as u64;
+            }
+            if let Some(algo) = hash_algo {
+                let mut trailer = [0u8; 32];
+                dec.read_exact(&mut trailer[..algo.trailer_bytes()])?;
+            }
+        }
+    }
+    if let Some(algo) = hash_algo {
+        eprintln!("hash      {}", algo.name());
+    }
+    eprintln!(
+        "{} entries, {:.2} MiB uncompressed",
+        n_entries,
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
+    let started = Instant::now();
+    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    if let Some(c) = comment.as_deref() {
+        if !opts.summary { eprintln!("comment {}", c); }
+    }
+
+    let mut buf = vec![0u8; CHUNK];
+    let mut n_entries: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut hashes_verified: u64 = 0;
+    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+        if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
+        if opts.verbose {
+            eprintln!("? {}", header.path);
+        }
+        if matches!(header.kind, EntryKind::File) {
+            let mut remaining = header.size;
+            total_bytes += remaining;
+            let mut hasher = hash_algo.map(EntryHasher::new);
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = dec.read(&mut buf[..want])?;
+                if n == 0 {
+                    return Err(anyhow!(
+                        "unexpected EOF while testing entry {}",
+                        header.path
+                    ));
+                }
+                if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
+                remaining -= n as u64;
+            }
+            if let (Some(h), Some(algo)) = (hasher, hash_algo) {
+                let tb = algo.trailer_bytes();
+                let mut stored = [0u8; 32];
+                dec.read_exact(&mut stored[..tb])?;
+                let mut computed = [0u8; 32];
+                h.finalize_into(&mut computed[..tb]);
+                if stored[..tb] != computed[..tb] {
+                    return Err(anyhow!(
+                        "{} mismatch on {}",
+                        algo.name(), header.path
+                    ));
+                }
+                hashes_verified += 1;
+            }
+        }
+        n_entries += 1;
+    }
+    let elapsed = started.elapsed();
+    let algo_name = hash_algo.map(|a| a.name()).unwrap_or("off");
+    eprintln!(
+        "test OK   {} entries ({} {} verified), {:.2} MiB in {:.2}s",
+        n_entries,
+        hashes_verified,
+        algo_name,
+        total_bytes as f64 / (1024.0 * 1024.0),
+        elapsed.as_secs_f64()
+    );
+    Ok(())
+}
