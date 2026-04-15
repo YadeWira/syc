@@ -190,6 +190,58 @@ fn roundtrip_xattrs() {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn roundtrip_append(level: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src1 = root.join("src1");
+    let src2 = root.join("src2");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+
+    // First batch.
+    make_fixture(&src1);
+    // Second batch — different content so we can verify both ended up in dst.
+    write_file(&src2.join("appended/one.txt"), b"I was appended!\n");
+    write_file(&src2.join("appended/two.bin"), &vec![7u8; 4096]);
+
+    run_syc(
+        &["a", archive.to_str().unwrap(), src1.to_str().unwrap(),
+          "-level", level],
+        &[],
+    );
+    let size_after_first = fs::metadata(&archive).unwrap().len();
+    run_syc(
+        &["a", archive.to_str().unwrap(), src2.to_str().unwrap(),
+          "-append", "-level", level],
+        &[],
+    );
+    let size_after_second = fs::metadata(&archive).unwrap().len();
+    assert!(
+        size_after_second > size_after_first,
+        "append should grow the archive (before={size_after_first} after={size_after_second})"
+    );
+
+    // Extract and verify files from both frames landed in dst. collect_entries
+    // stores paths relative to each source root, so both trees merge into dst.
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_eq!(fs::read(dst.join("hello.txt")).unwrap(), b"Hello, world!\n");
+    assert_eq!(
+        fs::read(dst.join("appended/one.txt")).unwrap(),
+        b"I was appended!\n"
+    );
+    assert_eq!(fs::read(dst.join("appended/two.bin")).unwrap(), vec![7u8; 4096]);
+
+    // List and test should also see entries from both frames.
+    run_syc(&["t", archive.to_str().unwrap()], &[]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_append_zstd() { roundtrip_append("1", "append-zstd"); }
+
+#[test]
+fn roundtrip_append_lzma() { roundtrip_append("5", "append-lzma"); }
+
 #[test]
 fn roundtrip_hash_crc32() { roundtrip_hash("crc32", "hash-crc32"); }
 

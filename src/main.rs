@@ -4,7 +4,7 @@ mod rep;
 mod srep;
 
 use anyhow::{anyhow, Context, Result};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -551,6 +551,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         solid_sort(&mut all);
     }
 
+    if opts.append {
+        return cmd_add_append(archive, all, opts, started);
+    }
+
     let backend = pick_backend(opts.level, opts.store);
 
     let total_raw: u64 = all
@@ -799,6 +803,160 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     Ok(())
 }
 
+/// Append a fresh compressed frame at the end of an existing archive.
+///
+/// The original preamble (and thus archive-level config: backend, dict, hash
+/// algo, xattr bit, comment) is preserved byte-for-byte — antiransomware
+/// guarantee. Per-level/-threads flags apply only to the NEW frame. Decoders
+/// for zstd and xz handle multi-frame streams natively; we flipped the xz
+/// decoder to `new_multi_decoder` so list/extract/test see every frame.
+fn cmd_add_append(
+    archive: PathBuf,
+    all: Vec<(PathBuf, PathBuf)>,
+    mut opts: Opts,
+    started: Instant,
+) -> Result<()> {
+    if is_stream_path(&archive) {
+        return Err(anyhow!("-append cannot be used with stdout (`-`)"));
+    }
+    if opts.chunk_mib.is_some() {
+        return Err(anyhow!("-append is not compatible with -chunk"));
+    }
+    if !archive.exists() {
+        return Err(anyhow!(
+            "-append: archive does not exist: {} (omit -append to create a new one)",
+            archive.display()
+        ));
+    }
+
+    let rd = File::open(&archive)
+        .with_context(|| format!("open {}", archive.display()))?;
+    let size_before = rd.metadata()?.len();
+    let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
+    let (backend, preproc, dict, ppmd_params, existing_comment, hash_algo) =
+        read_preamble(&mut br)?;
+    drop(br);
+
+    if matches!(backend, Backend::Ppmd) {
+        let _ = ppmd_params; // keep variable bound
+        return Err(anyhow!(
+            "-append: ppmd backend does not support multi-frame streams"
+        ));
+    }
+    if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+        return Err(anyhow!(
+            "-append: archive uses REP/SREP preprocessor; per-frame match \
+             state would diverge. Repack without REP/SREP first."
+        ));
+    }
+
+    // Flags that are locked by the existing preamble win over anything passed
+    // on the CLI. Warn so the user isn't surprised.
+    let archive_xattrs = preproc & archive::FEATURE_XATTRS != 0;
+    if opts.xattrs && !archive_xattrs {
+        eprintln!("warning: -xattrs ignored (archive was created without FEATURE_XATTRS)");
+    } else if !opts.xattrs && archive_xattrs && !opts.summary {
+        eprintln!("note: archive has FEATURE_XATTRS, appended entries will include xattrs too");
+    }
+    opts.xattrs = archive_xattrs;
+
+    if opts.hash.is_some() && !opts.summary {
+        eprintln!(
+            "warning: -hash ignored (archive locks hash algo to {})",
+            hash_algo.map(|h| h.name()).unwrap_or("none")
+        );
+    }
+    if opts.comment.is_some() && !opts.summary {
+        eprintln!("warning: -comment ignored (archive preamble is preserved)");
+    }
+    let _ = existing_comment;
+
+    let file = OpenOptions::new()
+        .append(true)
+        .open(&archive)
+        .with_context(|| format!("open for append {}", archive.display()))?;
+    let bw = BufWriter::with_capacity(archive::IO_BUF, file);
+
+    let mut total_bytes: u64 = 0;
+    let mut n_entries: u64 = 0;
+
+    match backend {
+        Backend::Zstd => {
+            let zlevel = if opts.store { 0 } else { map_zstd_level(opts.level) };
+            let mut enc = if dict.is_empty() {
+                zstd::stream::Encoder::new(bw, zlevel)?
+            } else {
+                zstd::stream::Encoder::with_dictionary(bw, zlevel, &dict)?
+            };
+            if opts.threads > 0 {
+                let _ = enc.multithread(opts.threads);
+            }
+            let _ = enc.include_checksum(true);
+            if !opts.nolong {
+                let _ = enc.window_log(27);
+                let _ = enc.long_distance_matching(true);
+            }
+            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            let bw = enc.finish()?;
+            let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+            inner.flush()?;
+        }
+        Backend::Lzma => {
+            let bcj = if let Some(s) = opts.bcj.as_deref() {
+                parse_bcj(s.trim())
+                    .ok_or_else(|| anyhow!("-bcj: unknown filter '{s}'"))?
+            } else {
+                match std::env::var("SYC_BCJ") {
+                    Ok(v) => parse_bcj(v.trim())
+                        .ok_or_else(|| anyhow!("SYC_BCJ: unknown filter '{v}'"))?,
+                    Err(_) => auto_detect_bcj(&all),
+                }
+            };
+            let stream = build_lzma_stream(opts.level, opts.threads, 0, bcj)?;
+            let mut enc = xz2::write::XzEncoder::new_stream(bw, stream);
+            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            let mut inner = enc.finish()?;
+            inner.flush()?;
+        }
+        Backend::Ppmd => unreachable!(),
+    }
+
+    let size_after = std::fs::metadata(&archive)?.len();
+    let appended_bytes = size_after.saturating_sub(size_before);
+    let elapsed = started.elapsed();
+    let ratio = if total_bytes > 0 {
+        appended_bytes as f64 / total_bytes as f64
+    } else {
+        0.0
+    };
+    let mbps = if elapsed.as_secs_f64() > 0.0 {
+        (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    if opts.summary {
+        eprintln!(
+            "append {} entries {:.2} MiB -> +{:.2} MiB (ratio {:.3}) {:.2}s {:.1} MiB/s",
+            n_entries,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            appended_bytes as f64 / (1024.0 * 1024.0),
+            ratio,
+            elapsed.as_secs_f64(),
+            mbps
+        );
+    } else {
+        eprintln!("appended {} entries", n_entries);
+        eprintln!("in      {:.2} MiB", total_bytes as f64 / (1024.0 * 1024.0));
+        eprintln!(
+            "added   +{:.2} MiB   (total now {:.2} MiB)",
+            appended_bytes as f64 / (1024.0 * 1024.0),
+            size_after as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!("time    {:.2} s    ({:.1} MiB/s)", elapsed.as_secs_f64(), mbps);
+    }
+    Ok(())
+}
+
 /// Which backend to use for a given syc level.
 /// l0..l4 use zstd (fast decomp, enough ratio to beat ARC m1-m4).
 /// l5..l10 default to LZMA (higher ratio).
@@ -1043,7 +1201,11 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
             };
             Box::new(d)
         }
-        Backend::Lzma => Box::new(xz2::read::XzDecoder::new(br)),
+        // `new_multi_decoder` transparently handles a sequence of concatenated
+        // xz streams — which is what the `-append` command produces. It's a
+        // strict superset of the single-stream decoder, so non-appended
+        // archives decode identically.
+        Backend::Lzma => Box::new(xz2::read::XzDecoder::new_multi_decoder(br)),
         Backend::Ppmd => {
             let p = ppmd.ok_or_else(|| anyhow!("ppmd backend missing params"))?;
             let mem_bytes = (p.mem_mb as u32).saturating_mul(1024 * 1024);

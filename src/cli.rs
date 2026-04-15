@@ -32,6 +32,7 @@ pub struct Opts {
     pub comment: Option<String>,
     pub hash: Option<String>,
     pub xattrs: bool,
+    pub append: bool,
 }
 
 #[derive(Debug)]
@@ -170,6 +171,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "dict" => opts.dict = true,
                 "nodict" => opts.nodict = true,
                 "xattrs" => opts.xattrs = true,
+                "append" => opts.append = true,
                 "nolong" => opts.nolong = true,
                 "nopreproc" => opts.nopreproc = true,
                 "level" | "m" => {
@@ -296,6 +298,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -comment TEXT  (archive-level UTF-8 tag, shown by `l`)
            -hash ALGO    (crc32|xxh3|blake3, default crc32)
            -xattrs       preserve Linux extended attributes (user.*, etc.)
+           -append       append a new compressed frame to an existing archive
+                         (antiransomware: existing bytes are never rewritten)
            -nodict       force dict training off (opposite of -dict)
 
 Env      : SYC_BACKEND=ppmd   force PPMd7 (experimental, needs Dict/LZP)
@@ -344,6 +348,11 @@ pub fn help(topic: Option<String>) {
                     blake3 is cryptographic; xxh3 is fastest; crc32 is smallest.
 -summary            One-line summary at end
 -verbose            Print each entry packed
+-append             Append a new compressed frame to an existing archive.
+                    Inherits backend/dict/hash/xattrs from the original
+                    preamble; existing bytes are never rewritten. Not
+                    compatible with -chunk, stdout, ppmd backend, or
+                    REP/SREP preprocessors.
 "
         ),
         Some("x") | Some("extract") => println!(
