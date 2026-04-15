@@ -295,6 +295,34 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## zpaqfranz clone UX (tareas #24-26, 2026-04-16)
+
+Tres toques para que `syc` se sienta como un clon de zpaqfranz — apariencia + semántica de salida:
+
+**#25 Numeric error prefixes** (`src/color.rs`):
+- `err_line(msg)` → `"00042! msg"` en rojo, contador global monotónico (`AtomicU32`).
+- Resumen final: `(N errors, with errors)` en vez de `(with errors)`.
+- Sustituye los eprintln rojos de `miss/diff/syc: <err>/exec hook failed`.
+
+**#26 Scan phase summary** (`src/main.rs`):
+- Después de `collect_entries + apply_selectors + solid_sort`, imprime `Scanned N file/s HH:MM:SS B (X.XX KB)` antes de `Creating archive at offset 0 + 0`.
+- No bloqueante — es una línea resumen post-walk, no un progress bar en vivo. `walkdir` síncrono sobre corpora modestos (target hardware: A8-6600K) suele correr en <1s; real-time throttling sería overkill.
+
+**#24 List layout con mtime** (`src/archive.rs`, `src/main.rs`):
+- **Wire format bump: `SYC4` → `SYC5`**. El byte de flags ya estaba lleno (0x01..0x80 todos tomados), así que no cabía un FEATURE_MTIME — magic bump fue la vía limpia.
+- `EntryHeader` gana `mtime: i64` (UNIX seconds). Writers emiten siempre v5; readers aceptan ambos.
+- `read_preamble` devuelve `(ArchiveVersion, Backend, ...)`; `EntryHeader::read_from(r, version)` lee mtime sólo si v5 (v4 → 0).
+- Extract restaura mtime via `utimensat` (best-effort; dirs quedan pisados por writes subsecuentes, symlinks con AT_SYMLINK_NOFOLLOW).
+- `cmd_list` cambia de `Size | Flag | Name` a:
+  ```
+  Date       Time                  Size  Ratio  Name
+  2026-04-15 19:22:40               0  <dir>  sub
+  2026-04-15 19:22:40              47         a.txt
+  ```
+  No tenemos per-entry compressed size, así que la columna Ratio lleva tag tipado (`<dir>`/`<lnk>`/`<hln>`/`<cdc>`) en lugar de un porcentaje falso. Dir cyan, link/hardlink amarillo, cdc verde.
+
+Test nuevo: `roundtrip_mtime` (stamp vía `utimensat`, pack, extract, verify exact seconds).
+
 ## FS snapshot (tarea #14, 2026-04-15)
 
 `src/snapshot.rs` — snapshot atómico opcional antes de archivar (`-snapshot`).

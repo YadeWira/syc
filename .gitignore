@@ -1,4 +1,5 @@
 /target
+/dist
 # Test fixtures (pesados, no en git)
 /test-files.tar
 /test-files2.tar

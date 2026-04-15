@@ -12,9 +12,14 @@
 //!   - whether stderr is a real TTY (most output goes to stderr)
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Global, monotonically-increasing error counter. zpaqfranz prefixes every
+/// error line with a zero-padded 5-digit count + `!`, so users can eyeball
+/// how many fault lines scrolled by without counting them manually. Wraps
+/// back to 0 at u32::MAX, which in practice never happens.
+static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Initialize once at program entry. Color is enabled only when all of:
 /// stderr is a TTY, `-nocolor` not set, `NO_COLOR` env var absent.
@@ -53,3 +58,18 @@ pub fn r(s: &str) -> String { wrap(RED, s) }
 pub fn y(s: &str) -> String { wrap(YELLOW, s) }
 #[allow(dead_code)]
 pub fn c(s: &str) -> String { wrap(CYAN, s) }
+
+/// Increment the global error counter and return a zpaqfranz-style red
+/// prefixed error line: `00042! {msg}`. The counter ticks even when color is
+/// off — only the ANSI wrapping is gated.
+pub fn err_line(msg: &str) -> String {
+    let n = ERR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let body = format!("{:05}! {}", n, msg);
+    if enabled() {
+        format!("{}{}{}", RED, body, RESET)
+    } else {
+        body
+    }
+}
+
+pub fn err_count() -> u32 { ERR_COUNT.load(Ordering::Relaxed) }

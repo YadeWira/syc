@@ -4,7 +4,21 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAGIC: &[u8; 4] = b"SYC4";
+/// Legacy magic; no per-entry mtime. Readers still accept it so 0.1.3-and-
+/// earlier archives keep extracting.
+pub const MAGIC_V4: &[u8; 4] = b"SYC4";
+/// v5 adds a u64-LE `mtime` field to every entry header (UNIX seconds). Needed
+/// by the zpaqfranz-style `l` listing (Date/Time/Size/Ratio/Name). Bumped
+/// because the flags byte is already full — no room for a FEATURE_MTIME bit.
+pub const MAGIC_V5: &[u8; 4] = b"SYC5";
+/// Writers emit v5 exclusively starting with 0.1.4.
+pub const MAGIC: &[u8; 4] = MAGIC_V5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveVersion {
+    V4,
+    V5,
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,15 +95,20 @@ pub struct EntryHeader {
     pub kind: EntryKind,
     pub mode: u32,
     pub size: u64,
+    /// UNIX seconds since epoch. Zero on v4 archives (no mtime stored) and on
+    /// platforms where `modified()` is unavailable.
+    pub mtime: i64,
     pub path: String,
     pub link_target: String,
 }
 
 impl EntryHeader {
+    /// Write in v5 format (mtime after size). Writers always target v5.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u8(self.kind as u8)?;
         w.write_u32::<LittleEndian>(self.mode)?;
         w.write_u64::<LittleEndian>(self.size)?;
+        w.write_i64::<LittleEndian>(self.mtime)?;
         let pb = self.path.as_bytes();
         w.write_u16::<LittleEndian>(pb.len() as u16)?;
         w.write_all(pb)?;
@@ -99,7 +118,7 @@ impl EntryHeader {
         Ok(())
     }
 
-    pub fn read_from<R: Read>(r: &mut R) -> Result<Option<Self>> {
+    pub fn read_from<R: Read>(r: &mut R, version: ArchiveVersion) -> Result<Option<Self>> {
         let kind_byte = match r.read_u8() {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -108,6 +127,11 @@ impl EntryHeader {
         let kind = EntryKind::from_u8(kind_byte)?;
         let mode = r.read_u32::<LittleEndian>()?;
         let size = r.read_u64::<LittleEndian>()?;
+        let mtime = if version == ArchiveVersion::V5 {
+            r.read_i64::<LittleEndian>()?
+        } else {
+            0
+        };
         let plen = r.read_u16::<LittleEndian>()? as usize;
         let mut pbuf = vec![0u8; plen];
         r.read_exact(&mut pbuf)?;
@@ -116,7 +140,7 @@ impl EntryHeader {
         let mut lbuf = vec![0u8; llen];
         r.read_exact(&mut lbuf)?;
         let link_target = String::from_utf8(lbuf).context("link not utf8")?;
-        Ok(Some(Self { kind, mode, size, path, link_target }))
+        Ok(Some(Self { kind, mode, size, mtime, path, link_target }))
     }
 }
 
@@ -279,15 +303,19 @@ pub fn write_preamble<W: Write>(
 
 pub fn read_preamble<R: Read>(
     r: &mut R,
-) -> Result<(Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>, Option<u8>)> {
+) -> Result<(ArchiveVersion, Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>, Option<u8>)> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
-    if &buf != MAGIC {
+    let version = if &buf == MAGIC_V5 {
+        ArchiveVersion::V5
+    } else if &buf == MAGIC_V4 {
+        ArchiveVersion::V4
+    } else {
         return Err(anyhow!(
-            "bad magic: not a syc v4 archive (got {:?})",
+            "bad magic: not a syc archive (got {:?})",
             std::str::from_utf8(&buf).unwrap_or("?")
         ));
-    }
+    };
     let backend = Backend::from_u8(r.read_u8()?)?;
     let preproc = r.read_u8()?;
     let comment = if preproc & FEATURE_COMMENT != 0 {
@@ -326,7 +354,7 @@ pub fn read_preamble<R: Read>(
     } else {
         None
     };
-    Ok((backend, preproc, dict, ppmd, comment, hash_algo, delta_stride))
+    Ok((version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride))
 }
 
 /// Gather up to DICT_SAMPLES_CAP bytes of sample data from regular files in
@@ -456,6 +484,22 @@ fn sort_key(full: &Path, rel: &Path) -> (KindRank, String, String, u64, String) 
     (kind, ext, parent, size, path)
 }
 
+/// Extract UNIX seconds from a `Metadata::modified()`. Returns 0 on any
+/// platform / filesystem combo where mtime is unavailable — the listing just
+/// shows `1970-01-01 00:00:00`, which is harmless.
+pub fn meta_mtime(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| {
+            match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => Some(d.as_secs() as i64),
+                // Pre-1970 files: compute the negative offset.
+                Err(e) => Some(-(e.duration().as_secs() as i64)),
+            }
+        })
+        .unwrap_or(0)
+}
+
 pub fn pack_entry<W: Write>(
     full: &Path,
     rel: &Path,
@@ -467,6 +511,7 @@ pub fn pack_entry<W: Write>(
     let meta = fs::symlink_metadata(full)
         .with_context(|| format!("stat {}", full.display()))?;
     let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mtime = meta_mtime(&meta);
 
     #[cfg(unix)]
     let mode = {
@@ -482,6 +527,7 @@ pub fn pack_entry<W: Write>(
             kind: EntryKind::Symlink,
             mode,
             size: 0,
+            mtime,
             path: rel_str,
             link_target: target,
         };
@@ -492,6 +538,7 @@ pub fn pack_entry<W: Write>(
             kind: EntryKind::Dir,
             mode,
             size: 0,
+            mtime,
             path: rel_str,
             link_target: String::new(),
         };
@@ -503,6 +550,7 @@ pub fn pack_entry<W: Write>(
             kind: EntryKind::File,
             mode,
             size,
+            mtime,
             path: rel_str,
             link_target: String::new(),
         };
@@ -615,6 +663,10 @@ pub fn unpack_entry<R: Read>(
                 let _ = fs::set_permissions(&full, fs::Permissions::from_mode(header.mode));
             }
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, false); }
+            // Dir mtimes get clobbered by later File writes in the same dir,
+            // so this is only meaningful for leaf / empty dirs. Still applied
+            // for parity with zpaqfranz.
+            if header.mtime != 0 { apply_mtime(&full, header.mtime); }
         }
         EntryKind::Symlink => {
             if let Some(p) = full.parent() {
@@ -628,6 +680,7 @@ pub fn unpack_entry<R: Read>(
             #[cfg(not(unix))]
             return Err(anyhow!("symlinks not supported on this platform"));
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, true); }
+            if header.mtime != 0 { apply_mtime(&full, header.mtime); }
         }
         EntryKind::HardLink => {
             // Body is empty. Resolve target within dest root; hardlink, fall
@@ -679,12 +732,16 @@ pub fn unpack_entry<R: Read>(
                 w.write_all(bytes).map_err(|e| e.into())
             })?;
             w.flush()?;
+            drop(w);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&full, fs::Permissions::from_mode(header.mode));
             }
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, false); }
+            if header.mtime != 0 {
+                apply_mtime(&full, header.mtime);
+            }
         }
     }
     Ok(())
@@ -769,6 +826,28 @@ pub fn apply_xattrs(path: &Path, attrs: &[XattrPair], is_symlink: bool) {
 
 #[cfg(not(unix))]
 pub fn apply_xattrs(_path: &Path, _attrs: &[XattrPair], _is_symlink: bool) {}
+
+/// Restore file mtime from archive header. Best-effort: any failure is
+/// silently skipped (matches the xattr policy and keeps extract robust on
+/// readonly mountpoints or filesystems without sub-second resolution).
+#[cfg(unix)]
+fn apply_mtime(path: &Path, mtime: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::CString;
+    let c = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // atime = mtime: no point pretending otherwise, and we only track mtime.
+    let ts = libc::timespec { tv_sec: mtime as libc::time_t, tv_nsec: 0 };
+    let times = [ts, ts];
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW);
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_mtime(_path: &Path, _mtime: i64) {}
 
 fn sanitize_rel(p: &str) -> Result<PathBuf> {
     let path = PathBuf::from(p);

@@ -34,7 +34,7 @@ fn main() {
     let cmd = match cli::parse(args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{}", color::r(&format!("syc: {e}")));
+            eprintln!("{}", color::err_line(&format!("syc: {e}")));
             std::process::exit(2);
         }
     };
@@ -91,8 +91,10 @@ fn main() {
         Err(_) => ("error", exec_error.as_deref()),
     };
     if let Err(e) = &res {
-        eprintln!("{}", color::r(&format!("syc: {e:#}")));
-        eprintln!("{}", color::r("(with errors)"));
+        eprintln!("{}", color::err_line(&format!("syc: {e:#}")));
+        let n = color::err_count();
+        eprintln!("{}", color::r(&format!("({} error{}, with errors)",
+            n, if n == 1 { "" } else { "s" })));
     }
     if let (Some(cmd), Some(archive)) = (hook, archive_for_hook.as_ref()) {
         run_exec_hook(cmd, archive, status);
@@ -220,7 +222,7 @@ fn run_exec_hook(shell_cmd: &str, archive: &Path, status: &str) {
         .env("SYC_STATUS", status)
         .status();
     if let Err(e) = sh {
-        eprintln!("syc: exec hook failed: {e}");
+        eprintln!("{}", color::err_line(&format!("exec hook failed: {e}")));
     }
 }
 
@@ -440,7 +442,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
     let source_abs = source
         .canonicalize()
         .with_context(|| format!("canonicalize {}", source.display()))?;
-    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    let (mut dec, hash_algo, comment, has_xattrs, version) = open_archive(&archive)?;
     if let Some(c) = comment.as_deref() {
         if !opts.summary { eprintln!("comment {}", c); }
     }
@@ -450,7 +452,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
     let mut mismatches: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut reg = fastcdc::DecodeRegistry::new();
-    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+    while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         if opts.verbose {
             eprintln!("? {}", header.path);
@@ -460,7 +462,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
             let mut live_f = match File::open(&live_path) {
                 Ok(f) => Some(BufReader::with_capacity(archive::IO_BUF, f)),
                 Err(_) => {
-                    eprintln!("miss {}", header.path);
+                    eprintln!("{}", color::err_line(&format!("miss {}", header.path)));
                     mismatches += 1;
                     None
                 }
@@ -485,7 +487,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
                 }
             }
             if this_mismatch {
-                eprintln!("diff {}", header.path);
+                eprintln!("{}", color::err_line(&format!("diff {}", header.path)));
                 mismatches += 1;
             }
             checked += 1;
@@ -495,7 +497,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
             // (dedup is an archive-internal optimization).
             let live_path = source_abs.join(&header.path);
             if !live_path.exists() && live_path.symlink_metadata().is_err() {
-                eprintln!("miss {}", header.path);
+                eprintln!("{}", color::err_line(&format!("miss {}", header.path)));
                 mismatches += 1;
             }
         }
@@ -602,6 +604,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         sources.clone()
     };
 
+    // Scan phase — collect + filter + sort. Keep the scan time separate from
+    // pack time so the user can see where wall-clock is being spent. The
+    // `Scanned N file/s` line mirrors zpaqfranz's pre-pack summary.
+    let scan_started = Instant::now();
     let mut all: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in &effective_sources {
         all.extend(collect_entries_or_single(src)?);
@@ -619,6 +625,21 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     }
     if !opts.nosort {
         solid_sort(&mut all);
+    }
+    if !opts.summary {
+        let scan_bytes: u64 = all
+            .iter()
+            .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        eprintln!(
+            "Scanned {} file/s  {}  {} ({})",
+            eu_num(all.len() as u64),
+            hms(scan_started.elapsed().as_secs()),
+            eu_num(scan_bytes),
+            human_si(scan_bytes),
+        );
     }
 
     if opts.append {
@@ -1080,11 +1101,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     Ok(())
 }
 
-/// `YYYY-MM-DD HH:MM:SS` UTC, no deps. Cosmetic label only — syc doesn't
-/// store per-entry mtime in the archive, so local TZ isn't worth the crate.
-fn chrono_like_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+/// `YYYY-MM-DD HH:MM:SS` UTC from UNIX seconds. No deps; pre-1970 (negative)
+/// values collapse to epoch since they never occur in practice on syc inputs.
+fn fmt_mtime(unix_secs: i64) -> String {
+    let t = if unix_secs < 0 { 0u64 } else { unix_secs as u64 };
     let days = t / 86400;
     let secs = t % 86400;
     let h = secs / 3600;
@@ -1092,6 +1112,12 @@ fn chrono_like_now() -> String {
     let s = secs % 60;
     let (y, mo, d) = days_to_ymd(days);
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
+}
+
+fn chrono_like_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    fmt_mtime(t)
 }
 
 /// Gregorian conversion from days-since-1970 — enough for a cosmetic date
@@ -1142,7 +1168,7 @@ fn cmd_add_append(
         .with_context(|| format!("open {}", archive.display()))?;
     let size_before = rd.metadata()?.len();
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (backend, preproc, dict, ppmd_params, existing_comment, hash_algo, delta_stride) =
+    let (_version, backend, preproc, dict, ppmd_params, existing_comment, hash_algo, delta_stride) =
         read_preamble(&mut br)?;
     drop(br);
 
@@ -1548,10 +1574,14 @@ fn pack_all<W: Write>(
         }
         if let Some(canonical) = dedup.get(full) {
             let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let mtime = std::fs::symlink_metadata(full)
+                .map(|m| archive::meta_mtime(&m))
+                .unwrap_or(0);
             let header = EntryHeader {
                 kind: EntryKind::HardLink,
                 mode: entry_mode(full),
                 size: 0,
+                mtime,
                 path: rel_str,
                 link_target: canonical.clone(),
             };
@@ -1601,6 +1631,7 @@ fn pack_entry_chunked<W: Write>(
     }
     let size = meta.len();
     let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mtime = archive::meta_mtime(&meta);
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -1612,6 +1643,7 @@ fn pack_entry_chunked<W: Write>(
         kind: EntryKind::ChunkedFile,
         mode,
         size,
+        mtime,
         path: rel_str,
         link_target: String::new(),
     };
@@ -1714,10 +1746,10 @@ fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     }
 }
 
-fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Option<String>, bool)> {
+fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Option<String>, bool, archive::ArchiveVersion)> {
     let rd = open_input(archive)?;
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (backend, preproc, dict, ppmd, comment, hash_algo, delta_stride) = read_preamble(&mut br)?;
+    let (version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride) = read_preamble(&mut br)?;
     let has_xattrs = preproc & archive::FEATURE_XATTRS != 0;
     let raw: Box<dyn Read> = match backend {
         Backend::Zstd => {
@@ -1755,7 +1787,7 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
     } else {
         pre_delta
     };
-    Ok((dec, hash_algo, comment, has_xattrs))
+    Ok((dec, hash_algo, comment, has_xattrs, version))
 }
 
 fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
@@ -1765,7 +1797,7 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
         .ok_or_else(|| anyhow!("x: -to DIR is required"))?;
     let started = Instant::now();
     std::fs::create_dir_all(&out)?;
-    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    let (mut dec, hash_algo, comment, has_xattrs, version) = open_archive(&archive)?;
     if let Some(c) = comment.as_deref() { if !opts.summary { eprintln!("comment {}", c); } }
 
     let mut buf = vec![0u8; CHUNK];
@@ -1774,7 +1806,7 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("extract", 0, progress_enabled);
     let mut reg = fastcdc::DecodeRegistry::new();
-    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+    while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
         if header.kind.is_file_like() {
             total_bytes += header.size;
         }
@@ -1821,17 +1853,18 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
 fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
     let started = Instant::now();
     let arc_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    let (mut dec, hash_algo, comment, has_xattrs, version) = open_archive(&archive)?;
 
     let mut buf = vec![0u8; CHUNK];
     let needle = opts.find.as_deref().map(|s| s.to_lowercase());
     let mut n_entries: u64 = 0;
     let mut n_files: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut rows: Vec<(char, u64, u32, String, String)> = Vec::new();
+    // (kind, mtime, size, path, link_target)
+    let mut rows: Vec<(EntryKind, i64, u64, String, String)> = Vec::new();
     let mut reg = fastcdc::DecodeRegistry::new();
 
-    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+    while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         let show = match &needle {
             Some(t) => header.path.to_lowercase().contains(t),
@@ -1843,14 +1876,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
         }
         n_entries += 1;
         if show && !opts.summary {
-            let flag = match header.kind {
-                EntryKind::File => '+',
-                EntryKind::ChunkedFile => 'c',
-                EntryKind::Dir => 'd',
-                EntryKind::Symlink => 'l',
-                EntryKind::HardLink => 'h',
-            };
-            rows.push((flag, header.size, header.mode & 0o7777, header.path.clone(), header.link_target.clone()));
+            rows.push((header.kind, header.mtime, header.size, header.path.clone(), header.link_target.clone()));
         }
         if header.kind.is_file_like() {
             archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))?;
@@ -1877,18 +1903,43 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
             human_si(total_bytes),
         );
         println!();
-        println!("          Size  Flag Name");
-        println!("--------------  ---- -----");
-        for (flag, size, _mode, path, link) in &rows {
+        // zpaqfranz-style layout: Date Time Size Ratio Name.
+        // We don't store per-entry compressed bytes, so the Ratio column
+        // carries a kind tag instead of a percentage: <dir>, <lnk>, <hln>,
+        // <cdc> for chunked files, blank for plain files. This keeps the
+        // column visually useful without inventing numbers.
+        println!("Date       Time                  Size  Ratio  Name");
+        println!("---------- --------  --------------  -----  ----");
+        for (kind, mtime, size, path, link) in &rows {
+            let date = if *mtime > 0 { fmt_mtime(*mtime) } else { "                   ".to_string() };
             let size_s = eu_num(*size);
-            if !link.is_empty() && (*flag == 'l' || *flag == 'h') {
-                println!("{:>14}  {}    {} -> {}", size_s, flag, path, link);
+            let (tag_raw, tag_col): (&str, String) = match kind {
+                EntryKind::Dir => ("<dir>", color::c("<dir>")),
+                EntryKind::Symlink => ("<lnk>", color::y("<lnk>")),
+                EntryKind::HardLink => ("<hln>", color::y("<hln>")),
+                EntryKind::ChunkedFile => ("<cdc>", color::g("<cdc>")),
+                EntryKind::File => ("     ", "     ".to_string()),
+            };
+            // Track raw tag width (5 chars) but print colored version; column
+            // alignment still looks right in a TTY because ANSI codes are
+            // zero-width.
+            let _ = tag_raw;
+            if !link.is_empty() && matches!(kind, EntryKind::Symlink | EntryKind::HardLink) {
+                println!("{}  {:>14}  {}  {} -> {}", date, size_s, tag_col, path, link);
             } else {
-                println!("{:>14}  {}    {}", size_s, flag, path);
+                println!("{}  {:>14}  {}  {}", date, size_s, tag_col, path);
             }
         }
         println!();
         let ratio = if total_bytes > 0 { arc_size as f64 / total_bytes as f64 } else { 0.0 };
+        let ratio_s = format!("{:.3}", ratio);
+        let ratio_col = if ratio >= 0.95 {
+            color::y(&ratio_s)
+        } else if ratio < 0.80 && ratio > 0.0 {
+            color::g(&ratio_s)
+        } else {
+            ratio_s
+        };
         println!(
             "              {} ({}) of {} ({}) in {} files shown",
             eu_num(total_bytes),
@@ -1898,9 +1949,9 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
             n_files,
         );
         println!(
-            "               {} compressed  Ratio {:.3} <<{}>>",
+            "               {} compressed  Ratio {} <<{}>>",
             eu_num(arc_size),
-            ratio,
+            ratio_col,
             archive.display(),
         );
         if let Some(algo) = hash_algo {
@@ -1915,7 +1966,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
 fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let started = Instant::now();
     let arc_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-    let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
+    let (mut dec, hash_algo, comment, has_xattrs, version) = open_archive(&archive)?;
     if !opts.summary {
         eprintln!();
         eprintln!("<<{}>>:", archive.display());
@@ -1929,7 +1980,7 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("test", 0, progress_enabled);
     let mut reg = fastcdc::DecodeRegistry::new();
-    while let Some(header) = EntryHeader::read_from(&mut dec)? {
+    while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         if opts.verbose {
             eprintln!("? {}", header.path);

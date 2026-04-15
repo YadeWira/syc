@@ -552,3 +552,82 @@ fn roundtrip_store() {
     assert_same_tree(&src, &dst);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// mtime must survive pack → extract. Relies on utimensat being applied to
+/// regular files; dirs get clobbered by child writes so we only assert on
+/// files. Precision is whole seconds (format stores UNIX seconds only).
+#[cfg(unix)]
+#[test]
+fn roundtrip_mtime() {
+    use std::time::{Duration, SystemTime};
+    let root = tmp_root("mtime");
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+
+    // Stamp a known mtime on one file and remember it.
+    let target = src.join("hello.txt");
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_584_286_200);
+    filetime_set(&target, 1_584_286_200);
+
+    run_syc(&["a", archive.to_str().unwrap(), src.to_str().unwrap()], &[]);
+    run_syc(
+        &["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()],
+        &[],
+    );
+    let extracted = dst.join("hello.txt");
+    let got = fs::symlink_metadata(&extracted).unwrap();
+    let got_sec = got.modified().unwrap().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(
+        got_sec, 1_584_286_200,
+        "mtime not restored (expected 1584286200, got {got_sec}, original epoch: {epoch:?})"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+fn filetime_set(path: &Path, unix_secs: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let ts = libc_timespec(unix_secs);
+    let times = [ts, ts];
+    unsafe {
+        libc_utimensat(c.as_ptr(), times.as_ptr());
+    }
+}
+
+#[cfg(unix)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LibcTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(unix)]
+fn libc_timespec(unix_secs: i64) -> LibcTimespec {
+    LibcTimespec { tv_sec: unix_secs, tv_nsec: 0 }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn utimensat(
+        dirfd: i32,
+        pathname: *const std::os::raw::c_char,
+        times: *const LibcTimespec,
+        flags: i32,
+    ) -> i32;
+}
+
+#[cfg(unix)]
+unsafe fn libc_utimensat(path: *const std::os::raw::c_char, times: *const LibcTimespec) {
+    // AT_FDCWD = -100 on Linux, -2 on macOS. Good enough for CI (Linux) and
+    // local (Linux) — the test is `#[cfg(unix)]` but in practice we only run
+    // on Linux boxes.
+    #[cfg(target_os = "linux")]
+    const AT_FDCWD: i32 = -100;
+    #[cfg(not(target_os = "linux"))]
+    const AT_FDCWD: i32 = -2;
+    utimensat(AT_FDCWD, path, times, 0);
+}
