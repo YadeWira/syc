@@ -50,6 +50,10 @@ pub enum EntryKind {
     File = 0,
     Dir = 1,
     Symlink = 2,
+    /// In-archive hard-link: `link_target` holds the canonical archive-relative
+    /// path of a previously-written File entry. Body is empty. Only emitted
+    /// when `-dedup` is active; old readers will fail cleanly on `from_u8`.
+    HardLink = 3,
 }
 
 impl EntryKind {
@@ -58,6 +62,7 @@ impl EntryKind {
             0 => Self::File,
             1 => Self::Dir,
             2 => Self::Symlink,
+            3 => Self::HardLink,
             _ => return Err(anyhow!("unknown entry kind: {v}")),
         })
     }
@@ -555,6 +560,37 @@ pub fn unpack_entry<R: Read>(
             #[cfg(not(unix))]
             return Err(anyhow!("symlinks not supported on this platform"));
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, true); }
+        }
+        EntryKind::HardLink => {
+            // Body is empty. Resolve target within dest root; hardlink, fall
+            // back to copy on cross-fs / unsupported-fs errors.
+            let target_rel = sanitize_rel(&header.link_target)?;
+            let target = dest_root.join(&target_rel);
+            if let Some(p) = full.parent() {
+                fs::create_dir_all(p)?;
+            }
+            if full.exists() || full.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(&full);
+            }
+            match fs::hard_link(&target, &full) {
+                Ok(()) => {}
+                Err(_) => {
+                    fs::copy(&target, &full).with_context(|| {
+                        format!(
+                            "dedup fallback copy {} -> {}",
+                            target.display(), full.display()
+                        )
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(
+                            &full, fs::Permissions::from_mode(header.mode),
+                        );
+                    }
+                }
+            }
+            if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, false); }
         }
         EntryKind::File => {
             // Parent dirs should already exist (Dir entries come first in

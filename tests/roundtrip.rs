@@ -298,6 +298,74 @@ fn roundtrip_route(level: &str, tag: &str) {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn roundtrip_dedup(level: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive_plain = root.join("plain.syc");
+    let archive_dedup = root.join("dedup.syc");
+    let dst = root.join("dst");
+
+    // Three identical "large" blobs + one unique — dedup should collapse the
+    // three to one body plus two HardLink entries.
+    let big: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    write_file(&src.join("a/blob.bin"), &big);
+    write_file(&src.join("b/blob.bin"), &big);
+    write_file(&src.join("c/copy.bin"), &big);
+    write_file(&src.join("unique.txt"), b"not a duplicate\n");
+    // Also a zero-byte file pair — dedup skips size==0 (no gain).
+    write_file(&src.join("empty1"), b"");
+    write_file(&src.join("empty2"), b"");
+
+    // Baseline: no dedup.
+    run_syc(
+        &["a", archive_plain.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level],
+        &[],
+    );
+    // With dedup.
+    run_syc(
+        &["a", archive_dedup.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level, "-dedup"],
+        &[],
+    );
+
+    let plain_size = fs::metadata(&archive_plain).unwrap().len();
+    let dedup_size = fs::metadata(&archive_dedup).unwrap().len();
+    assert!(
+        dedup_size < plain_size,
+        "dedup archive should be smaller (plain={plain_size} dedup={dedup_size})"
+    );
+
+    // Roundtrip: all original files reconstructed byte-exact.
+    run_syc(
+        &["x", archive_dedup.to_str().unwrap(), "-to", dst.to_str().unwrap()],
+        &[],
+    );
+    assert_same_tree(&src, &dst);
+    // test should also walk cleanly.
+    run_syc(&["t", archive_dedup.to_str().unwrap()], &[]);
+    // list must show all entries including the hardlink ones.
+    let out = Command::new(syc_bin())
+        .args(["l", archive_dedup.to_str().unwrap()])
+        .output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("blob.bin"), "list missing blob: {stdout}");
+    assert!(stdout.contains("unique.txt"), "list missing unique: {stdout}");
+    // At least one entry line must begin with "h " (hardlink kind).
+    assert!(
+        stdout.lines().any(|l| l.starts_with("h ")),
+        "list has no hardlink entries: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_dedup_zstd() { roundtrip_dedup("1", "dedup-zstd"); }
+
+#[test]
+fn roundtrip_dedup_lzma() { roundtrip_dedup("5", "dedup-lzma"); }
+
 #[test]
 fn roundtrip_route_zstd() { roundtrip_route("1", "route-zstd"); }
 

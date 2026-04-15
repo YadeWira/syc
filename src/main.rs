@@ -436,8 +436,10 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
                 }
                 checked += 1;
             }
-            EntryKind::Dir | EntryKind::Symlink => {
-                // Presence-only check for non-file entries.
+            EntryKind::Dir | EntryKind::Symlink | EntryKind::HardLink => {
+                // Presence-only check for non-file entries. HardLink has no
+                // body in the archive; the live-side file should still exist
+                // (dedup is an archive-internal optimization).
                 let live_path = source_abs.join(&header.path);
                 if !live_path.exists() && live_path.symlink_metadata().is_err() {
                     eprintln!("miss {}", header.path);
@@ -568,6 +570,32 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         } else {
             (all, Vec::new())
         };
+
+    // Build dedup maps per-bucket so HardLink entries always point at a
+    // canonical within the same frame (canonical must be extracted before any
+    // of its references).
+    let dedup_default = if opts.dedup {
+        build_dedup_map(&default_entries)?
+    } else {
+        std::collections::HashMap::new()
+    };
+    let dedup_media = if opts.dedup && !media_entries.is_empty() {
+        build_dedup_map(&media_entries)?
+    } else {
+        std::collections::HashMap::new()
+    };
+    if opts.dedup && !opts.summary {
+        let n_default = dedup_default.len();
+        let n_media = dedup_media.len();
+        if n_default + n_media > 0 {
+            eprintln!(
+                "dedup   {} duplicates → hardlink entries ({} default, {} media)",
+                n_default + n_media, n_default, n_media
+            );
+        } else {
+            eprintln!("dedup   no duplicate contents found");
+        }
+    }
 
     let total_raw: u64 = default_entries
         .iter()
@@ -706,13 +734,13 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             }
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = dw.finish()?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             } else {
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
@@ -738,25 +766,25 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             let enc = xz2::write::XzEncoder::new_stream(bw, stream);
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = dw.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -768,19 +796,19 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 .map_err(|e| anyhow!("ppmd init: {e}"))?;
             if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             }
@@ -807,7 +835,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                     let _ = enc.multithread(opts.threads);
                 }
                 let _ = enc.include_checksum(true);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media)?;
                 let bw2 = enc.finish()?;
                 let mut inner = bw2.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
@@ -815,7 +843,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             Backend::Lzma => {
                 let stream = build_lzma_stream(0, opts.threads, 0, Bcj::None)?;
                 let mut enc = xz2::write::XzEncoder::new_stream(bw2, stream);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -984,6 +1012,18 @@ fn cmd_add_append(
         .with_context(|| format!("open for append {}", archive.display()))?;
     let bw = BufWriter::with_capacity(archive::IO_BUF, file);
 
+    // Dedup applies within the appended frame only — we don't scan the existing
+    // frame(s) so an appended file that matches an old one still gets re-packed.
+    // That keeps -append non-destructive and stream-only.
+    let dedup = if opts.dedup {
+        build_dedup_map(&entries)?
+    } else {
+        std::collections::HashMap::new()
+    };
+    if opts.dedup && !opts.summary && !dedup.is_empty() {
+        eprintln!("dedup   {} duplicates in appended batch", dedup.len());
+    }
+
     let mut total_bytes: u64 = 0;
     let mut n_entries: u64 = 0;
 
@@ -1003,7 +1043,7 @@ fn cmd_add_append(
                 let _ = enc.window_log(27);
                 let _ = enc.long_distance_matching(true);
             }
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup)?;
             let bw = enc.finish()?;
             let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
             inner.flush()?;
@@ -1021,7 +1061,7 @@ fn cmd_add_append(
             };
             let stream = build_lzma_stream(opts.level, opts.threads, 0, bcj)?;
             let mut enc = xz2::write::XzEncoder::new_stream(bw, stream);
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup)?;
             let mut inner = enc.finish()?;
             inner.flush()?;
         }
@@ -1289,21 +1329,98 @@ fn pack_all<W: Write>(
     hash_algo: Option<HashAlgo>,
     total_bytes: &mut u64,
     n_entries: &mut u64,
+    dedup: &std::collections::HashMap<PathBuf, String>,
 ) -> Result<()> {
     let mut buf = vec![0u8; CHUNK];
     for (full, rel) in all {
         if opts.verbose {
             eprintln!("+ {}", rel.display());
         }
-        pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs)?;
-        if let Ok(meta) = std::fs::symlink_metadata(full) {
-            if meta.is_file() {
-                *total_bytes += meta.len();
+        if let Some(canonical) = dedup.get(full) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let header = EntryHeader {
+                kind: EntryKind::HardLink,
+                mode: entry_mode(full),
+                size: 0,
+                path: rel_str,
+                link_target: canonical.clone(),
+            };
+            header.write_to(enc)?;
+            if opts.xattrs {
+                archive::write_xattrs_block(enc, full, false)?;
+            }
+        } else {
+            pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs)?;
+            if let Ok(meta) = std::fs::symlink_metadata(full) {
+                if meta.is_file() {
+                    *total_bytes += meta.len();
+                }
             }
         }
         *n_entries += 1;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn entry_mode(full: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(full)
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o644)
+}
+
+#[cfg(not(unix))]
+fn entry_mode(_full: &Path) -> u32 { 0o644 }
+
+/// Scan `entries` and build a map of duplicate-file full-path → canonical
+/// archive-relative path (the first-seen copy). Only considers regular files
+/// with size > 0. Hash: xxh3_64 over full content. Callers must have already
+/// sorted entries — canonical is whichever file comes first in the iteration
+/// order.
+fn build_dedup_map(
+    entries: &[(PathBuf, PathBuf)],
+) -> Result<std::collections::HashMap<PathBuf, String>> {
+    use std::collections::HashMap;
+    use std::hash::Hasher;
+    let mut seen: HashMap<(u64, u64), String> = HashMap::new();
+    let mut targets: HashMap<PathBuf, String> = HashMap::new();
+    let mut buf = vec![0u8; archive::CHUNK];
+    for (full, rel) in entries {
+        let meta = match std::fs::symlink_metadata(full) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        let size = meta.len();
+        let f = match File::open(full) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut r = BufReader::with_capacity(archive::IO_BUF, f);
+        let mut h = twox_hash::XxHash3_64::new();
+        loop {
+            let n = match r.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 { break; }
+            h.write(&buf[..n]);
+        }
+        let key = (size, h.finish());
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        match seen.get(&key) {
+            Some(canonical) => {
+                targets.insert(full.clone(), canonical.clone());
+            }
+            None => {
+                seen.insert(key, rel_str);
+            }
+        }
+    }
+    Ok(targets)
 }
 
 fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
@@ -1438,14 +1555,26 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
                 EntryKind::File => "f",
                 EntryKind::Dir => "d",
                 EntryKind::Symlink => "l",
+                EntryKind::HardLink => "h",
             };
-            println!(
-                "{} {:>12} {:o} {}",
-                kind,
-                header.size,
-                header.mode & 0o7777,
-                header.path
-            );
+            if matches!(header.kind, EntryKind::HardLink | EntryKind::Symlink) && !header.link_target.is_empty() {
+                println!(
+                    "{} {:>12} {:o} {} -> {}",
+                    kind,
+                    header.size,
+                    header.mode & 0o7777,
+                    header.path,
+                    header.link_target
+                );
+            } else {
+                println!(
+                    "{} {:>12} {:o} {}",
+                    kind,
+                    header.size,
+                    header.mode & 0o7777,
+                    header.path
+                );
+            }
         }
         if matches!(header.kind, EntryKind::File) {
             let mut remaining = header.size;

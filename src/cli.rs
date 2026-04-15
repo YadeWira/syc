@@ -35,6 +35,7 @@ pub struct Opts {
     pub append: bool,
     pub delta: Option<u8>,
     pub route: bool,
+    pub dedup: bool,
 }
 
 #[derive(Debug)]
@@ -175,6 +176,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "xattrs" => opts.xattrs = true,
                 "append" => opts.append = true,
                 "route" => opts.route = true,
+                "dedup" => opts.dedup = true,
                 "nolong" => opts.nolong = true,
                 "nopreproc" => opts.nopreproc = true,
                 "level" | "m" => {
@@ -313,6 +315,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -delta N      delta pre-filter stride (1|2|4), for PCM / rasters
            -route        split pre-compressed media (jpg/mp4/zip/...) into
                          a level-0 frame, saves CPU without losing ratio
+           -dedup        pack identical files once; duplicates become hardlink
+                         entries (extracted as hardlinks, fall back to copy)
            -nodict       force dict training off (opposite of -dict)
 
 Env      : SYC_BACKEND=ppmd   force PPMd7 (experimental, needs Dict/LZP)
