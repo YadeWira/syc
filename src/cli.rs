@@ -33,7 +33,7 @@ pub struct Opts {
     pub filelist: Option<PathBuf>,
     pub datefrom: Option<i64>,
     pub dateto: Option<i64>,
-    pub chunk_mib: Option<u64>,
+    pub chunk_bytes: Option<u64>,
     pub comment: Option<String>,
     pub hash: Option<String>,
     pub xattrs: bool,
@@ -219,10 +219,10 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                     opts.exclude.push(arg_val(args, &mut i, flag)?.to_string());
                 }
                 "minsize" => {
-                    opts.minsize = Some(arg_val(args, &mut i, flag)?.parse()?);
+                    opts.minsize = Some(parse_size(arg_val(args, &mut i, flag)?)?);
                 }
                 "maxsize" => {
-                    opts.maxsize = Some(arg_val(args, &mut i, flag)?.parse()?);
+                    opts.maxsize = Some(parse_size(arg_val(args, &mut i, flag)?)?);
                 }
                 "filelist" => {
                     opts.filelist = Some(PathBuf::from(arg_val(args, &mut i, flag)?));
@@ -234,7 +234,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                     opts.dateto = Some(parse_date_arg(arg_val(args, &mut i, flag)?)?);
                 }
                 "chunk" => {
-                    opts.chunk_mib = Some(arg_val(args, &mut i, flag)?.parse()?);
+                    opts.chunk_bytes = Some(parse_size(arg_val(args, &mut i, flag)?)?);
                 }
                 "comment" => {
                     opts.comment = Some(arg_val(args, &mut i, flag)?.to_string());
@@ -260,6 +260,58 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
 }
 
 /// Parse a date-ish argument. Accepts UNIX timestamp (all digits) or a simple
+/// Parse a size with optional unit suffix. Used by `-chunk`, `-minsize`,
+/// `-maxsize`. Accepts:
+///   - bare digits → bytes (`1048576` → 1 MiB)
+///   - `K` / `M` / `G` / `T` → binary (KiB, MiB, GiB, TiB)
+///   - `KB` / `MB` / `GB` / `TB` → decimal (1000-based)
+///   - `KiB` / `MiB` / `GiB` / `TiB` → explicit binary
+///   - decimals OK: `1.5GB`, `2.5MiB`
+/// Case-insensitive. Whitespace stripped.
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty size"));
+    }
+    let lower = s.to_ascii_lowercase();
+    // Order matters: longer suffixes first so "MiB" matches before "M".
+    // KB/MB/GB are 1024-base to match zpaqfranz and our human_si echo.
+    let table: &[(&str, u64)] = &[
+        ("kib", 1024),
+        ("mib", 1024 * 1024),
+        ("gib", 1024 * 1024 * 1024),
+        ("tib", 1024u64.pow(4)),
+        ("kb", 1024),
+        ("mb", 1024 * 1024),
+        ("gb", 1024 * 1024 * 1024),
+        ("tb", 1024u64.pow(4)),
+        ("k", 1024),
+        ("m", 1024 * 1024),
+        ("g", 1024 * 1024 * 1024),
+        ("t", 1024u64.pow(4)),
+        ("b", 1),
+    ];
+    for (suffix, mult) in table {
+        if let Some(num) = lower.strip_suffix(suffix) {
+            let num = num.trim();
+            if num.is_empty() {
+                return Err(anyhow!("size '{s}': missing number before '{suffix}'"));
+            }
+            // Try integer first to keep exact bytes; fall back to f64 for decimals.
+            if let Ok(n) = num.parse::<u64>() {
+                return Ok(n.saturating_mul(*mult));
+            }
+            let f: f64 = num.parse()
+                .map_err(|_| anyhow!("size '{s}': invalid number '{num}'"))?;
+            if f < 0.0 {
+                return Err(anyhow!("size '{s}': negative"));
+            }
+            return Ok((f * (*mult as f64)) as u64);
+        }
+    }
+    s.parse::<u64>().map_err(|_| anyhow!("size '{s}': expected digits or N{{K,M,G,T}}[{{B,iB}}]"))
+}
+
 /// `YYYY-MM-DD` that's interpreted as UTC midnight. Uses Howard Hinnant's
 /// civil-from-days algorithm to avoid a chrono dep.
 fn parse_date_arg(s: &str) -> Result<i64> {
@@ -326,9 +378,12 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -nosort   -dict   -nolong   -nopreproc
            -bcj TYPE (x86|arm|armt|ia64|sparc|ppc|off)
            -exec_ok CMD   -exec_error CMD
-           -exclude PATTERN (repeatable)  -minsize N  -maxsize N
+           -exclude PATTERN (repeatable)  -minsize SIZE  -maxsize SIZE
            -filelist FILE  -datefrom YYYY-MM-DD  -dateto YYYY-MM-DD
-           -chunk N_MiB  (split output into archive.001, .002, ...)
+           -chunk SIZE   (split output into archive.001, .002, ...)
+                         SIZE accepts: 100MB / 1.5GB / 200MiB / 4096
+                         (bare digits = bytes; KB/MB/GB = 1000-based;
+                          KiB/MiB/GiB or K/M/G = 1024-based)
            -comment TEXT  (archive-level UTF-8 tag, shown by `l`)
            -hash ALGO    (crc32|xxh3|blake3, default crc32)
            -xattrs       preserve Linux extended attributes (user.*, etc.)

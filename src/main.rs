@@ -349,6 +349,12 @@ impl ChunkedWriter {
     }
     fn rotate(&mut self) -> std::io::Result<()> {
         self.current.flush()?;
+        // Announce the just-finished part so the user can see split progress
+        // as it streams. Goes to stderr (won't pollute archives piped to
+        // stdout — chunked mode already disallows stdout, but be defensive).
+        let closed = part_path(&self.base, self.part);
+        eprintln!("\rwrote   {} ({})            ",
+            closed.display(), human_si(self.written_in_part));
         self.part += 1;
         self.current = File::create(part_path(&self.base, self.part))?;
         self.written_in_part = 0;
@@ -412,22 +418,22 @@ impl Read for ChunkedReader {
     }
 }
 
-/// Open the archive path for writing. Path "-" means stdout. If chunk_mib is
+/// Open the archive path for writing. Path "-" means stdout. If chunk_bytes is
 /// set, output is split into archive.001, .002, ... (stdout + chunk is an error).
 ///
 /// For a regular single-file archive we write to `<archive>.tmp` and return
 /// that path as the second tuple element — the caller renames it to the final
 /// path once the stream has flushed cleanly. A cancelled/failed run therefore
 /// leaves the partial `.tmp` behind instead of clobbering the final name.
-fn open_output(archive: &Path, chunk_mib: Option<u64>) -> Result<(Box<dyn Write>, Option<PathBuf>)> {
+fn open_output(archive: &Path, chunk_bytes: Option<u64>) -> Result<(Box<dyn Write>, Option<PathBuf>)> {
     if archive.as_os_str() == "-" {
-        if chunk_mib.is_some() {
+        if chunk_bytes.is_some() {
             return Err(anyhow!("-chunk cannot be combined with stdout (`-`)"));
         }
         return Ok((Box::new(std::io::stdout().lock()), None));
     }
-    if let Some(mib) = chunk_mib {
-        let chunk_size = mib.saturating_mul(1024 * 1024).max(1);
+    if let Some(b) = chunk_bytes {
+        let chunk_size = b.max(1);
         return Ok((Box::new(ChunkedWriter::new(archive.to_path_buf(), chunk_size)?), None));
     }
     let mut tmp = archive.as_os_str().to_os_string();
@@ -764,8 +770,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     };
 
     let is_stream = is_stream_path(&archive);
-    let is_chunked = opts.chunk_mib.is_some() && !is_stream;
-    let (out, tmp_path) = open_output(&archive, opts.chunk_mib)?;
+    let is_chunked = opts.chunk_bytes.is_some() && !is_stream;
+    if let (Some(b), false) = (opts.chunk_bytes, opts.summary) {
+        if !is_stream {
+            eprintln!("chunk   {}  (output split into {}.001, .002, ...)",
+                human_si(b), archive.display());
+        }
+    }
+    let (out, tmp_path) = open_output(&archive, opts.chunk_bytes)?;
     // When tmp_path is Some we're writing to `<archive>.tmp`; rename to the
     // final name only after the encoder chain and the optional route-frame
     // append have flushed. Route-append also targets tmp_path.
@@ -870,7 +882,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         if is_stream_path(&archive) {
             return Err(anyhow!("-route cannot be used with stdout (`-`)"));
         }
-        if opts.chunk_mib.is_some() {
+        if opts.chunk_bytes.is_some() {
             return Err(anyhow!("-route not compatible with -chunk"));
         }
     }
@@ -1210,7 +1222,7 @@ fn cmd_add_append(
     if is_stream_path(&archive) {
         return Err(anyhow!("-append cannot be used with stdout (`-`)"));
     }
-    if opts.chunk_mib.is_some() {
+    if opts.chunk_bytes.is_some() {
         return Err(anyhow!("-append is not compatible with -chunk"));
     }
     if !archive.exists() {

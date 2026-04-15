@@ -23,11 +23,11 @@ Pre-built binaries on the [releases page](https://github.com/YadeWira/syc/releas
 Linux:
 
 ```sh
-chmod +x syc-0.1.6-linux-x86_64
-./syc-0.1.6-linux-x86_64 h
+chmod +x syc-0.1.8-linux-x86_64
+./syc-0.1.8-linux-x86_64 h
 ```
 
-Windows: download `syc-0.1.6-windows-x86_64.exe`, run from `cmd` or
+Windows: download `syc-0.1.8-windows-x86_64.exe`, run from `cmd` or
 PowerShell.
 
 Or build from source (stable Rust, edition 2021):
@@ -111,7 +111,10 @@ Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
 **Selectors and plumbing**
 - `-exclude PATTERN` (repeatable), `-minsize N`, `-maxsize N`
 - `-filelist FILE`, `-datefrom YYYY-MM-DD`, `-dateto YYYY-MM-DD`
-- `-chunk N_MiB` — split output into `archive.001`, `.002`, …
+- `-chunk SIZE` — split output into `archive.001`, `.002`, … Accepts size
+  suffixes: `-chunk 100MB`, `-chunk 2GB`, `-chunk 1.5GiB`. KB/MB/GB are
+  1024-base (matches zpaqfranz). `-minsize` / `-maxsize` accept the same
+  suffixes.
 - Pipe support: `-` as archive path reads from stdin / writes to stdout
 - `-exec_ok CMD` / `-exec_error CMD` hooks
 

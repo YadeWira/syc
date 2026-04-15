@@ -295,6 +295,26 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.8 — `-chunk XMB/GB` size suffixes + part rotation log (tareas #35-36, 2026-04-16)
+
+**#35 Size suffix parser** (`src/cli.rs`):
+- Opts.`chunk_mib` → `chunk_bytes`. Nuevo `parse_size(&str) → Result<u64>` aceptado por `-chunk`, `-minsize`, `-maxsize`.
+- Sufijos soportados: `B`, `K/KB/KiB`, `M/MB/MiB`, `G/GB/GiB`, `T/TB/TiB`. Valores decimales OK (`1.5GB`).
+- **Decisión**: KB/MB/GB son 1024-base (igual que zpaqfranz y nuestro `human_si`), no decimal-1000. Así `-chunk 10MB` → 10·1024·1024 → echo "10.00 MB" coincide con lo que escribió el usuario. Antes (interpretación decimal): "10MB" → 10MB exactos pero la barra decía "9.54 MB".
+- Errores hablados: `size '10X': expected digits or N{K,M,G,T}[{B,iB}]`.
+
+**#36 Polish: print resolved chunk + part rotation log** (`src/main.rs`):
+- Pre-pack: `chunk   10.00 MB  (output split into a.syc.001, .002, ...)` — el usuario ve qué interpretó syc antes de comprometerse.
+- Por cada parte completada, `ChunkedWriter::rotate` imprime `wrote   a.syc.001 (10.00 MB)` (sobreescribiendo la línea de progreso, con padding para ocultar restos).
+- Smoke test: 50 MB de urandom + `-chunk 10MB -m 0` → 5 partes de 10·1024·1024 + remainder, sin bytes perdidos.
+
+## v0.1.7 — per-chunk progress en pack_entry (tarea #34, 2026-04-16)
+
+**#34 Per-chunk progress** (`src/archive.rs`, `src/fastcdc.rs`, `src/main.rs`):
+- `pack_entry` y `pack_entry_chunked` reciben `on_bytes: &mut dyn FnMut(u64)` y lo invocan **dentro del read loop** de cada chunk (no una sola vez por entry al final).
+- Bug report: en single-file de 1.75 GB, la barra saltaba directo de `Scanned` a `flushing...` porque `pack_entry` consumía el archivo entero antes de devolver y `progress.advance(meta.len())` corría una sola vez.
+- También aplicado al body del FastCDC chunker (`pack_chunked_body`) para coherencia.
+
 ## v0.1.6 — auto-MT zstd + banner trim (tareas #31-32, 2026-04-16)
 
 **#31 Auto-MT zstd cuando el input pesa** (`src/main.rs`):
