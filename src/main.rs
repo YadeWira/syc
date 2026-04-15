@@ -558,7 +558,18 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
 
     let backend = pick_backend(opts.level, opts.store);
 
-    let total_raw: u64 = all
+    // Partition up-front so dict samples, total_raw, preproc decisions, and
+    // BCJ auto-detect all key off the compressible bucket only. Media files
+    // don't belong in those stats anyway (they won't compress and their
+    // headers are already compressed payloads).
+    let (default_entries, media_entries): (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>) =
+        if opts.route {
+            all.into_iter().partition(|(_, rel)| !is_media_ext(rel))
+        } else {
+            (all, Vec::new())
+        };
+
+    let total_raw: u64 = default_entries
         .iter()
         .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
         .filter(|m| m.is_file())
@@ -573,7 +584,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     // a 110 KiB dict is dead weight on a 4 MiB archive.
     let want_dict = backend == Backend::Zstd && !opts.store && !opts.nodict && opts.dict;
     let dict: Vec<u8> = if want_dict {
-        let samples = gather_samples(&all)?;
+        let samples = gather_samples(&default_entries)?;
         let target = archive::adaptive_dict_target(total_raw);
         let d = train_dict(&samples, target);
         if !d.is_empty() && !opts.summary {
@@ -639,6 +650,23 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             eprintln!("delta   stride {}  (pre-filter before compressor)", stride);
         }
     }
+    if opts.route {
+        if matches!(backend, Backend::Ppmd) {
+            return Err(anyhow!("-route not supported with PPMd backend"));
+        }
+        if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+            return Err(anyhow!("-route not compatible with REP/SREP preprocessor"));
+        }
+        if opts.delta.is_some() {
+            return Err(anyhow!("-route not compatible with -delta"));
+        }
+        if is_stream_path(&archive) {
+            return Err(anyhow!("-route cannot be used with stdout (`-`)"));
+        }
+        if opts.chunk_mib.is_some() {
+            return Err(anyhow!("-route not compatible with -chunk"));
+        }
+    }
     let ppmd_params = if backend == Backend::Ppmd {
         Some(pick_ppmd_params(opts.level))
     } else {
@@ -678,13 +706,13 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             }
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = dw.finish()?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             } else {
-                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
@@ -700,7 +728,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 match std::env::var("SYC_BCJ") {
                     Ok(v) => parse_bcj(v.trim())
                         .ok_or_else(|| anyhow!("SYC_BCJ: unknown filter '{v}' (x86|arm|armt|ia64|sparc|ppc|off)"))?,
-                    Err(_) => auto_detect_bcj(&all),
+                    Err(_) => auto_detect_bcj(&default_entries),
                 }
             };
             if bcj != Bcj::None && !opts.summary {
@@ -710,25 +738,25 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             let enc = xz2::write::XzEncoder::new_stream(bw, stream);
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = dw.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -740,22 +768,65 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 .map_err(|e| anyhow!("ppmd init: {e}"))?;
             if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             }
+        }
+    }
+
+    // Second frame for the media bucket at level 0. Same backend + same dict
+    // (if any), so the top-level decoder handles it as just another frame.
+    // Wrapping checks already rejected ppmd, REP/SREP, delta, stdout, chunk.
+    if opts.route && !media_entries.is_empty() {
+        let append_file = OpenOptions::new()
+            .append(true)
+            .open(&archive)
+            .with_context(|| format!("open for route-append {}", archive.display()))?;
+        let bw2 = BufWriter::with_capacity(archive::IO_BUF, append_file);
+        match backend {
+            Backend::Zstd => {
+                let mut enc = if dict.is_empty() {
+                    zstd::stream::Encoder::new(bw2, 0)?
+                } else {
+                    zstd::stream::Encoder::with_dictionary(bw2, 0, &dict)?
+                };
+                if opts.threads > 0 {
+                    let _ = enc.multithread(opts.threads);
+                }
+                let _ = enc.include_checksum(true);
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let bw2 = enc.finish()?;
+                let mut inner = bw2.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+                inner.flush()?;
+            }
+            Backend::Lzma => {
+                let stream = build_lzma_stream(0, opts.threads, 0, Bcj::None)?;
+                let mut enc = xz2::write::XzEncoder::new_stream(bw2, stream);
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
+            }
+            Backend::Ppmd => unreachable!(),
+        }
+        if !opts.summary {
+            eprintln!(
+                "route   {} default + {} media (level-0 frame)",
+                default_entries.len(),
+                media_entries.len()
+            );
         }
     }
 
@@ -842,7 +913,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
 /// decoder to `new_multi_decoder` so list/extract/test see every frame.
 fn cmd_add_append(
     archive: PathBuf,
-    all: Vec<(PathBuf, PathBuf)>,
+    entries: Vec<(PathBuf, PathBuf)>,
     mut opts: Opts,
     started: Instant,
 ) -> Result<()> {
@@ -932,7 +1003,7 @@ fn cmd_add_append(
                 let _ = enc.window_log(27);
                 let _ = enc.long_distance_matching(true);
             }
-            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
             let bw = enc.finish()?;
             let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
             inner.flush()?;
@@ -945,12 +1016,12 @@ fn cmd_add_append(
                 match std::env::var("SYC_BCJ") {
                     Ok(v) => parse_bcj(v.trim())
                         .ok_or_else(|| anyhow!("SYC_BCJ: unknown filter '{v}'"))?,
-                    Err(_) => auto_detect_bcj(&all),
+                    Err(_) => auto_detect_bcj(&entries),
                 }
             };
             let stream = build_lzma_stream(opts.level, opts.threads, 0, bcj)?;
             let mut enc = xz2::write::XzEncoder::new_stream(bw, stream);
-            pack_all(&mut enc, &all, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries)?;
             let mut inner = enc.finish()?;
             inner.flush()?;
         }
@@ -1064,6 +1135,32 @@ fn parse_hash_algo(s: Option<&str>) -> Result<HashAlgo> {
         Some("blake3") | Some("b3") => Ok(HashAlgo::Blake3),
         Some(other) => Err(anyhow!("-hash: unknown algo '{other}' (crc32|xxh3|blake3)")),
     }
+}
+
+/// Extensions that are typically already-compressed payloads. When `-route`
+/// is on, these land in a level-0 frame so we spend zero CPU trying to
+/// re-compress (pointless — they stay ~1.0 ratio either way). Case-insensitive.
+const ROUTE_STORE_EXTS: &[&str] = &[
+    // Images
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif",
+    // Audio (already lossy/compressed)
+    "mp3", "aac", "m4a", "ogg", "opus", "flac",
+    // Video
+    "mp4", "mkv", "webm", "mov", "avi", "flv", "wmv", "m4v",
+    // Archives
+    "zip", "gz", "xz", "7z", "rar", "bz2", "zst", "lz4", "lzma",
+    "tgz", "tbz2", "txz", "tzst",
+    // Packages
+    "deb", "rpm", "apk", "jar", "war", "ear", "crx", "whl", "egg",
+    // Misc
+    "pdf",
+];
+
+fn is_media_ext(rel: &Path) -> bool {
+    rel.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| ROUTE_STORE_EXTS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+        .unwrap_or(false)
 }
 
 fn parse_bcj(s: &str) -> Option<Bcj> {

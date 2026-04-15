@@ -265,6 +265,45 @@ fn roundtrip_delta(level: &str, stride: &str, tag: &str) {
     let _ = fs::remove_dir_all(&root);
 }
 
+fn roundtrip_route(level: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+
+    // Compressible text
+    write_file(&src.join("notes.txt"), &b"hello routing world!\n".repeat(200));
+    // Fake "pre-compressed" files — extensions trigger the media bucket.
+    write_file(&src.join("image.jpg"), &vec![0xABu8; 5000]);
+    write_file(&src.join("sub/clip.mp4"), &vec![0xCDu8; 7000]);
+    write_file(&src.join("sub/pack.zip"), &vec![0xEFu8; 3000]);
+
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level, "-route"],
+        &[],
+    );
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    // List must see all entries (both frames).
+    let out = Command::new(syc_bin())
+        .args(["l", archive.to_str().unwrap()])
+        .output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("notes.txt"), "list missing default-bucket entry: {stdout}");
+    assert!(stdout.contains("image.jpg"), "list missing media-bucket entry: {stdout}");
+    assert!(stdout.contains("clip.mp4"), "list missing media-bucket entry: {stdout}");
+    assert!(stdout.contains("pack.zip"), "list missing media-bucket entry: {stdout}");
+    run_syc(&["t", archive.to_str().unwrap()], &[]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_route_zstd() { roundtrip_route("1", "route-zstd"); }
+
+#[test]
+fn roundtrip_route_lzma() { roundtrip_route("5", "route-lzma"); }
+
 #[test]
 fn roundtrip_delta_zstd_s2() { roundtrip_delta("1", "2", "delta-zstd-s2"); }
 
