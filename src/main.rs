@@ -347,14 +347,16 @@ impl ChunkedWriter {
         let current = File::create(&path)?;
         Ok(Self { base, part: 1, current, written_in_part: 0, chunk_size })
     }
+    fn announce(&self, part: u32, size: u64) {
+        // \r + 80-char-wide line nukes any leftover progress-bar pixels to the
+        // right (zpaqfranz progress is ~70 chars). \n commits and the next
+        // progress refresh resumes on a fresh line.
+        let line = format!("wrote   {} ({})", part_path(&self.base, part).display(), human_si(size));
+        eprintln!("\r{:<80}", line);
+    }
     fn rotate(&mut self) -> std::io::Result<()> {
         self.current.flush()?;
-        // Announce the just-finished part so the user can see split progress
-        // as it streams. Goes to stderr (won't pollute archives piped to
-        // stdout — chunked mode already disallows stdout, but be defensive).
-        let closed = part_path(&self.base, self.part);
-        eprintln!("\rwrote   {} ({})            ",
-            closed.display(), human_si(self.written_in_part));
+        self.announce(self.part, self.written_in_part);
         self.part += 1;
         self.current = File::create(part_path(&self.base, self.part))?;
         self.written_in_part = 0;
@@ -364,16 +366,30 @@ impl ChunkedWriter {
 
 impl Write for ChunkedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.written_in_part >= self.chunk_size {
+        // zpaqfranz semantics: write the whole buffer, then rotate once we've
+        // crossed the threshold. Parts end up slightly larger than chunk_size
+        // (by up to one upstream write — typically tens of KiB) but each part
+        // ends on a clean writer-boundary instead of mid-buffer.
+        let n = self.current.write(buf)?;
+        self.written_in_part += n as u64;
+        if self.written_in_part > self.chunk_size {
             self.rotate()?;
         }
-        let room = (self.chunk_size - self.written_in_part) as usize;
-        let to_write = buf.len().min(room);
-        let n = self.current.write(&buf[..to_write])?;
-        self.written_in_part += n as u64;
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> { self.current.flush() }
+}
+
+// Final partial part never crosses the threshold, so rotate() never announces
+// it. Drop fires at end of the writer's scope (after pack_all + finish_writes
+// have flushed the encoder), so written_in_part is the real on-disk size.
+impl Drop for ChunkedWriter {
+    fn drop(&mut self) {
+        let _ = self.current.flush();
+        if self.written_in_part > 0 {
+            self.announce(self.part, self.written_in_part);
+        }
+    }
 }
 
 /// Reader that transparently concatenates base.001, .002, ... when the plain

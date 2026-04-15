@@ -295,6 +295,16 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.9 — chunk rotation = zpaqfranz semantics + Drop announce (2026-04-16)
+
+**ChunkedWriter::write** ahora replica la mecánica de `myfwrite` en zpaqfranz (`zpaqfranz.cpp:44083`): escribe el buffer entero a la parte actual y rota DESPUÉS si `written_in_part > chunk_size`. Las partes terminan ligeramente más grandes que `-chunk SIZE` (por hasta un upstream-write, típicamente decenas/cientos de KiB), pero cada rotación cae en una frontera de write limpia en vez de partir un buffer al medio. Decisión del usuario: "no importa la exactitud", queremos clon de zpaqfranz.
+
+**Drop impl en ChunkedWriter**: la última parte parcial nunca cruza el umbral, por lo que `rotate()` no la anuncia. Un `Drop` que ahora cierra la parte actual e imprime su `wrote …` real (best-effort, sin propagar errores). El Box<dyn Write> en `cmd_add` muere después de `encoder.finish()`, por lo que `written_in_part` es el tamaño real en disco.
+
+**Padding del `wrote …`**: subido a 80 chars con `\r{:<80}\n` para barrer cualquier residuo de la barra de progreso a la derecha. Antes se veían pixeles tipo "1.47 GB/s" pegados al final del `wrote a.syc.001 …`.
+
+Comparativa práctica con `zpaqfranz a 'z_????.zpaq' payload.bin -chunk 12MB`: ambos producen 4 partes (3 llenas + 1 parcial) sobre 50 MB de input. Tamaños syc 13.2 MiB (overshoot ~1.2 MiB del buffer de zstd-MT), zpaqfranz 12.06 MiB (overshoot 64 KiB del bloque interno de zpaq).
+
 ## v0.1.8 — `-chunk XMB/GB` size suffixes + part rotation log (tareas #35-36, 2026-04-16)
 
 **#35 Size suffix parser** (`src/cli.rs`):
