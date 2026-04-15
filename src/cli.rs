@@ -6,7 +6,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// with a fallback to a hard-coded string so `cargo build` works without
 /// a build script. Update manually per release — keeps binary bit-identical
 /// if the date is pinned.
-pub const BUILD_DATE: &str = "2026-04-17";
+pub const BUILD_DATE: &str = "2026-04-16";
 
 #[derive(Debug, Default)]
 pub struct Opts {
@@ -298,11 +298,7 @@ fn arg_val<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str>
 /// zpaqfranz). Uses eprintln so it stays on stderr and won't contaminate
 /// piped archive streams.
 pub fn banner() {
-    let line = format!(
-        "syc v{VERSION}-zstd,lzma,ppmd,xattr,HW xxh3/blake3,({BUILD_DATE})",
-        VERSION = VERSION,
-        BUILD_DATE = BUILD_DATE,
-    );
+    let line = format!("syc v{VERSION} - {BUILD_DATE} - by Yade Bravo (YadeWira)");
     eprintln!("{}", crate::color::g(&line));
     eprintln!("Streaming archiver w/ dedup (pure-ish Rust)");
 }

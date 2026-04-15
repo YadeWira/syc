@@ -605,7 +605,7 @@ fn cmd_dedupe(root: PathBuf, opts: Opts) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
+fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()> {
     let started = Instant::now();
 
     if !(0..=10).contains(&opts.level) {
@@ -714,6 +714,26 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum();
+
+    // Auto-MT: when the user didn't pass -t, scale threads with the input.
+    // Single-threaded zstd at L1 caps near 600 MB/s on a fast core; with
+    // multithread() the encoder splits the stream into independent blocks and
+    // runs them in parallel. LZMA's MT path has its own ratio-vs-cores gate
+    // (build_lzma_stream), so it's safe to forward the same auto value.
+    // Threshold at 256 MiB: smaller inputs barely benefit because spawn +
+    // block setup eats the win, and ratio cost on tiny data shows up more.
+    if opts.threads == 0 && total_raw >= 256 * 1024 * 1024 {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        // Cap at 8: zstd's internal MT scales sub-linearly past that on most
+        // hardware and just burns CPU for tiny gains.
+        opts.threads = cores.min(8).max(1);
+        if !opts.summary && opts.threads > 1 {
+            eprintln!("threads {} (auto: -t not set, input {})",
+                opts.threads, human_si(total_raw));
+        }
+    }
 
     // Progress bar total: actual bytes pack_all will feed to the compressor,
     // so hardlink-dedup'd entries and media-bucket files are both included

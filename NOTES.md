@@ -295,6 +295,18 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.6 — auto-MT zstd + banner trim (tareas #31-32, 2026-04-16)
+
+**#31 Auto-MT zstd cuando el input pesa** (`src/main.rs`):
+- Cuando `opts.threads == 0` (no se pasó `-threads`) **y** `total_raw >= 256 MiB`, syc autodetecta cores con `std::thread::available_parallelism()`, los capa a 8 y los inyecta a `enc.multithread()` de zstd y al `MtStreamBuilder` de LZMA.
+- Reportado por usuario: en un i9-11900K (16 threads), `syc a -m 1 data.tar` corría a 1 hilo (`1T` en el footer) — FreeArc usaba 4 cores en el mismo input. Ratio nuestro era mejor pero wall-time perdía por falta de paralelismo.
+- Cap a 8: zstd-MT escala sublinear pasados 8 workers en hardware típico.
+- Threshold a 256 MiB: por debajo de eso el spawn + setup se come la ganancia.
+
+**#32 Banner simplificado** (`src/cli.rs`):
+- Antes: `syc v0.1.4-zstd,lzma,ppmd,xattr,HW xxh3/blake3,(2026-04-16)` — un trabalengua de feature flags que el usuario nunca leyó.
+- Después: `syc v0.1.6 - 2026-04-16 - by Yade Bravo (YadeWira)` — versión, fecha, autor. Las features quedan implícitas (siempre están todas compiladas) o se descubren con `syc h`.
+
 ## Polish iteration v0.1.5 (tareas #27-29, 2026-04-17)
 
 Tres pulidas en pos del clon zpaqfranz — uno nació de un bug report real del usuario en Windows:
