@@ -20,6 +20,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// how many fault lines scrolled by without counting them manually. Wraps
 /// back to 0 at u32::MAX, which in practice never happens.
 static ERR_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Same idea for warnings. zpaqfranz uses `NNNNN:` (colon, not bang) and
+/// yellow for both non-fatal warnings and info lines — we reserve this counter
+/// for warnings only so the footer number actually means something.
+static WARN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Initialize once at program entry. Color is enabled only when all of:
 /// stderr is a TTY, `-nocolor` not set, `NO_COLOR` env var absent.
@@ -73,3 +77,19 @@ pub fn err_line(msg: &str) -> String {
 }
 
 pub fn err_count() -> u32 { ERR_COUNT.load(Ordering::Relaxed) }
+
+/// Yellow zpaqfranz-style warning line: `00042: {msg}`. Bumps the global
+/// warning counter. Use for non-fatal issues that the user should notice but
+/// that don't stop the run (snapshot fallback, flag ignored because preamble
+/// locks it, etc.).
+pub fn warn_line(msg: &str) -> String {
+    let n = WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let body = format!("{:05}: {}", n, msg);
+    if enabled() {
+        format!("{}{}{}", YELLOW, body, RESET)
+    } else {
+        body
+    }
+}
+
+pub fn warn_count() -> u32 { WARN_COUNT.load(Ordering::Relaxed) }

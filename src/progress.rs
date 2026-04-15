@@ -103,6 +103,25 @@ impl Progress {
         eprintln!();
         self.dirty = false;
     }
+
+    /// Overwrite the current progress line with a "flushing..." hint so the
+    /// user can tell the compressor is still working after the counter hits
+    /// 100%. LZMA multi-thread finish() can take tens of seconds on a big
+    /// archive — without this the bar appears frozen.
+    pub fn flushing(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let (h, m, s) = hms(self.start.elapsed().as_secs());
+        eprint!(
+            "\r{label} flushing... {h:02}:{m:02}:{s:02}  {done}                              ",
+            label = self.label,
+            h = h, m = m, s = s,
+            done = human(self.done),
+        );
+        let _ = std::io::stderr().flush();
+        self.dirty = true;
+    }
 }
 
 fn hms(secs: u64) -> (u64, u64, u64) {

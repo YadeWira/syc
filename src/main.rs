@@ -93,8 +93,24 @@ fn main() {
     if let Err(e) = &res {
         eprintln!("{}", color::err_line(&format!("syc: {e:#}")));
         let n = color::err_count();
-        eprintln!("{}", color::r(&format!("({} error{}, with errors)",
-            n, if n == 1 { "" } else { "s" })));
+        let w = color::warn_count();
+        let warn_tail = if w > 0 {
+            format!(", {} warning{}", w, if w == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
+        eprintln!("{}", color::r(&format!("({} error{}{}, with errors)",
+            n, if n == 1 { "" } else { "s" }, warn_tail)));
+    } else {
+        // Success path: still surface a one-liner if we emitted any warnings
+        // so the user knows something non-fatal happened (e.g. snapshot
+        // fallback, flag locked by preamble).
+        let w = color::warn_count();
+        if w > 0 {
+            eprintln!("{}", color::y(&format!(
+                "({} warning{})", w, if w == 1 { "" } else { "s" }
+            )));
+        }
     }
     if let (Some(cmd), Some(archive)) = (hook, archive_for_hook.as_ref()) {
         run_exec_hook(cmd, archive, status);
@@ -398,21 +414,28 @@ impl Read for ChunkedReader {
 
 /// Open the archive path for writing. Path "-" means stdout. If chunk_mib is
 /// set, output is split into archive.001, .002, ... (stdout + chunk is an error).
-fn open_output(archive: &Path, chunk_mib: Option<u64>) -> Result<Box<dyn Write>> {
+///
+/// For a regular single-file archive we write to `<archive>.tmp` and return
+/// that path as the second tuple element — the caller renames it to the final
+/// path once the stream has flushed cleanly. A cancelled/failed run therefore
+/// leaves the partial `.tmp` behind instead of clobbering the final name.
+fn open_output(archive: &Path, chunk_mib: Option<u64>) -> Result<(Box<dyn Write>, Option<PathBuf>)> {
     if archive.as_os_str() == "-" {
         if chunk_mib.is_some() {
             return Err(anyhow!("-chunk cannot be combined with stdout (`-`)"));
         }
-        return Ok(Box::new(std::io::stdout().lock()));
+        return Ok((Box::new(std::io::stdout().lock()), None));
     }
     if let Some(mib) = chunk_mib {
         let chunk_size = mib.saturating_mul(1024 * 1024).max(1);
-        Ok(Box::new(ChunkedWriter::new(archive.to_path_buf(), chunk_size)?))
-    } else {
-        Ok(Box::new(
-            File::create(archive).with_context(|| format!("create {}", archive.display()))?,
-        ))
+        return Ok((Box::new(ChunkedWriter::new(archive.to_path_buf(), chunk_size)?), None));
     }
+    let mut tmp = archive.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp_path = PathBuf::from(tmp);
+    let f = File::create(&tmp_path)
+        .with_context(|| format!("create {}", tmp_path.display()))?;
+    Ok((Box::new(f), Some(tmp_path)))
 }
 
 /// Open the archive path for reading. Path "-" means stdin. If the plain path
@@ -722,7 +745,11 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
 
     let is_stream = is_stream_path(&archive);
     let is_chunked = opts.chunk_mib.is_some() && !is_stream;
-    let mut bw = BufWriter::with_capacity(archive::IO_BUF, open_output(&archive, opts.chunk_mib)?);
+    let (out, tmp_path) = open_output(&archive, opts.chunk_mib)?;
+    // When tmp_path is Some we're writing to `<archive>.tmp`; rename to the
+    // final name only after the encoder chain and the optional route-frame
+    // append have flushed. Route-append also targets tmp_path.
+    let mut bw = BufWriter::with_capacity(archive::IO_BUF, out);
     // Pick preprocessor based on size:
     //   <128 MiB  → none (LZMA's 128 MiB dict already covers it)
     //   128 MiB..512 MiB → REP (catches shorter repeats too, hash still sparse)
@@ -963,10 +990,11 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     // (if any), so the top-level decoder handles it as just another frame.
     // Wrapping checks already rejected ppmd, REP/SREP, delta, stdout, chunk.
     if opts.route && !media_entries.is_empty() {
+        let route_target: &Path = tmp_path.as_deref().unwrap_or(&archive);
         let append_file = OpenOptions::new()
             .append(true)
-            .open(&archive)
-            .with_context(|| format!("open for route-append {}", archive.display()))?;
+            .open(route_target)
+            .with_context(|| format!("open for route-append {}", route_target.display()))?;
         let bw2 = BufWriter::with_capacity(archive::IO_BUF, append_file);
         match backend {
             Backend::Zstd => {
@@ -1003,6 +1031,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     }
 
     prog.finish();
+
+    // Atomic commit: promote the .tmp file to its final name only now, after
+    // every frame has flushed. On cancel/failure the .tmp stays so the user
+    // can inspect or delete it; the final path is never half-written.
+    if let Some(tp) = tmp_path.as_deref() {
+        std::fs::rename(tp, &archive)
+            .with_context(|| format!("rename {} -> {}", tp.display(), archive.display()))?;
+    }
 
     let out_size = if is_stream {
         0
@@ -1201,20 +1237,23 @@ fn cmd_add_append(
     // on the CLI. Warn so the user isn't surprised.
     let archive_xattrs = preproc & archive::FEATURE_XATTRS != 0;
     if opts.xattrs && !archive_xattrs {
-        eprintln!("warning: -xattrs ignored (archive was created without FEATURE_XATTRS)");
+        eprintln!("{}", color::warn_line("-xattrs ignored (archive was created without FEATURE_XATTRS)"));
     } else if !opts.xattrs && archive_xattrs && !opts.summary {
-        eprintln!("note: archive has FEATURE_XATTRS, appended entries will include xattrs too");
+        eprintln!("{}", color::warn_line("archive has FEATURE_XATTRS, appended entries will include xattrs too"));
     }
     opts.xattrs = archive_xattrs;
 
     if opts.hash.is_some() && !opts.summary {
         eprintln!(
-            "warning: -hash ignored (archive locks hash algo to {})",
-            hash_algo.map(|h| h.name()).unwrap_or("none")
+            "{}",
+            color::warn_line(&format!(
+                "-hash ignored (archive locks hash algo to {})",
+                hash_algo.map(|h| h.name()).unwrap_or("none")
+            ))
         );
     }
     if opts.comment.is_some() && !opts.summary {
-        eprintln!("warning: -comment ignored (archive preamble is preserved)");
+        eprintln!("{}", color::warn_line("-comment ignored (archive preamble is preserved)"));
     }
     let _ = existing_comment;
 
@@ -1608,6 +1647,10 @@ fn pack_all<W: Write>(
         }
         *n_entries += 1;
     }
+    // All entries streamed. The encoder's finish() step can still take a
+    // while (LZMA MT in particular), so flip the bar to a "flushing..."
+    // message before we hand control to enc.finish() back in cmd_add.
+    progress.flushing();
     Ok(())
 }
 

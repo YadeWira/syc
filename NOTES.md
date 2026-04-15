@@ -295,6 +295,28 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## Polish iteration v0.1.5 (tareas #27-29, 2026-04-17)
+
+Tres pulidas en pos del clon zpaqfranz — uno nació de un bug report real del usuario en Windows:
+
+**#27 Atomic .tmp write + rename on pack** (`src/main.rs`):
+- `open_output` ahora escribe a `<archive>.tmp` cuando el destino es un archivo regular (stdout y `-chunk` quedan como estaban).
+- Tras `prog.finish()` y después del route-append, `std::fs::rename(tmp, archive)` promueve el archivo a su nombre final.
+- Si el usuario cancela (Ctrl-C) o el compresor falla, el `.tmp` queda tirado y el nombre final jamás se crea. Antes: el `.syc` quedaba truncado y aparentemente válido.
+- Route-append (`opts.route`) ahora abre `tmp_path` (no el path final).
+- Reportado por el usuario tras cancelar un pack de 1.75 GiB en Windows: "lo cancele y termina asi, y deja un archivo incompleto".
+
+**#28 Flushing... indicator** (`src/progress.rs` + `pack_all`):
+- `Progress::flushing()` sobreescribe la línea de progreso con `"{label} flushing... HH:MM:SS {done}"` en stderr.
+- Llamado al final de `pack_all()`, justo antes del `encoder.finish()` de cada arm (LZMA-MT puede tardar decenas de segundos vaciando el stream).
+- El `prog.finish()` subsiguiente reemplaza la línea por las stats normales + newline, así que visualmente sólo aparece durante el flush real.
+
+**#29 Yellow `warn_line` helper + footer** (`src/color.rs`):
+- `warn_line(msg)` → `"00042: msg"` amarillo, contador global independiente del de errores.
+- `warn_count()` público para el footer.
+- En éxito con warnings: footer amarillo `(N warnings)`; en error con warnings: `(N errors, M warnings, with errors)`.
+- Sitios convertidos: `cmd_add_append` (xattrs/hash/comment locked por preamble), `snapshot::take_snapshot` (btrfs/zfs/unsupported fallbacks).
+
 ## zpaqfranz clone UX (tareas #24-26, 2026-04-16)
 
 Tres toques para que `syc` se sienta como un clon de zpaqfranz — apariencia + semántica de salida:

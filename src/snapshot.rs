@@ -44,18 +44,22 @@ pub fn take_snapshot(src: &Path) -> Result<SnapshotGuard> {
     let fs = detect_fs(src);
     match fs {
         Some("btrfs") => Ok(try_btrfs(src).unwrap_or_else(|e| {
-            eprintln!("-snapshot: btrfs fallback ({e}); using live tree");
+            eprintln!("{}", crate::color::warn_line(&format!(
+                "-snapshot: btrfs fallback ({e}); using live tree"
+            )));
             SnapshotGuard::passthrough(src)
         })),
         Some("zfs") => Ok(try_zfs(src).unwrap_or_else(|e| {
-            eprintln!("-snapshot: zfs fallback ({e}); using live tree");
+            eprintln!("{}", crate::color::warn_line(&format!(
+                "-snapshot: zfs fallback ({e}); using live tree"
+            )));
             SnapshotGuard::passthrough(src)
         })),
         other => {
-            eprintln!(
+            eprintln!("{}", crate::color::warn_line(&format!(
                 "-snapshot: filesystem {} not supported (need btrfs or zfs); using live tree",
                 other.unwrap_or("unknown")
-            );
+            )));
             Ok(SnapshotGuard::passthrough(src))
         }
     }
