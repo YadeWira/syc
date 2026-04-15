@@ -325,12 +325,14 @@ fn cmd_compare(left: PathBuf, right: PathBuf, opts: Opts) -> Result<()> {
     Ok(())
 }
 
-/// Wraps any writer to tally bytes that actually reached the inner sink.
-/// Sits *under* BufWriter (i.e. closer to disk) so the counter advances when
-/// the buffer flushes, not when the caller pokes the buffer. That lines up
-/// with what zpaqfranz's `g_scritti` counts (post-MT-flush bytes), and means
-/// the projection in the progress bar reflects bytes actually written instead
-/// of bytes the encoder *might* still be holding internally.
+/// Wraps any writer to tally bytes the encoder emitted.
+/// Sits *above* BufWriter (between encoder and buffer) so the counter ticks
+/// the moment the encoder produces output, not after BufWriter's 1 MiB
+/// buffer flushes. Important for LZMA-MT: workers buffer internally and only
+/// emit output blocks during `finish()`; counting at disk-level would show
+/// 0 B for tens of seconds even though the compressor is alive. This is
+/// closer to zpaqfranz's `g_scritti` in spirit (tracks compressor output),
+/// just sitting one layer up the chain.
 struct CountingWriter<W: Write> {
     inner: W,
     counter: Arc<AtomicU64>,
@@ -339,6 +341,9 @@ struct CountingWriter<W: Write> {
 impl<W: Write> CountingWriter<W> {
     fn new(inner: W, counter: Arc<AtomicU64>) -> Self {
         Self { inner, counter }
+    }
+    fn into_inner(self) -> W {
+        self.inner
     }
 }
 
@@ -829,8 +834,8 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     // append have flushed. Route-append also targets tmp_path.
     let comp_counter = Arc::new(AtomicU64::new(0));
     prog.set_compressed_counter(Arc::clone(&comp_counter));
-    let counted = CountingWriter::new(out, Arc::clone(&comp_counter));
-    let mut bw = BufWriter::with_capacity(archive::IO_BUF, counted);
+    let bw_inner = BufWriter::with_capacity(archive::IO_BUF, out);
+    let mut bw = CountingWriter::new(bw_inner, Arc::clone(&comp_counter));
     // Pick preprocessor based on size:
     //   <128 MiB  → none (LZMA's 128 MiB dict already covers it)
     //   128 MiB..512 MiB → REP (catches shorter repeats too, hash still sparse)
@@ -976,13 +981,15 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
                 let mut dw = delta::DeltaWriter::new(enc, stride);
                 pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = dw.finish()?;
-                let bw = enc.finish()?;
-                let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+                let counted = enc.finish()?;
+                let bw_inner = counted.into_inner();
+                let mut inner = bw_inner.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             } else {
                 pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
-                let bw = enc.finish()?;
-                let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
+                let counted = enc.finish()?;
+                let bw_inner = counted.into_inner();
+                let mut inner = bw_inner.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             }
         }
@@ -1077,9 +1084,11 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             .open(route_target)
             .with_context(|| format!("open for route-append {}", route_target.display()))?;
         // Share the same counter so the second-frame bytes also feed the
-        // progress projection.
-        let counted2 = CountingWriter::new(append_file, Arc::clone(&comp_counter));
-        let bw2 = BufWriter::with_capacity(archive::IO_BUF, counted2);
+        // progress projection. CountingWriter sits *above* BufWriter to count
+        // encoder output as soon as it's produced (LZMA-MT batches output;
+        // counting at disk-level would lag for many seconds).
+        let bw2_inner = BufWriter::with_capacity(archive::IO_BUF, append_file);
+        let bw2 = CountingWriter::new(bw2_inner, Arc::clone(&comp_counter));
         match backend {
             Backend::Zstd => {
                 let mut enc = if dict.is_empty() {
@@ -1092,7 +1101,8 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
                 }
                 let _ = enc.include_checksum(true);
                 pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media, &mut prog)?;
-                let bw2 = enc.finish()?;
+                let counted2 = enc.finish()?;
+                let bw2 = counted2.into_inner();
                 let mut inner = bw2.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             }
@@ -1346,8 +1356,8 @@ fn cmd_add_append(
         .open(&archive)
         .with_context(|| format!("open for append {}", archive.display()))?;
     let comp_counter = Arc::new(AtomicU64::new(0));
-    let counted = CountingWriter::new(file, Arc::clone(&comp_counter));
-    let bw = BufWriter::with_capacity(archive::IO_BUF, counted);
+    let bw_inner = BufWriter::with_capacity(archive::IO_BUF, file);
+    let bw = CountingWriter::new(bw_inner, Arc::clone(&comp_counter));
 
     // Dedup applies within the appended frame only — we don't scan the existing
     // frame(s) so an appended file that matches an old one still gets re-packed.
@@ -1385,7 +1395,8 @@ fn cmd_add_append(
                 let _ = enc.long_distance_matching(true);
             }
             pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup, &mut prog)?;
-            let bw = enc.finish()?;
+            let counted = enc.finish()?;
+            let bw = counted.into_inner();
             let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
             inner.flush()?;
         }

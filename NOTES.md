@@ -295,6 +295,20 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.12 — progress: CountingWriter sobre BufWriter + flushing pad (2026-04-16)
+
+**Bug visible en v0.1.11**: durante `flushing...` el counter `comp` quedaba en `22 B` (preámbulo) durante minutos, y al final aparecían pixeles `B/s \` colgando a la derecha de la línea.
+
+**Causa #1**: `CountingWriter` estaba *bajo* `BufWriter` (1 MiB), así que solo veía bytes cuando el buffer hacía flush — y con LZMA-MT, los workers acumulan todo el output internamente y solo emiten en bloques al `finish()`, llegando a BufWriter en ráfagas.
+
+**Fix #1**: subir `CountingWriter` *encima* del `BufWriter` (entre encoder y buffer). Ahora cuenta cuando el encoder emite, sin esperar a que se llene el buffer. Cambio mecánico en los call sites de zstd que usaban `bw.into_inner()` — añadido `CountingWriter::into_inner()` y un paso extra de unwrap.
+
+**Causa #2**: el `format!()` del flushing era ~75 chars vs ~82 del render normal, dejando residuo a la derecha.
+
+**Fix #2**: construir la línea con `format!` y luego `eprint!("\r{:<82}", line)` para garantizar ancho fijo.
+
+**Lo que sigue siendo limitación, no bug**: con `xz2` LZMA-MT (`-m 5 -threads N`), los workers buffean TODO el input antes de emitir. Resultado: la barra muestra input subiendo rápido pero `comp` queda casi 0 hasta que `enc.finish()` libera los workers. Test 700 MB texto+random: input 0→97 % en ~2 s, luego flushing 2:47 con `comp` saltando 1.28 MB → 17 → 106 → 177 → 240 → 327 → 425 → 476 MB en el último segundo. Esto es xz2 MT, no nuestra capa. Con zstd MT o LZMA single-thread la barra avanza sincronizada.
+
 ## v0.1.11 — progress: i_scritti + projection (2026-04-16)
 
 Cierro la pieza que quedaba de la rama "rica" del `print_progress` de zpaqfranz: la columna de bytes ya escritos al archivo y la proyección del tamaño final.

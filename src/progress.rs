@@ -174,26 +174,31 @@ impl Progress {
             while !stop_t.load(Ordering::Relaxed) {
                 let (h, m, s) = hms(start.elapsed().as_secs());
                 let c = SPINNER[spin % SPINNER.len()];
-                if let Some(ca) = &comp_arc {
+                // Pad to ≥ the regular render width (~82 chars) so no leftover
+                // pixels from the prior `… rate/s spin   ` line bleed out the
+                // right edge. Building the line then `{:<82}` is the cleanest
+                // way to guarantee it.
+                let line = if let Some(ca) = &comp_arc {
                     // Compressed counter keeps moving while encoder.finish()
                     // drains internal buffers — that's the whole point of
                     // showing it here.
                     let comp = ca.load(Ordering::Relaxed);
-                    eprint!(
-                        "\r       flushing... {h:02}:{m:02}:{s:02}  ({done})->({comp}) {c}                  ",
+                    format!(
+                        "       flushing... {h:02}:{m:02}:{s:02}  ({done})->({comp}) {c}",
                         h = h, m = m, s = s,
                         done = human(done),
                         comp = human(comp),
                         c = c,
-                    );
+                    )
                 } else {
-                    eprint!(
-                        "\r       flushing... {h:02}:{m:02}:{s:02}  ({done}) {c}                              ",
+                    format!(
+                        "       flushing... {h:02}:{m:02}:{s:02}  ({done}) {c}",
                         h = h, m = m, s = s,
                         done = human(done),
                         c = c,
-                    );
-                }
+                    )
+                };
+                eprint!("\r{:<82}", line);
                 let _ = std::io::stderr().flush();
                 spin = spin.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(125));
