@@ -16,7 +16,7 @@
 //! by calling `finish()`.
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -35,6 +35,7 @@ pub struct Progress {
     spin: usize,
     flush_stop: Option<Arc<AtomicBool>>,
     flush_thread: Option<JoinHandle<()>>,
+    compressed: Option<Arc<AtomicU64>>,
 }
 
 impl Progress {
@@ -53,7 +54,16 @@ impl Progress {
             spin: 0,
             flush_stop: None,
             flush_thread: None,
+            compressed: None,
         }
+    }
+
+    /// Hand over a counter that the writer chain increments after every byte
+    /// it lands on disk. With this set + `total > 0`, render switches to the
+    /// `(in)->(out)=>(projection)` format (zpaqfranz `print_progress`'s rich
+    /// branch). Projection extrapolates the current ratio to the full input.
+    pub fn set_compressed_counter(&mut self, c: Arc<AtomicU64>) {
+        self.compressed = Some(c);
     }
 
     pub fn advance(&mut self, n: u64) {
@@ -88,15 +98,37 @@ impl Progress {
                 0
             };
             let (h, m, s) = hms(eta_secs);
-            eprint!(
-                "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done})=>({total}) {rate}/s {spin}   ",
-                pct = pct,
-                h = h, m = m, s = s,
-                done = human(self.done),
-                total = human(self.total),
-                rate = human(rate_u),
-                spin = spin,
-            );
+            if let Some(c) = &self.compressed {
+                let comp = c.load(Ordering::Relaxed);
+                // proj = comp * total / done : extrapolates current ratio to
+                // the full input. Saturating math keeps a runaway estimate from
+                // wrapping when comp is huge and done is small early on.
+                let proj = if self.done > 0 {
+                    ((comp as u128) * (self.total as u128) / (self.done as u128)) as u64
+                } else {
+                    0
+                };
+                eprint!(
+                    "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done})->({comp})=>({proj}) {rate}/s {spin}   ",
+                    pct = pct,
+                    h = h, m = m, s = s,
+                    done = human(self.done),
+                    comp = human(comp),
+                    proj = human(proj),
+                    rate = human(rate_u),
+                    spin = spin,
+                );
+            } else {
+                eprint!(
+                    "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done})=>({total}) {rate}/s {spin}   ",
+                    pct = pct,
+                    h = h, m = m, s = s,
+                    done = human(self.done),
+                    total = human(self.total),
+                    rate = human(rate_u),
+                    spin = spin,
+                );
+            }
         } else {
             let (h, m, s) = hms(self.start.elapsed().as_secs());
             eprint!(
@@ -136,17 +168,32 @@ impl Progress {
         let stop_t = Arc::clone(&stop);
         let start = self.start;
         let done = self.done;
+        let comp_arc = self.compressed.clone();
         let handle = std::thread::spawn(move || {
             let mut spin = 0usize;
             while !stop_t.load(Ordering::Relaxed) {
                 let (h, m, s) = hms(start.elapsed().as_secs());
                 let c = SPINNER[spin % SPINNER.len()];
-                eprint!(
-                    "\r       flushing... {h:02}:{m:02}:{s:02}  ({done}) {c}                              ",
-                    h = h, m = m, s = s,
-                    done = human(done),
-                    c = c,
-                );
+                if let Some(ca) = &comp_arc {
+                    // Compressed counter keeps moving while encoder.finish()
+                    // drains internal buffers — that's the whole point of
+                    // showing it here.
+                    let comp = ca.load(Ordering::Relaxed);
+                    eprint!(
+                        "\r       flushing... {h:02}:{m:02}:{s:02}  ({done})->({comp}) {c}                  ",
+                        h = h, m = m, s = s,
+                        done = human(done),
+                        comp = human(comp),
+                        c = c,
+                    );
+                } else {
+                    eprint!(
+                        "\r       flushing... {h:02}:{m:02}:{s:02}  ({done}) {c}                              ",
+                        h = h, m = m, s = s,
+                        done = human(done),
+                        c = c,
+                    );
+                }
                 let _ = std::io::stderr().flush();
                 spin = spin.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(125));

@@ -295,6 +295,16 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.11 — progress: i_scritti + projection (2026-04-16)
+
+Cierro la pieza que quedaba de la rama "rica" del `print_progress` de zpaqfranz: la columna de bytes ya escritos al archivo y la proyección del tamaño final.
+
+- **`CountingWriter<W>` en `src/main.rs`**: wrap entre `BufWriter` y la salida (File / ChunkedWriter / OpenOptions append). Cada `write` exitoso suma a un `Arc<AtomicU64>`. Vive *bajo* el BufWriter para contar bytes que efectivamente bajaron al sink (no los que el buffer aún tiene), análogo a `g_scritti+= n` en zpaqfranz tras flush MT (`zpaqfranz.cpp:71474`).
+- **`Progress::set_compressed_counter(Arc<AtomicU64>)`** (`src/progress.rs`): el ticker lee el counter en cada render. Cuando hay counter + `total > 0`, formato cambia de `(in)=>(total)` a `(in)->(comp)=>(proj)` con `proj = comp * total / done` (i128 intermedio para evitar overflow temprano cuando comp ≫ done). El ticker de `flushing()` también muestra `(in)->(comp)` para que el comprimido siga subiendo durante `encoder.finish()`.
+- **Cableado**: ambos paths de pack — `cmd_add` (con/sin route, route-append comparte el mismo Arc) y `cmd_append`. Extract/test no usan el counter (input-driven, ya tienen total stub a 0).
+
+Verificado con script-PTY sobre 250 MB (200 MB urandom + 50 MB ceros, lzma -m 5 -threads 4): la proyección converge a 190.16 MB durante el run y el resultado real es 190.75 MB.
+
 ## v0.1.10 — progress format zpaqfranz + spinner + flushing live ticker (2026-04-16)
 
 `src/progress.rs` reescrito:

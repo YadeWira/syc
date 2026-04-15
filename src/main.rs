@@ -13,6 +13,8 @@ use anyhow::{anyhow, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::archive::{
@@ -321,6 +323,34 @@ fn cmd_compare(left: PathBuf, right: PathBuf, opts: Opts) -> Result<()> {
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// Wraps any writer to tally bytes that actually reached the inner sink.
+/// Sits *under* BufWriter (i.e. closer to disk) so the counter advances when
+/// the buffer flushes, not when the caller pokes the buffer. That lines up
+/// with what zpaqfranz's `g_scritti` counts (post-MT-flush bytes), and means
+/// the projection in the progress bar reflects bytes actually written instead
+/// of bytes the encoder *might* still be holding internally.
+struct CountingWriter<W: Write> {
+    inner: W,
+    counter: Arc<AtomicU64>,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn new(inner: W, counter: Arc<AtomicU64>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Build the per-part path for -chunk output: base becomes base.001, .002, ...
@@ -797,7 +827,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     // When tmp_path is Some we're writing to `<archive>.tmp`; rename to the
     // final name only after the encoder chain and the optional route-frame
     // append have flushed. Route-append also targets tmp_path.
-    let mut bw = BufWriter::with_capacity(archive::IO_BUF, out);
+    let comp_counter = Arc::new(AtomicU64::new(0));
+    prog.set_compressed_counter(Arc::clone(&comp_counter));
+    let counted = CountingWriter::new(out, Arc::clone(&comp_counter));
+    let mut bw = BufWriter::with_capacity(archive::IO_BUF, counted);
     // Pick preprocessor based on size:
     //   <128 MiB  → none (LZMA's 128 MiB dict already covers it)
     //   128 MiB..512 MiB → REP (catches shorter repeats too, hash still sparse)
@@ -1043,7 +1076,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             .append(true)
             .open(route_target)
             .with_context(|| format!("open for route-append {}", route_target.display()))?;
-        let bw2 = BufWriter::with_capacity(archive::IO_BUF, append_file);
+        // Share the same counter so the second-frame bytes also feed the
+        // progress projection.
+        let counted2 = CountingWriter::new(append_file, Arc::clone(&comp_counter));
+        let bw2 = BufWriter::with_capacity(archive::IO_BUF, counted2);
         match backend {
             Backend::Zstd => {
                 let mut enc = if dict.is_empty() {
@@ -1309,7 +1345,9 @@ fn cmd_add_append(
         .append(true)
         .open(&archive)
         .with_context(|| format!("open for append {}", archive.display()))?;
-    let bw = BufWriter::with_capacity(archive::IO_BUF, file);
+    let comp_counter = Arc::new(AtomicU64::new(0));
+    let counted = CountingWriter::new(file, Arc::clone(&comp_counter));
+    let bw = BufWriter::with_capacity(archive::IO_BUF, counted);
 
     // Dedup applies within the appended frame only — we don't scan the existing
     // frame(s) so an appended file that matches an old one still gets re-packed.
@@ -1328,6 +1366,7 @@ fn cmd_add_append(
     let progress_total = packable_bytes(&entries, &dedup);
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("pack", progress_total, progress_enabled);
+    prog.set_compressed_counter(Arc::clone(&comp_counter));
 
     match backend {
         Backend::Zstd => {
