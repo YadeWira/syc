@@ -507,6 +507,7 @@ pub fn pack_entry<W: Write>(
     buf: &mut [u8],
     hash_algo: Option<HashAlgo>,
     with_xattrs: bool,
+    on_bytes: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let meta = fs::symlink_metadata(full)
         .with_context(|| format!("stat {}", full.display()))?;
@@ -569,6 +570,7 @@ pub fn pack_entry<W: Write>(
             }
             if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
             out.write_all(&buf[..n])?;
+            on_bytes(n as u64);
             remaining -= n as u64;
         }
         if let (Some(h), Some(algo)) = (hasher, hash_algo) {

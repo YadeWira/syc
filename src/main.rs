@@ -1649,19 +1649,23 @@ fn pack_all<W: Write>(
                 archive::write_xattrs_block(enc, full, false)?;
             }
         } else if let Some(reg) = chunk_reg.as_mut() {
-            pack_entry_chunked(full, rel, enc, hash_algo, opts.xattrs, reg)?;
+            pack_entry_chunked(full, rel, enc, hash_algo, opts.xattrs, reg,
+                &mut |n| progress.advance(n))?;
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     *total_bytes += meta.len();
-                    progress.advance(meta.len());
                 }
             }
         } else {
-            pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs)?;
+            // Per-chunk progress: pack_entry calls back per write so a single
+            // multi-GB file ticks the bar instead of jumping straight to
+            // flushing... Total bytes counter still bumps once per file at
+            // the end (independent of progress UI).
+            pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
+                &mut |n| progress.advance(n))?;
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     *total_bytes += meta.len();
-                    progress.advance(meta.len());
                 }
             }
         }
@@ -1683,6 +1687,7 @@ fn pack_entry_chunked<W: Write>(
     hash_algo: Option<HashAlgo>,
     with_xattrs: bool,
     reg: &mut fastcdc::ChunkRegistry,
+    on_bytes: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let meta = std::fs::symlink_metadata(full)
         .with_context(|| format!("stat {}", full.display()))?;
@@ -1690,7 +1695,7 @@ fn pack_entry_chunked<W: Write>(
     // handles them; we only intercept regular files.
     if !meta.is_file() || meta.file_type().is_symlink() {
         let mut small_buf = vec![0u8; CHUNK];
-        return pack_entry(full, rel, out, &mut small_buf, hash_algo, with_xattrs);
+        return pack_entry(full, rel, out, &mut small_buf, hash_algo, with_xattrs, on_bytes);
     }
     let size = meta.len();
     let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -1720,6 +1725,7 @@ fn pack_entry_chunked<W: Write>(
     let mut hasher = hash_algo.map(archive::EntryHasher::new);
     let total = fastcdc::pack_chunked_body(r, out, reg, |bytes| {
         if let Some(h) = hasher.as_mut() { h.update(bytes); }
+        on_bytes(bytes.len() as u64);
     })?;
     if total != size {
         return Err(anyhow!("fastcdc: file {} changed during pack ({} vs {})",
