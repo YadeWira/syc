@@ -1,6 +1,7 @@
 mod archive;
 mod cli;
 mod delta;
+mod progress;
 mod rep;
 mod srep;
 
@@ -604,6 +605,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         .map(|m| m.len())
         .sum();
 
+    // Progress bar total: actual bytes pack_all will feed to the compressor,
+    // so hardlink-dedup'd entries and media-bucket files are both included
+    // but dedup skipped bytes are subtracted.
+    let progress_total: u64 = packable_bytes(&default_entries, &dedup_default)
+        + packable_bytes(&media_entries, &dedup_media);
+    let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
+    let mut prog = progress::Progress::new("pack", progress_total, progress_enabled);
+
     // Dict is opt-in via `-dict` (we don't auto-enable). In solid mode the
     // zstd stream already sees all shared templates inline, so a precomputed
     // dict is redundant at best and net-negative at worst (measured: +5..10 %
@@ -734,13 +743,13 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             }
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = dw.finish()?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             } else {
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let bw = enc.finish()?;
                 let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
@@ -766,25 +775,25 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             let enc = xz2::write::XzEncoder::new_stream(bw, stream);
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = dw.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -796,19 +805,19 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 .map_err(|e| anyhow!("ppmd init: {e}"))?;
             if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             }
@@ -835,7 +844,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                     let _ = enc.multithread(opts.threads);
                 }
                 let _ = enc.include_checksum(true);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media, &mut prog)?;
                 let bw2 = enc.finish()?;
                 let mut inner = bw2.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
@@ -843,7 +852,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             Backend::Lzma => {
                 let stream = build_lzma_stream(0, opts.threads, 0, Bcj::None)?;
                 let mut enc = xz2::write::XzEncoder::new_stream(bw2, stream);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_media, &mut prog)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -857,6 +866,8 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             );
         }
     }
+
+    prog.finish();
 
     let out_size = if is_stream {
         0
@@ -1026,6 +1037,9 @@ fn cmd_add_append(
 
     let mut total_bytes: u64 = 0;
     let mut n_entries: u64 = 0;
+    let progress_total = packable_bytes(&entries, &dedup);
+    let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
+    let mut prog = progress::Progress::new("pack", progress_total, progress_enabled);
 
     match backend {
         Backend::Zstd => {
@@ -1043,7 +1057,7 @@ fn cmd_add_append(
                 let _ = enc.window_log(27);
                 let _ = enc.long_distance_matching(true);
             }
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup, &mut prog)?;
             let bw = enc.finish()?;
             let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
             inner.flush()?;
@@ -1061,12 +1075,13 @@ fn cmd_add_append(
             };
             let stream = build_lzma_stream(opts.level, opts.threads, 0, bcj)?;
             let mut enc = xz2::write::XzEncoder::new_stream(bw, stream);
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup, &mut prog)?;
             let mut inner = enc.finish()?;
             inner.flush()?;
         }
         Backend::Ppmd => unreachable!(),
     }
+    prog.finish();
 
     let size_after = std::fs::metadata(&archive)?.len();
     let appended_bytes = size_after.saturating_sub(size_before);
@@ -1322,6 +1337,20 @@ fn build_lzma_stream(syc_level: i32, threads: u32, total_raw: u64, bcj: Bcj) -> 
     }
 }
 
+/// Sum of bytes `pack_all` will actually stream through the compressor for
+/// this bucket — regular files that aren't hardlink-dedup'd.
+fn packable_bytes(
+    all: &[(PathBuf, PathBuf)],
+    dedup: &std::collections::HashMap<PathBuf, String>,
+) -> u64 {
+    all.iter()
+        .filter(|(full, _)| !dedup.contains_key(full))
+        .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
 fn pack_all<W: Write>(
     enc: &mut W,
     all: &[(PathBuf, PathBuf)],
@@ -1330,6 +1359,7 @@ fn pack_all<W: Write>(
     total_bytes: &mut u64,
     n_entries: &mut u64,
     dedup: &std::collections::HashMap<PathBuf, String>,
+    progress: &mut progress::Progress,
 ) -> Result<()> {
     let mut buf = vec![0u8; CHUNK];
     for (full, rel) in all {
@@ -1354,6 +1384,7 @@ fn pack_all<W: Write>(
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     *total_bytes += meta.len();
+                    progress.advance(meta.len());
                 }
             }
         }
@@ -1491,6 +1522,8 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut buf = vec![0u8; CHUNK];
     let mut n_entries: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
+    let mut prog = progress::Progress::new("extract", 0, progress_enabled);
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if matches!(header.kind, EntryKind::File) {
             total_bytes += header.size;
@@ -1499,11 +1532,15 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
             eprintln!("- {}", header.path);
         }
         unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs)?;
+        if matches!(header.kind, EntryKind::File) {
+            prog.advance(header.size);
+        }
         n_entries += 1;
     }
 
     let mut sink = [0u8; 1024];
     while dec.read(&mut sink)? > 0 {}
+    prog.finish();
 
     let elapsed = started.elapsed();
     if opts.summary {
@@ -1614,6 +1651,8 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut n_entries: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut hashes_verified: u64 = 0;
+    let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
+    let mut prog = progress::Progress::new("test", 0, progress_enabled);
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         if opts.verbose {
@@ -1622,6 +1661,7 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
         if matches!(header.kind, EntryKind::File) {
             let mut remaining = header.size;
             total_bytes += remaining;
+            prog.advance(header.size);
             let mut hasher = hash_algo.map(EntryHasher::new);
             while remaining > 0 {
                 let want = remaining.min(buf.len() as u64) as usize;
@@ -1652,6 +1692,7 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
         }
         n_entries += 1;
     }
+    prog.finish();
     let elapsed = started.elapsed();
     let algo_name = hash_algo.map(|a| a.name()).unwrap_or("off");
     eprintln!(

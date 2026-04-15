@@ -36,6 +36,7 @@ pub struct Opts {
     pub delta: Option<u8>,
     pub route: bool,
     pub dedup: bool,
+    pub noprogress: bool,
 }
 
 #[derive(Debug)]
@@ -177,6 +178,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "append" => opts.append = true,
                 "route" => opts.route = true,
                 "dedup" => opts.dedup = true,
+                "noprogress" | "noeta" => opts.noprogress = true,
                 "nolong" => opts.nolong = true,
                 "nopreproc" => opts.nopreproc = true,
                 "level" | "m" => {
@@ -317,6 +319,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          a level-0 frame, saves CPU without losing ratio
            -dedup        pack identical files once; duplicates become hardlink
                          entries (extracted as hardlinks, fall back to copy)
+           -noprogress   suppress the progress bar (auto-off when stderr
+                         isn't a TTY; alias: -noeta)
            -nodict       force dict training off (opposite of -dict)
 
 Env      : SYC_BACKEND=ppmd   force PPMd7 (experimental, needs Dict/LZP)
