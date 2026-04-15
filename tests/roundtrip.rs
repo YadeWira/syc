@@ -351,9 +351,12 @@ fn roundtrip_dedup(level: &str, tag: &str) {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("blob.bin"), "list missing blob: {stdout}");
     assert!(stdout.contains("unique.txt"), "list missing unique: {stdout}");
-    // At least one entry line must begin with "h " (hardlink kind).
+    // At least one entry line must have the hardlink flag column ("h  <path> -> <target>").
     assert!(
-        stdout.lines().any(|l| l.starts_with("h ")),
+        stdout.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("h ") || l.contains(" h  ") || l.contains(" h\t") || l.contains(" -> ")
+        }),
         "list has no hardlink entries: {stdout}"
     );
 

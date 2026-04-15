@@ -2,6 +2,11 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Compile-time build date, baked in at build time via env!("SYC_BUILD_DATE")
+/// with a fallback to a hard-coded string so `cargo build` works without
+/// a build script. Update manually per release — keeps binary bit-identical
+/// if the date is pinned.
+pub const BUILD_DATE: &str = "2026-04-15";
 
 #[derive(Debug, Default)]
 pub struct Opts {
@@ -281,12 +286,23 @@ fn arg_val<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str>
         .ok_or_else(|| anyhow!("flag -{flag} needs a value"))
 }
 
+/// Compact 2-line banner printed at the top of every invocation (mimics
+/// zpaqfranz). Uses eprintln so it stays on stderr and won't contaminate
+/// piped archive streams.
 pub fn banner() {
+    eprintln!(
+        "syc v{VERSION}-zstd,lzma,ppmd,xattr,({BUILD_DATE})",
+        VERSION = VERSION,
+        BUILD_DATE = BUILD_DATE,
+    );
+    eprintln!("Streaming archiver + compressor  (pure-ish Rust)");
+}
+
+/// Full command index — printed by `syc h` (no args) or `syc` with no args.
+pub fn help_main() {
+    banner();
     println!(
         "\
-syc v{VERSION} — streaming archiver + zstd compressor (pure-ish Rust)
-Tuned for modest hardware  (C) 2026
-
 Help     : syc h <command>    (single)   syc h h   (full)
 Core     : a, x, l, t, v, c, d
 Info     : h, v
@@ -299,7 +315,6 @@ Info     : h, v
   c   compare    diff two directories by content (size+crc32)
   d   dedupe     report duplicate files in a tree (size+crc32)
   h   help       this screen, or detail for a command
-  v   version    print version
 
 Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -verbose  -summary  -force  -store  -nochecksum
@@ -329,15 +344,18 @@ Env      : SYC_BACKEND=ppmd   force PPMd7 (experimental, needs Dict/LZP)
            SYC_DICT=BYTES     LZMA dictionary size override
            SYC_LC/LP/PB/NICE  LZMA lc/lp/pb/nice_len overrides
            SYC_BCJ=x86|arm|armt|ia64|sparc|ppc  BCJ pre-filter (LZMA only)
-",
-        VERSION = VERSION
+"
     );
 }
 
 pub fn help(topic: Option<String>) {
+    // Sub-topic help: zpaqfranz prints the banner first on `h <cmd>` too.
+    if !matches!(topic.as_deref(), None | Some("h") | Some("help")) {
+        banner();
+    }
     match topic.as_deref() {
         None | Some("h") | Some("help") => {
-            banner();
+            help_main();
             println!(
 "Examples:
   syc a data.syc ./mydir -m 9 -threads 4

@@ -55,9 +55,14 @@ fn main() {
         ),
         _ => (None, None, None),
     };
+    // zpaqfranz prints its banner on every invocation, including real
+    // commands. Skip for help / bare `syc` (they print help_main themselves).
+    if !matches!(cmd, Cmd::Banner | Cmd::Help { .. }) {
+        cli::banner();
+    }
     let res = match cmd {
         Cmd::Banner => {
-            cli::banner();
+            cli::help_main();
             Ok(())
         }
         Cmd::Help { topic } => {
@@ -85,6 +90,56 @@ fn main() {
     if res.is_err() {
         std::process::exit(1);
     }
+}
+
+/// European-style thousand separator (zpaqfranz convention). 131858 → "131.858".
+fn eu_num(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c as char);
+    }
+    out
+}
+
+/// Compact IEC-style human unit, space between value and label: "128.77 KB".
+/// Uses 1024-base like zpaqfranz despite the short "KB/MB" labels.
+fn human_si(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:.2} {}", v, UNITS[i])
+}
+
+fn hms(secs: u64) -> String {
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
+/// Final one-line footer printed at the end of every command (zpaqfranz
+/// convention): `0.020s (00:00:00,7.16MB) (all OK)`. The value after the
+/// comma is average throughput.
+fn end_footer(elapsed: std::time::Duration, processed_bytes: u64) {
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 {
+        (processed_bytes as f64 / secs) as u64
+    } else {
+        processed_bytes
+    };
+    let rate_s = human_si(rate).replace(' ', "");
+    eprintln!(
+        "{:.3}s ({},{}) (all OK)",
+        secs,
+        hms(elapsed.as_secs()),
+        rate_s
+    );
 }
 
 /// Filter walked entries in-place per -exclude / -minsize / -maxsize /
@@ -896,51 +951,95 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
     } else {
         0.0
     };
-    let dict_info = if dict.is_empty() {
-        "no-dict".to_string()
-    } else {
-        format!("dict {} B", dict.len())
+    let backend_name = match backend {
+        Backend::Zstd => "zstd",
+        Backend::Lzma => "lzma",
+        Backend::Ppmd => "ppmd",
     };
-    let out_display = if is_stream {
-        "stream".to_string()
-    } else if is_chunked {
-        format!("{:.2} MiB across parts", out_size as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} MiB", out_size as f64 / (1024.0 * 1024.0))
-    };
-    let ratio_display = if is_stream { "?".to_string() } else { format!("{:.3}", ratio) };
+    let n_files = n_entries;
+    let n_dirs = default_entries.iter().chain(media_entries.iter())
+        .filter(|(full, _)| std::fs::symlink_metadata(full).map(|m| m.is_dir()).unwrap_or(false))
+        .count();
     if opts.summary {
         eprintln!(
-            "{} entries {:.2} MiB -> {} (ratio {}) {:.2}s {:.1} MiB/s [{}]",
+            "{} entries {} -> {} (ratio {:.3}) {:.2}s {:.1} MB/s [{}]",
             n_entries,
-            total_bytes as f64 / (1024.0 * 1024.0),
-            out_display,
-            ratio_display,
+            human_si(total_bytes),
+            if is_stream { "stream".to_string() } else { human_si(out_size) },
+            ratio,
             elapsed.as_secs_f64(),
             mbps,
-            dict_info
+            backend_name,
         );
     } else {
-        eprintln!("added   {} entries", n_entries);
-        eprintln!("in      {:.2} MiB", total_bytes as f64 / (1024.0 * 1024.0));
-        eprintln!(
-            "out     {}   (ratio {})",
-            out_display,
-            ratio_display
-        );
-        eprintln!(
-            "time    {:.2} s    ({:.1} MiB/s)",
-            elapsed.as_secs_f64(),
-            mbps
-        );
-        let backend_name = match backend {
-            Backend::Zstd => "zstd",
-            Backend::Lzma => "lzma",
-            Backend::Ppmd => "ppmd",
+        let out_disp = if is_stream {
+            "stream".to_string()
+        } else {
+            format!("{} ({})", eu_num(out_size), human_si(out_size))
         };
-        eprintln!("syc-l{}  backend {}  threads {}  [{}]", opts.level, backend_name, opts.threads, dict_info);
+        let now = chrono_like_now();
+        eprintln!(
+            "Creating {} at offset 0 + 0",
+            if is_stream { "<stdout>".to_string() } else { archive.display().to_string() }
+        );
+        eprintln!(
+            "Add {}         {:>3}         {:>11} ({:>7}) {}T ({} dirs)",
+            now,
+            n_files,
+            eu_num(total_bytes),
+            human_si(total_bytes),
+            opts.threads.max(1),
+            n_dirs,
+        );
+        eprintln!("{} +added, 0 -removed.", n_files);
+        eprintln!(
+            "0 + ({} -> {} -> {}) = {}  @ {:.2} MB/s",
+            eu_num(total_bytes),
+            eu_num(total_bytes),
+            eu_num(out_size),
+            out_disp,
+            mbps,
+        );
+        eprintln!("Files added +{}", n_files);
+        eprintln!(
+            "syc-l{}  backend {}  threads {}  ratio {:.3}",
+            opts.level, backend_name, opts.threads, ratio,
+        );
     }
+    end_footer(elapsed, total_bytes);
     Ok(())
+}
+
+/// `YYYY-MM-DD HH:MM:SS` UTC, no deps. Cosmetic label only — syc doesn't
+/// store per-entry mtime in the archive, so local TZ isn't worth the crate.
+fn chrono_like_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let days = t / 86400;
+    let secs = t % 86400;
+    let h = secs / 3600;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
+}
+
+/// Gregorian conversion from days-since-1970 — enough for a cosmetic date
+/// stamp, matches zpaqfranz's `Add YYYY-MM-DD HH:MM:SS` header column.
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut y: u64 = 1970;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let ydays = if leap { 366 } else { 365 };
+        if days < ydays { break; }
+        days -= ydays;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let ml = [31, if leap {29} else {28}, 31,30,31,30,31,31,30,31,30,31];
+    let mut m = 0;
+    while m < 12 && days >= ml[m] { days -= ml[m]; m += 1; }
+    (y, m as u64 + 1, days + 1)
 }
 
 /// Append a fresh compressed frame at the end of an existing archive.
@@ -1545,37 +1644,40 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
     let elapsed = started.elapsed();
     if opts.summary {
         eprintln!(
-            "{} entries {:.2} MiB in {:.2}s",
+            "{} entries {} in {:.2}s",
             n_entries,
-            total_bytes as f64 / (1024.0 * 1024.0),
+            human_si(total_bytes),
             elapsed.as_secs_f64()
         );
     } else {
-        eprintln!("extracted {} entries", n_entries);
+        eprintln!();
         eprintln!(
-            "bytes     {:.2} MiB",
-            total_bytes as f64 / (1024.0 * 1024.0)
+            "<<{}>>: extracted into {}",
+            archive.display(),
+            out.display(),
         );
-        eprintln!("time      {:.2} s", elapsed.as_secs_f64());
-        eprintln!("dest      {}", out.display());
+        eprintln!(
+            "{} files, {} ({})",
+            n_entries,
+            eu_num(total_bytes),
+            human_si(total_bytes),
+        );
     }
+    end_footer(elapsed, total_bytes);
     Ok(())
 }
 
 fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
+    let started = Instant::now();
+    let arc_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
     let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
-    if let Some(c) = comment.as_deref() {
-        if opts.summary {
-            eprintln!("comment: {}", c);
-        } else {
-            println!("# comment: {}", c);
-        }
-    }
 
     let mut buf = vec![0u8; CHUNK];
     let needle = opts.find.as_deref().map(|s| s.to_lowercase());
     let mut n_entries: u64 = 0;
+    let mut n_files: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut rows: Vec<(char, u64, u32, String, String)> = Vec::new();
 
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
@@ -1585,42 +1687,24 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
         };
         if matches!(header.kind, EntryKind::File) {
             total_bytes += header.size;
+            n_files += 1;
         }
         n_entries += 1;
         if show && !opts.summary {
-            let kind = match header.kind {
-                EntryKind::File => "f",
-                EntryKind::Dir => "d",
-                EntryKind::Symlink => "l",
-                EntryKind::HardLink => "h",
+            let flag = match header.kind {
+                EntryKind::File => '+',
+                EntryKind::Dir => 'd',
+                EntryKind::Symlink => 'l',
+                EntryKind::HardLink => 'h',
             };
-            if matches!(header.kind, EntryKind::HardLink | EntryKind::Symlink) && !header.link_target.is_empty() {
-                println!(
-                    "{} {:>12} {:o} {} -> {}",
-                    kind,
-                    header.size,
-                    header.mode & 0o7777,
-                    header.path,
-                    header.link_target
-                );
-            } else {
-                println!(
-                    "{} {:>12} {:o} {}",
-                    kind,
-                    header.size,
-                    header.mode & 0o7777,
-                    header.path
-                );
-            }
+            rows.push((flag, header.size, header.mode & 0o7777, header.path.clone(), header.link_target.clone()));
         }
         if matches!(header.kind, EntryKind::File) {
             let mut remaining = header.size;
             while remaining > 0 {
                 let want = remaining.min(buf.len() as u64) as usize;
                 let n = dec.read(&mut buf[..want])?;
-                if n == 0 {
-                    break;
-                }
+                if n == 0 { break; }
                 remaining -= n as u64;
             }
             if let Some(algo) = hash_algo {
@@ -1629,22 +1713,70 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
             }
         }
     }
-    if let Some(algo) = hash_algo {
-        eprintln!("hash      {}", algo.name());
+
+    if opts.summary {
+        eprintln!(
+            "{} files, {} ({}) uncompressed, archive {} ({})",
+            n_files,
+            eu_num(total_bytes),
+            human_si(total_bytes),
+            eu_num(arc_size),
+            human_si(arc_size),
+        );
+    } else {
+        println!();
+        println!("<<{}>>:", archive.display());
+        if let Some(c) = comment.as_deref() { println!("comment: {}", c); }
+        println!(
+            "1 versions, {} files, {} bytes ({})",
+            n_files,
+            eu_num(total_bytes),
+            human_si(total_bytes),
+        );
+        println!();
+        println!("          Size  Flag Name");
+        println!("--------------  ---- -----");
+        for (flag, size, _mode, path, link) in &rows {
+            let size_s = eu_num(*size);
+            if !link.is_empty() && (*flag == 'l' || *flag == 'h') {
+                println!("{:>14}  {}    {} -> {}", size_s, flag, path, link);
+            } else {
+                println!("{:>14}  {}    {}", size_s, flag, path);
+            }
+        }
+        println!();
+        let ratio = if total_bytes > 0 { arc_size as f64 / total_bytes as f64 } else { 0.0 };
+        println!(
+            "              {} ({}) of {} ({}) in {} files shown",
+            eu_num(total_bytes),
+            human_si(total_bytes),
+            eu_num(total_bytes),
+            human_si(total_bytes),
+            n_files,
+        );
+        println!(
+            "               {} compressed  Ratio {:.3} <<{}>>",
+            eu_num(arc_size),
+            ratio,
+            archive.display(),
+        );
+        if let Some(algo) = hash_algo {
+            println!("hash: {}", algo.name());
+        }
     }
-    eprintln!(
-        "{} entries, {:.2} MiB uncompressed",
-        n_entries,
-        total_bytes as f64 / (1024.0 * 1024.0)
-    );
+    let _ = n_entries;
+    end_footer(started.elapsed(), arc_size);
     Ok(())
 }
 
 fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let started = Instant::now();
+    let arc_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
     let (mut dec, hash_algo, comment, has_xattrs) = open_archive(&archive)?;
-    if let Some(c) = comment.as_deref() {
-        if !opts.summary { eprintln!("comment {}", c); }
+    if !opts.summary {
+        eprintln!();
+        eprintln!("<<{}>>:", archive.display());
+        if let Some(c) = comment.as_deref() { eprintln!("comment: {}", c); }
     }
 
     let mut buf = vec![0u8; CHUNK];
@@ -1695,13 +1827,35 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     prog.finish();
     let elapsed = started.elapsed();
     let algo_name = hash_algo.map(|a| a.name()).unwrap_or("off");
-    eprintln!(
-        "test OK   {} entries ({} {} verified), {:.2} MiB in {:.2}s",
-        n_entries,
-        hashes_verified,
-        algo_name,
-        total_bytes as f64 / (1024.0 * 1024.0),
-        elapsed.as_secs_f64()
-    );
+    if opts.summary {
+        eprintln!(
+            "test OK  {} entries ({} {} verified) {} in {:.2}s",
+            n_entries, hashes_verified, algo_name,
+            human_si(total_bytes), elapsed.as_secs_f64(),
+        );
+    } else {
+        let n_files = n_entries; // approximate — non-file entries skipped hashing
+        eprintln!(
+            "{} versions, {} files, {} bytes ({})",
+            1, n_files, eu_num(total_bytes), human_si(total_bytes),
+        );
+        eprintln!(
+            "To be checked {} ({}) in {} files ({} threads)",
+            eu_num(total_bytes), human_si(total_bytes), n_files, opts.threads.max(1),
+        );
+        let mbps = if elapsed.as_secs_f64() > 0.0 {
+            (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+        } else { 0.0 };
+        eprintln!(
+            "Total       {} speed {}.000/s ({:.2} MB/s)",
+            eu_num(total_bytes), eu_num(total_bytes), mbps,
+        );
+        eprintln!(
+            "VERDICT         : OK                   ({} stored vs decompressed)",
+            algo_name,
+        );
+        let _ = arc_size;
+    }
+    end_footer(elapsed, total_bytes);
     Ok(())
 }
