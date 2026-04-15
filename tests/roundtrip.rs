@@ -142,6 +142,39 @@ fn roundtrip_ppmd_l7() {
     roundtrip_at_level("7", &[("SYC_BACKEND", "ppmd")], "ppmd-l7");
 }
 
+fn roundtrip_lzp(level: &str, envs: &[(&str, &str)], tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+    // Add a larger repeating payload so LZP has something long to match on.
+    let long_rep: Vec<u8> =
+        b"the quick brown fox jumps over the lazy dog 0123456789 "
+            .repeat(4096);
+    write_file(&src.join("nested/repeats.txt"), &long_rep);
+
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level, "-lzp"],
+        envs,
+    );
+    run_syc(&["t", archive.to_str().unwrap()], &[]);
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_lzp_lzma() {
+    roundtrip_lzp("6", &[], "lzp-lzma");
+}
+
+#[test]
+fn roundtrip_lzp_ppmd() {
+    roundtrip_lzp("7", &[("SYC_BACKEND", "ppmd")], "lzp-ppmd");
+}
+
 fn roundtrip_hash(algo: &str, tag: &str) {
     let root = tmp_root(tag);
     let src = root.join("src");
@@ -368,6 +401,94 @@ fn roundtrip_dedup_zstd() { roundtrip_dedup("1", "dedup-zstd"); }
 
 #[test]
 fn roundtrip_dedup_lzma() { roundtrip_dedup("5", "dedup-lzma"); }
+
+fn roundtrip_fastcdc(level: &str, tag: &str) {
+    let root = tmp_root(tag);
+    let src = root.join("src");
+    let archive_plain = root.join("plain.syc");
+    let archive_cdc = root.join("cdc.syc");
+    let dst = root.join("dst");
+
+    // Build two files that share large overlapping regions at shifted offsets
+    // so file-level dedup can't collapse them, but chunk-level CDC can.
+    let mut base: Vec<u8> = Vec::with_capacity(512 * 1024);
+    let mut x: u64 = 0xABCD_0123;
+    for _ in 0..512 * 1024 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        base.push((x >> 33) as u8);
+    }
+    let mut shifted: Vec<u8> = b"PREAMBLE-AAAAA".to_vec();
+    shifted.extend_from_slice(&base);
+    shifted.extend_from_slice(b"-TAIL-Z");
+    let mut inserted: Vec<u8> = base[..256 * 1024].to_vec();
+    inserted.extend_from_slice(b"INSERTED-MIDDLE-BLOCK-64-BYTES-PADDING-PADDING-");
+    inserted.extend_from_slice(&base[256 * 1024..]);
+
+    write_file(&src.join("a.bin"), &base);
+    write_file(&src.join("b.bin"), &shifted);
+    write_file(&src.join("c.bin"), &inserted);
+    // plus a small unrelated file
+    write_file(&src.join("note.txt"), b"fastcdc test\n");
+
+    // Baseline: no fastcdc.
+    run_syc(
+        &["a", archive_plain.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level],
+        &[],
+    );
+    // With fastcdc.
+    run_syc(
+        &["a", archive_cdc.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", level, "-fastcdc"],
+        &[],
+    );
+
+    let plain_size = fs::metadata(&archive_plain).unwrap().len();
+    let cdc_size = fs::metadata(&archive_cdc).unwrap().len();
+    // CDC only expected to strictly beat solid-mode compression at level 0
+    // (store); at higher levels the zstd/lzma sliding window already catches
+    // the cross-file overlap. Allow a small ceiling for metadata overhead.
+    let ceiling = plain_size + plain_size / 20; // +5%
+    assert!(
+        cdc_size <= ceiling,
+        "fastcdc archive overhead too high (plain={plain_size} cdc={cdc_size})"
+    );
+
+    run_syc(
+        &["x", archive_cdc.to_str().unwrap(), "-to", dst.to_str().unwrap()],
+        &[],
+    );
+    assert_same_tree(&src, &dst);
+    run_syc(&["t", archive_cdc.to_str().unwrap()], &[]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn roundtrip_fastcdc_zstd() { roundtrip_fastcdc("1", "fastcdc-zstd"); }
+
+#[test]
+fn roundtrip_fastcdc_lzma() { roundtrip_fastcdc("5", "fastcdc-lzma"); }
+
+#[test]
+fn roundtrip_snapshot_fallback() {
+    // -snapshot on a tmpfs/ext4 path must fall back cleanly to the live tree
+    // (warn to stderr, but archive anyway). The test environment doesn't
+    // have btrfs/zfs root, so we exercise the fallback path.
+    let root = tmp_root("snapshot-fallback");
+    let src = root.join("src");
+    let archive = root.join("out.syc");
+    let dst = root.join("dst");
+    make_fixture(&src);
+    run_syc(
+        &["a", archive.to_str().unwrap(), src.to_str().unwrap(),
+          "-level", "1", "-snapshot"],
+        &[],
+    );
+    run_syc(&["x", archive.to_str().unwrap(), "-to", dst.to_str().unwrap()], &[]);
+    assert_same_tree(&src, &dst);
+    let _ = fs::remove_dir_all(&root);
+}
 
 #[test]
 fn roundtrip_route_zstd() { roundtrip_route("1", "route-zstd"); }

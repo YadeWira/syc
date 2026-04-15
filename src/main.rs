@@ -1,8 +1,11 @@
 mod archive;
 mod cli;
 mod delta;
+mod fastcdc;
+mod lzp;
 mod progress;
 mod rep;
+mod snapshot;
 mod srep;
 
 use anyhow::{anyhow, Context, Result};
@@ -13,9 +16,9 @@ use std::time::Instant;
 
 use crate::archive::{
     collect_entries, gather_samples, pack_entry, read_preamble, solid_sort, train_dict,
-    unpack_entry, write_preamble, Backend, EntryHasher, EntryHeader, EntryKind, HashAlgo,
+    unpack_entry, write_preamble, Backend, EntryHeader, EntryKind, HashAlgo,
     PpmdParams, CHUNK,
-    PREPROC_REP, PREPROC_SREP,
+    PREPROC_LZP, PREPROC_REP, PREPROC_SREP,
 };
 use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder};
 use crate::cli::{Cmd, Opts};
@@ -438,69 +441,54 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
     let mut checked: u64 = 0;
     let mut mismatches: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut reg = fastcdc::DecodeRegistry::new();
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         if opts.verbose {
             eprintln!("? {}", header.path);
         }
-        match header.kind {
-            EntryKind::File => {
-                let live_path = source_abs.join(&header.path);
-                let mut live_f = match File::open(&live_path) {
-                    Ok(f) => Some(BufReader::with_capacity(archive::IO_BUF, f)),
-                    Err(_) => {
-                        eprintln!("miss {}", header.path);
-                        mismatches += 1;
-                        None
-                    }
-                };
-                let mut remaining = header.size;
-                total_bytes += remaining;
-                let mut hasher = hash_algo.map(EntryHasher::new);
-                let mut this_mismatch = false;
-                while remaining > 0 {
-                    let want = remaining.min(buf.len() as u64) as usize;
-                    dec.read_exact(&mut buf[..want])?;
-                    if let Some(h) = hasher.as_mut() { h.update(&buf[..want]); }
-                    if let Some(lf) = live_f.as_mut() {
-                        if lf.read_exact(&mut live[..want]).is_err() || live[..want] != buf[..want] {
-                            this_mismatch = true;
-                            live_f = None;
-                        }
-                    }
-                    remaining -= want as u64;
-                }
-                if let (Some(h), Some(algo)) = (hasher, hash_algo) {
-                    let tb = algo.trailer_bytes();
-                    let mut stored = [0u8; 32];
-                    dec.read_exact(&mut stored[..tb])?;
-                    let mut computed = [0u8; 32];
-                    h.finalize_into(&mut computed[..tb]);
-                    if stored[..tb] != computed[..tb] {
-                        return Err(anyhow!("{} mismatch on {} (archive corruption)", algo.name(), header.path));
-                    }
-                }
-                if let Some(mut lf) = live_f {
-                    let mut tail = [0u8; 1];
-                    if lf.read(&mut tail)? > 0 {
-                        this_mismatch = true;
-                    }
-                }
-                if this_mismatch {
-                    eprintln!("diff {}", header.path);
-                    mismatches += 1;
-                }
-                checked += 1;
-            }
-            EntryKind::Dir | EntryKind::Symlink | EntryKind::HardLink => {
-                // Presence-only check for non-file entries. HardLink has no
-                // body in the archive; the live-side file should still exist
-                // (dedup is an archive-internal optimization).
-                let live_path = source_abs.join(&header.path);
-                if !live_path.exists() && live_path.symlink_metadata().is_err() {
+        if header.kind.is_file_like() {
+            let live_path = source_abs.join(&header.path);
+            let mut live_f = match File::open(&live_path) {
+                Ok(f) => Some(BufReader::with_capacity(archive::IO_BUF, f)),
+                Err(_) => {
                     eprintln!("miss {}", header.path);
                     mismatches += 1;
+                    None
                 }
+            };
+            total_bytes += header.size;
+            let mut this_mismatch = false;
+            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |bytes| {
+                if let Some(lf) = live_f.as_mut() {
+                    if lf.read_exact(&mut live[..bytes.len()]).is_err()
+                        || live[..bytes.len()] != *bytes
+                    {
+                        this_mismatch = true;
+                        live_f = None;
+                    }
+                }
+                Ok(())
+            })?;
+            if let Some(mut lf) = live_f {
+                let mut tail = [0u8; 1];
+                if lf.read(&mut tail)? > 0 {
+                    this_mismatch = true;
+                }
+            }
+            if this_mismatch {
+                eprintln!("diff {}", header.path);
+                mismatches += 1;
+            }
+            checked += 1;
+        } else {
+            // Presence-only check for non-file entries. HardLink has no
+            // body in the archive; the live-side file should still exist
+            // (dedup is an archive-internal optimization).
+            let live_path = source_abs.join(&header.path);
+            if !live_path.exists() && live_path.symlink_metadata().is_err() {
+                eprintln!("miss {}", header.path);
+                mismatches += 1;
             }
         }
     }
@@ -591,8 +579,23 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
         return Err(anyhow!("level must be 0..=10 (got {})", opts.level));
     }
 
+    // Optional FS snapshot: take once per source directory, keep the guards
+    // alive until this function returns so cleanup runs after archival.
+    let mut _snap_guards: Vec<snapshot::SnapshotGuard> = Vec::new();
+    let effective_sources: Vec<PathBuf> = if opts.snapshot {
+        let mut v = Vec::with_capacity(sources.len());
+        for src in &sources {
+            let g = snapshot::take_snapshot(src)?;
+            v.push(g.effective_src.clone());
+            _snap_guards.push(g);
+        }
+        v
+    } else {
+        sources.clone()
+    };
+
     let mut all: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for src in &sources {
+    for src in &effective_sources {
         all.extend(collect_entries_or_single(src)?);
     }
     if let Some(fl) = opts.filelist.as_deref() {
@@ -742,12 +745,48 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
             eprintln!("delta   stride {}  (pre-filter before compressor)", stride);
         }
     }
+    if opts.fastcdc {
+        if opts.append {
+            return Err(anyhow!(
+                "-fastcdc not supported with -append (chunk registry is per-frame)"
+            ));
+        }
+        if opts.delta.is_some() {
+            return Err(anyhow!("-fastcdc not supported with -delta"));
+        }
+        if !opts.summary {
+            eprintln!(
+                "fastcdc min {} avg {} max {}  (content-defined chunk-level dedup)",
+                fastcdc::MIN_SIZE, fastcdc::AVG_SIZE, fastcdc::MAX_SIZE
+            );
+        }
+    }
+    if opts.lzp {
+        if !preproc_eligible {
+            return Err(anyhow!("-lzp needs -m 5+ (LZMA) or SYC_BACKEND=ppmd"));
+        }
+        if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
+            return Err(anyhow!(
+                "-lzp cannot combine with REP/SREP (pass -nopreproc or drop -lzp)"
+            ));
+        }
+        if opts.delta.is_some() {
+            return Err(anyhow!("-lzp cannot combine with -delta"));
+        }
+        preproc |= PREPROC_LZP;
+        if !opts.summary {
+            eprintln!("lzp     ctx {}  min-match {}  (context-hash predictor)", lzp::CTX, lzp::MIN_MATCH);
+        }
+    }
     if opts.route {
         if matches!(backend, Backend::Ppmd) {
             return Err(anyhow!("-route not supported with PPMd backend"));
         }
         if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
             return Err(anyhow!("-route not compatible with REP/SREP preprocessor"));
+        }
+        if preproc & PREPROC_LZP != 0 {
+            return Err(anyhow!("-route not compatible with -lzp"));
         }
         if opts.delta.is_some() {
             return Err(anyhow!("-route not compatible with -delta"));
@@ -846,6 +885,12 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 let enc = rep.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
+            } else if preproc & PREPROC_LZP != 0 {
+                let mut lz = lzp::LzpWriter::new(enc);
+                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
+                let enc = lz.finish()?;
+                let mut inner = enc.finish()?;
+                inner.flush()?;
             } else {
                 let mut enc = enc;
                 pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
@@ -868,6 +913,12 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, opts: Opts) -> Result<()> {
                 let mut rep = rep::RepWriter::new(enc);
                 pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
                 let enc = rep.finish()?;
+                let mut inner = enc.finish(true)?;
+                inner.flush()?;
+            } else if preproc & PREPROC_LZP != 0 {
+                let mut lz = lzp::LzpWriter::new(enc);
+                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup_default, &mut prog)?;
+                let enc = lz.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else {
@@ -1086,6 +1137,12 @@ fn cmd_add_append(
         return Err(anyhow!(
             "-append: archive uses REP/SREP preprocessor; per-frame match \
              state would diverge. Repack without REP/SREP first."
+        ));
+    }
+    if preproc & PREPROC_LZP != 0 {
+        return Err(anyhow!(
+            "-append: archive uses LZP preprocessor; per-frame predictor \
+             state would diverge. Repack without -lzp first."
         ));
     }
     if delta_stride.is_some() {
@@ -1461,6 +1518,11 @@ fn pack_all<W: Write>(
     progress: &mut progress::Progress,
 ) -> Result<()> {
     let mut buf = vec![0u8; CHUNK];
+    let mut chunk_reg = if opts.fastcdc {
+        Some(fastcdc::ChunkRegistry::new())
+    } else {
+        None
+    };
     for (full, rel) in all {
         if opts.verbose {
             eprintln!("+ {}", rel.display());
@@ -1478,6 +1540,14 @@ fn pack_all<W: Write>(
             if opts.xattrs {
                 archive::write_xattrs_block(enc, full, false)?;
             }
+        } else if let Some(reg) = chunk_reg.as_mut() {
+            pack_entry_chunked(full, rel, enc, hash_algo, opts.xattrs, reg)?;
+            if let Ok(meta) = std::fs::symlink_metadata(full) {
+                if meta.is_file() {
+                    *total_bytes += meta.len();
+                    progress.advance(meta.len());
+                }
+            }
         } else {
             pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs)?;
             if let Ok(meta) = std::fs::symlink_metadata(full) {
@@ -1488,6 +1558,64 @@ fn pack_all<W: Write>(
             }
         }
         *n_entries += 1;
+    }
+    Ok(())
+}
+
+/// Pack one entry using FastCDC chunking. Regular (Dir/Symlink) entries fall
+/// back to plain pack_entry; only File entries switch to ChunkedFile format.
+fn pack_entry_chunked<W: Write>(
+    full: &Path,
+    rel: &Path,
+    out: &mut W,
+    hash_algo: Option<HashAlgo>,
+    with_xattrs: bool,
+    reg: &mut fastcdc::ChunkRegistry,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(full)
+        .with_context(|| format!("stat {}", full.display()))?;
+    // Dirs/symlinks don't get chunked — their bodies are empty. Plain pack_entry
+    // handles them; we only intercept regular files.
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        let mut small_buf = vec![0u8; CHUNK];
+        return pack_entry(full, rel, out, &mut small_buf, hash_algo, with_xattrs);
+    }
+    let size = meta.len();
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644u32;
+    let header = EntryHeader {
+        kind: EntryKind::ChunkedFile,
+        mode,
+        size,
+        path: rel_str,
+        link_target: String::new(),
+    };
+    header.write_to(out)?;
+    if with_xattrs {
+        archive::write_xattrs_block(out, full, false)?;
+    }
+    let f = File::open(full)
+        .with_context(|| format!("open {}", full.display()))?;
+    let r = BufReader::with_capacity(archive::IO_BUF, f);
+    let mut hasher = hash_algo.map(archive::EntryHasher::new);
+    let total = fastcdc::pack_chunked_body(r, out, reg, |bytes| {
+        if let Some(h) = hasher.as_mut() { h.update(bytes); }
+    })?;
+    if total != size {
+        return Err(anyhow!("fastcdc: file {} changed during pack ({} vs {})",
+            full.display(), total, size));
+    }
+    if let (Some(h), Some(algo)) = (hasher, hash_algo) {
+        let mut trailer = [0u8; 32];
+        let tb = algo.trailer_bytes();
+        h.finalize_into(&mut trailer[..tb]);
+        out.write_all(&trailer[..tb])?;
     }
     Ok(())
 }
@@ -1595,8 +1723,11 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
         }
     };
     // Both REP and SREP emit the same wire format, so RepReader handles both.
+    // LZP uses its own (context-hash) wire format, handled by LzpReader.
     let pre_delta: Box<dyn Read> = if preproc & (PREPROC_REP | PREPROC_SREP) != 0 {
         Box::new(rep::RepReader::new(raw))
+    } else if preproc & PREPROC_LZP != 0 {
+        Box::new(lzp::LzpReader::new(raw))
     } else {
         raw
     };
@@ -1623,15 +1754,16 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut total_bytes: u64 = 0;
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("extract", 0, progress_enabled);
+    let mut reg = fastcdc::DecodeRegistry::new();
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
-        if matches!(header.kind, EntryKind::File) {
+        if header.kind.is_file_like() {
             total_bytes += header.size;
         }
         if opts.verbose {
             eprintln!("- {}", header.path);
         }
-        unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs)?;
-        if matches!(header.kind, EntryKind::File) {
+        unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs, &mut reg)?;
+        if header.kind.is_file_like() {
             prog.advance(header.size);
         }
         n_entries += 1;
@@ -1678,6 +1810,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut n_files: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut rows: Vec<(char, u64, u32, String, String)> = Vec::new();
+    let mut reg = fastcdc::DecodeRegistry::new();
 
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
@@ -1685,7 +1818,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
             Some(t) => header.path.to_lowercase().contains(t),
             None => true,
         };
-        if matches!(header.kind, EntryKind::File) {
+        if header.kind.is_file_like() {
             total_bytes += header.size;
             n_files += 1;
         }
@@ -1693,24 +1826,15 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
         if show && !opts.summary {
             let flag = match header.kind {
                 EntryKind::File => '+',
+                EntryKind::ChunkedFile => 'c',
                 EntryKind::Dir => 'd',
                 EntryKind::Symlink => 'l',
                 EntryKind::HardLink => 'h',
             };
             rows.push((flag, header.size, header.mode & 0o7777, header.path.clone(), header.link_target.clone()));
         }
-        if matches!(header.kind, EntryKind::File) {
-            let mut remaining = header.size;
-            while remaining > 0 {
-                let want = remaining.min(buf.len() as u64) as usize;
-                let n = dec.read(&mut buf[..want])?;
-                if n == 0 { break; }
-                remaining -= n as u64;
-            }
-            if let Some(algo) = hash_algo {
-                let mut trailer = [0u8; 32];
-                dec.read_exact(&mut trailer[..algo.trailer_bytes()])?;
-            }
+        if header.kind.is_file_like() {
+            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))?;
         }
     }
 
@@ -1785,40 +1909,17 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut hashes_verified: u64 = 0;
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("test", 0, progress_enabled);
+    let mut reg = fastcdc::DecodeRegistry::new();
     while let Some(header) = EntryHeader::read_from(&mut dec)? {
         if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
         if opts.verbose {
             eprintln!("? {}", header.path);
         }
-        if matches!(header.kind, EntryKind::File) {
-            let mut remaining = header.size;
-            total_bytes += remaining;
+        if header.kind.is_file_like() {
+            total_bytes += header.size;
             prog.advance(header.size);
-            let mut hasher = hash_algo.map(EntryHasher::new);
-            while remaining > 0 {
-                let want = remaining.min(buf.len() as u64) as usize;
-                let n = dec.read(&mut buf[..want])?;
-                if n == 0 {
-                    return Err(anyhow!(
-                        "unexpected EOF while testing entry {}",
-                        header.path
-                    ));
-                }
-                if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
-                remaining -= n as u64;
-            }
-            if let (Some(h), Some(algo)) = (hasher, hash_algo) {
-                let tb = algo.trailer_bytes();
-                let mut stored = [0u8; 32];
-                dec.read_exact(&mut stored[..tb])?;
-                let mut computed = [0u8; 32];
-                h.finalize_into(&mut computed[..tb]);
-                if stored[..tb] != computed[..tb] {
-                    return Err(anyhow!(
-                        "{} mismatch on {}",
-                        algo.name(), header.path
-                    ));
-                }
+            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))?;
+            if hash_algo.is_some() {
                 hashes_verified += 1;
             }
         }

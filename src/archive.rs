@@ -54,15 +54,24 @@ pub enum EntryKind {
     /// path of a previously-written File entry. Body is empty. Only emitted
     /// when `-dedup` is active; old readers will fail cleanly on `from_u8`.
     HardLink = 3,
+    /// FastCDC-chunked regular file. `size` holds the reconstructed file
+    /// length (same as `File`); the body is a sequence of chunk records
+    /// (inline or ref) that together reconstruct those bytes. Emitted only
+    /// when `-fastcdc` is active; old readers fail cleanly on `from_u8`.
+    ChunkedFile = 4,
 }
 
 impl EntryKind {
+    pub fn is_file_like(self) -> bool {
+        matches!(self, Self::File | Self::ChunkedFile)
+    }
     fn from_u8(v: u8) -> Result<Self> {
         Ok(match v {
             0 => Self::File,
             1 => Self::Dir,
             2 => Self::Symlink,
             3 => Self::HardLink,
+            4 => Self::ChunkedFile,
             _ => return Err(anyhow!("unknown entry kind: {v}")),
         })
     }
@@ -141,6 +150,11 @@ pub const FEATURE_XATTRS: u8 = 0x20;
 /// an extra u8 `delta_stride` (1, 2, or 4) right before `dict_len`. Mutually
 /// exclusive with REP/SREP and with the PPMd backend (enforced by cmd_add).
 pub const FEATURE_DELTA: u8 = 0x40;
+/// LZP pre-filter (Lempel-Ziv prediction): emits (literal, match_len) pairs
+/// with no offset; decoder recovers the source position from context hash.
+/// Complements PPMd (long matches that small-order models miss). Mutually
+/// exclusive with REP/SREP (same slot in the pipeline) and with -delta.
+pub const PREPROC_LZP: u8 = 0x80;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,6 +533,59 @@ pub fn pack_entry<W: Write>(
     Ok(())
 }
 
+/// Stream the body of a File-like entry (File or ChunkedFile), invoking
+/// `on_raw` with each reconstructed byte range and verifying the optional
+/// per-file hash trailer. `reg` is only used for ChunkedFile; callers that
+/// never expect ChunkedFile may still pass a fresh registry.
+pub fn read_file_body<R: Read, F: FnMut(&[u8]) -> Result<()>>(
+    r: &mut R,
+    header: &EntryHeader,
+    reg: &mut crate::fastcdc::DecodeRegistry,
+    hash_algo: Option<HashAlgo>,
+    buf: &mut [u8],
+    mut on_raw: F,
+) -> Result<()> {
+    let mut hasher = hash_algo.map(EntryHasher::new);
+    match header.kind {
+        EntryKind::File => {
+            let mut remaining = header.size;
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = r.read(&mut buf[..want])?;
+                if n == 0 {
+                    return Err(anyhow!("unexpected EOF in archive body"));
+                }
+                if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
+                on_raw(&buf[..n])?;
+                remaining -= n as u64;
+            }
+        }
+        EntryKind::ChunkedFile => {
+            reg.read_body(r, header.size, |bytes| {
+                if let Some(h) = hasher.as_mut() { h.update(bytes); }
+                on_raw(bytes)
+            })?;
+        }
+        _ => {
+            return Err(anyhow!(
+                "read_file_body on non-file kind {:?}",
+                header.kind
+            ));
+        }
+    }
+    if let (Some(h), Some(algo)) = (hasher, hash_algo) {
+        let tb = algo.trailer_bytes();
+        let mut stored = [0u8; 32];
+        r.read_exact(&mut stored[..tb])?;
+        let mut computed = [0u8; 32];
+        h.finalize_into(&mut computed[..tb]);
+        if stored[..tb] != computed[..tb] {
+            return Err(anyhow!("{} mismatch on {}", algo.name(), header.path));
+        }
+    }
+    Ok(())
+}
+
 pub fn unpack_entry<R: Read>(
     r: &mut R,
     dest_root: &Path,
@@ -526,6 +593,7 @@ pub fn unpack_entry<R: Read>(
     buf: &mut [u8],
     hash_algo: Option<HashAlgo>,
     with_xattrs: bool,
+    reg: &mut crate::fastcdc::DecodeRegistry,
 ) -> Result<()> {
     let safe_rel = sanitize_rel(&header.path)?;
     let full = dest_root.join(&safe_rel);
@@ -592,7 +660,7 @@ pub fn unpack_entry<R: Read>(
             }
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, false); }
         }
-        EntryKind::File => {
+        EntryKind::File | EntryKind::ChunkedFile => {
             // Parent dirs should already exist (Dir entries come first in
             // solid-sorted streams). Only create on demand if missing.
             let f = match File::create(&full) {
@@ -607,32 +675,10 @@ pub fn unpack_entry<R: Read>(
                 Err(e) => return Err(e).with_context(|| format!("create {}", full.display())),
             };
             let mut w = BufWriter::with_capacity(IO_BUF, f);
-            let mut remaining = header.size;
-            let mut hasher = hash_algo.map(EntryHasher::new);
-            while remaining > 0 {
-                let want = remaining.min(buf.len() as u64) as usize;
-                let n = r.read(&mut buf[..want])?;
-                if n == 0 {
-                    return Err(anyhow!("unexpected EOF in archive body"));
-                }
-                if let Some(h) = hasher.as_mut() { h.update(&buf[..n]); }
-                w.write_all(&buf[..n])?;
-                remaining -= n as u64;
-            }
+            read_file_body(r, header, reg, hash_algo, buf, |bytes| {
+                w.write_all(bytes).map_err(|e| e.into())
+            })?;
             w.flush()?;
-            if let (Some(h), Some(algo)) = (hasher, hash_algo) {
-                let tb = algo.trailer_bytes();
-                let mut stored = [0u8; 32];
-                r.read_exact(&mut stored[..tb])?;
-                let mut computed = [0u8; 32];
-                h.finalize_into(&mut computed[..tb]);
-                if stored[..tb] != computed[..tb] {
-                    return Err(anyhow!(
-                        "{} mismatch on {}",
-                        algo.name(), header.path
-                    ));
-                }
-            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

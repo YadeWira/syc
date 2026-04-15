@@ -1,6 +1,6 @@
 [package]
 name = "syc"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Streaming archiver + compressor in pure-ish Rust, tuned for modest hardware"
 license = "MIT OR Apache-2.0"
@@ -18,6 +18,7 @@ twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64
 
 [target.'cfg(unix)'.dependencies]
 xattr = "1.3"
+libc = "0.2"
 
 [target.'cfg(unix)'.dev-dependencies]
 xattr = "1.3"

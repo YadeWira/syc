@@ -233,6 +233,33 @@ Activado automáticamente con `-threads >1` cuando `total_raw ≥ 2 × block_siz
   - auto no dispara (samples no son ELF): `ratio 0.14787`, 46.4s — intacto.
 - Roundtrip verificado (integration test `roundtrip_lzma_bcj_x86`).
 
+## LZP preprocessor (tarea #2, 2026-04-15)
+
+- Context-hash predictor (CTX=8, HASH_BITS=20, MIN_MATCH=32) — emite
+  (literal_run, match_len) sin offset; decoder recupera la fuente desde el
+  mismo hash table reconstruido.
+- Flag `-lzp`. Bit `PREPROC_LZP = 0x80` en el preamble (sin bytes extra).
+- Incompatible con REP/SREP, `-delta`, `-route`, `-append`. Gate requiere
+  backend LZMA o PPMd (`preproc_eligible`).
+- Roundtrip cubierto: `roundtrip_lzp_lzma`, `roundtrip_lzp_ppmd`.
+
+### Medición (log corpus 7.8 MiB, texto repetitivo)
+
+| config       | tamaño     | Δ vs base | walltime |
+|--------------|------------|-----------|----------|
+| lzma -m 6    | 321.386 B  | —         | 9.4 s    |
+| lzma + lzp   | 343.142 B  | **+6.8 %**| 2.9 s (×3.3 más rápido) |
+| ppmd         | 555.614 B  | —         | 0.24 s   |
+| ppmd + lzp   | 427.116 B  | **−23 %** | 0.40 s   |
+
+- **PPMd + LZP** es la combo clásica: captura matches largos que el modelo
+  de contexto chico de PPMd no ve. Ideal para `-mx` cuando esté listo.
+- **LZMA + LZP** es trade-off velocidad/ratio, no ganancia neta; útil si el
+  walltime pesa más que los últimos bytes.
+- Corpora pequeños (<2 MiB) no tienen suficiente repetición a larga
+  distancia para pagar el overhead de varints — LZP queda neutral o con
+  pérdida leve. Por eso queda opt-in (sin auto-selección).
+
 ### Cómo compilar / ejecutar
 
 ```bash
@@ -247,3 +274,49 @@ cargo build --release
 
 - `bench.sh <dir>` — syc vs tar+zstd (compresión + descompresión)
 - `bench_arc.sh <dir>` — syc vs ARC.exe (FreeArc vía wine), -m1..-m9 + -mx
+
+## FastCDC chunk-level dedup (tarea #3, 2026-04-15)
+
+FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global de chunks por archivo (`xxh3_64`). Boundaries content-defined → files con overlap desplazado comparten chunks.
+
+- Flag `-fastcdc`. Nueva `EntryKind::ChunkedFile = 4`: body = secuencia de `(varint header, payload?)` registros; `header&1==0` → inline, `header&1==1` → backref a chunk previo.
+- Sin bit en preamble: formato legible por decoders antiguos sólo si no hay ChunkedFile en el archivo.
+- Registry global por frame (shared across entries). DecodeRegistry mantiene `Vec<Vec<u8>>` en memoria — MVP, sin eviction.
+- Incompatibilidades: `-append`, `-delta` (error duro al combinar).
+
+### Medición (3 ficheros con overlaps desplazados, 8 MiB total)
+
+| backend      | plain       | +fastcdc    | delta      | walltime |
+|--------------|-------------|-------------|------------|----------|
+| zstd -l 1    | 4.20 MB     | 4.20 MB     | ≈0%        | similar  |
+| ppmd -l 5    | 6.41 MB     | 4.27 MB     | **−33%**   | 2.0× faster |
+
+- **zstd/lzma solid** ya deduplican vía su ventana grande (128 MiB lzma, 128 MiB zstd long); CDC no añade valor.
+- **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
+- Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
+
+## FS snapshot (tarea #14, 2026-04-15)
+
+`src/snapshot.rs` — snapshot atómico opcional antes de archivar (`-snapshot`).
+
+- Detección por `statfs` magic: btrfs (0x9123683E) y zfs (0x2FC12FC1).
+- btrfs: `btrfs subvolume snapshot -r <src> <parent>/.syc-snap-<pid>-<ns>`; cleanup via `btrfs subvolume delete` en Drop.
+- zfs: `df --output=source` → dataset; `zfs snapshot ds@tag`; navegación via `<mountpoint>/.zfs/snapshot/tag/<rel>`; cleanup via `zfs destroy`.
+- Otras FS (ext4/xfs/tmpfs/fuse): aviso y fallback a live tree.
+- Cualquier fallo (no-root, src no subvolume, binarios ausentes) → fallback con aviso; nunca error duro.
+- `SnapshotGuard` RAII: effective_src usado durante archivar, cleanup al salir de cmd_add.
+
+## Dict preprocessor (tarea #1, pending design)
+
+FreeArc Dict sustituye palabras frecuentes inglesas/multi-idioma por códigos cortos (1..3 bytes) antes de LZMA/PPMd. Combinado con LZP da el empujón que lleva ARC -mx a ganarle a LZMA puro en texto. ~1500 líneas C++ en `Compression/Dict/C_Dict.cpp` (ref no disponible localmente; consultar repo FreeArc upstream).
+
+**Diseño propuesto (no implementado, pendiente para 0.1.4):**
+
+1. **Tabla de tokens**: diccionario estático de N tokens (palabras comunes + whitespace patterns), ordenado por frecuencia descendente. Publicado como bytes embebidos en el binario (p. ej. `include_bytes!("dict_en.bin")`).
+2. **Encoder**: scan secuencial byte a byte con un trie. Cuando matchea un token, emite `0xFx yy` (2B) o `0xFF xx yy` (3B) según índice. Ventaja real: tokens de 6..12 chars → 2..3 bytes.
+3. **Decoder**: stateless, reemplaza códigos por tokens.
+4. **Wire format**: bit `PREPROC_DICT = 0x40` en preamble (libre, REP=0x04, SREP=0x08, LZP=0x80 ya tomados; 0x40 disponible).
+5. **Gating**: auto-on si total_raw > 4 MiB y >30 % del sample muestra tokens del diccionario. Incompat con binarios (detectar por BCJ auto-detect).
+6. **Sinergia**: debería apilar como `Dict → LZP → LZMA/PPMd` (primero sustituye tokens, después LZP encuentra repeticiones entre sustituciones, después el backend).
+
+**Por qué quedó para doc**: el trabajo crítico es la **selección y curación de la tabla** (FreeArc tiene versiones separadas EN/RU/EN+symbols), no el encoder. Un port a ciegas sin medir contra corpora específicos tendería a empatar o perder vs LZP solo. Mejor abordar cuando haya corpus de referencia y tiempo de medición iterativa.

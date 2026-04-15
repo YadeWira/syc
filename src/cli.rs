@@ -39,8 +39,11 @@ pub struct Opts {
     pub xattrs: bool,
     pub append: bool,
     pub delta: Option<u8>,
+    pub lzp: bool,
     pub route: bool,
     pub dedup: bool,
+    pub fastcdc: bool,
+    pub snapshot: bool,
     pub noprogress: bool,
 }
 
@@ -182,7 +185,10 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "xattrs" => opts.xattrs = true,
                 "append" => opts.append = true,
                 "route" => opts.route = true,
+                "lzp" => opts.lzp = true,
                 "dedup" => opts.dedup = true,
+                "fastcdc" => opts.fastcdc = true,
+                "snapshot" => opts.snapshot = true,
                 "noprogress" | "noeta" => opts.noprogress = true,
                 "nolong" => opts.nolong = true,
                 "nopreproc" => opts.nopreproc = true,
@@ -330,10 +336,16 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -append       append a new compressed frame to an existing archive
                          (antiransomware: existing bytes are never rewritten)
            -delta N      delta pre-filter stride (1|2|4), for PCM / rasters
+           -lzp          LZP pre-filter (context-hash long-match predictor)
+                         pairs well with PPMd/LZMA; excl. REP/SREP/-delta
            -route        split pre-compressed media (jpg/mp4/zip/...) into
                          a level-0 frame, saves CPU without losing ratio
            -dedup        pack identical files once; duplicates become hardlink
                          entries (extracted as hardlinks, fall back to copy)
+           -fastcdc      chunk-level dedup via FastCDC (2..64 KiB chunks);
+                         catches partial overlap, e.g. near-duplicate backups
+           -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
+                         falls back to live tree on unsupported FS or non-root
            -noprogress   suppress the progress bar (auto-off when stderr
                          isn't a TTY; alias: -noeta)
            -nodict       force dict training off (opposite of -dict)
