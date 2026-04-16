@@ -583,10 +583,22 @@ pub fn pack_entry<W: Write>(
     Ok(())
 }
 
+/// Outcome of a body read. Hash mismatches are reported in-band so callers
+/// can choose to abort (extract, verify) or tally-and-continue (test under a
+/// paranoid sweep). The stream is always consistent past the hash trailer
+/// when `Ok(_)` is returned — only Err means "can't resync with the archive".
+pub enum BodyOutcome {
+    Ok,
+    HashMismatch,
+}
+
 /// Stream the body of a File-like entry (File or ChunkedFile), invoking
 /// `on_raw` with each reconstructed byte range and verifying the optional
-/// per-file hash trailer. `reg` is only used for ChunkedFile; callers that
-/// never expect ChunkedFile may still pass a fresh registry.
+/// per-file hash trailer. Returns `BodyOutcome::HashMismatch` rather than an
+/// `Err` when the trailer doesn't match — both the body and the trailer were
+/// fully consumed, so the decompressor can keep going. `reg` is only used for
+/// ChunkedFile; callers that never expect ChunkedFile may still pass a fresh
+/// registry.
 pub fn read_file_body<R: Read, F: FnMut(&[u8]) -> Result<()>>(
     r: &mut R,
     header: &EntryHeader,
@@ -594,7 +606,7 @@ pub fn read_file_body<R: Read, F: FnMut(&[u8]) -> Result<()>>(
     hash_algo: Option<HashAlgo>,
     buf: &mut [u8],
     mut on_raw: F,
-) -> Result<()> {
+) -> Result<BodyOutcome> {
     let mut hasher = hash_algo.map(EntryHasher::new);
     match header.kind {
         EntryKind::File => {
@@ -630,10 +642,11 @@ pub fn read_file_body<R: Read, F: FnMut(&[u8]) -> Result<()>>(
         let mut computed = [0u8; 32];
         h.finalize_into(&mut computed[..tb]);
         if stored[..tb] != computed[..tb] {
-            return Err(anyhow!("{} mismatch on {}", algo.name(), header.path));
+            return Ok(BodyOutcome::HashMismatch);
         }
+        let _ = algo;
     }
-    Ok(())
+    Ok(BodyOutcome::Ok)
 }
 
 pub fn unpack_entry<R: Read>(
@@ -730,9 +743,18 @@ pub fn unpack_entry<R: Read>(
                 Err(e) => return Err(e).with_context(|| format!("create {}", full.display())),
             };
             let mut w = BufWriter::with_capacity(IO_BUF, f);
-            read_file_body(r, header, reg, hash_algo, buf, |bytes| {
+            match read_file_body(r, header, reg, hash_algo, buf, |bytes| {
                 w.write_all(bytes).map_err(|e| e.into())
-            })?;
+            })? {
+                BodyOutcome::Ok => {}
+                BodyOutcome::HashMismatch => {
+                    return Err(anyhow!(
+                        "{} mismatch on {}",
+                        hash_algo.map(|a| a.name()).unwrap_or("hash"),
+                        header.path
+                    ));
+                }
+            }
             w.flush()?;
             drop(w);
             #[cfg(unix)]

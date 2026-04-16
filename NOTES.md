@@ -295,6 +295,65 @@ FastCDC Gear-hash chunker (MIN=2 KiB, AVG=8 KiB, MAX=64 KiB) + registry global d
 - **ppmd** no tiene match-finder: CDC aporta el ahorro entero. Combo ganadora para texto/logs grandes con PPMd.
 - Para archivos > dict window (multi-GB), CDC también ayuda a LZMA.
 
+## v0.1.13 — test paranoid: continue-on-error + tally (2026-04-16)
+
+Dos entregas en un ciclo:
+
+### 1. Port de FreeArc `Dict` preprocessor — portado, medido, archivado
+
+`src/dict_fa.rs` implementa el preprocesador de FreeArc: lista de 128 palabras en inglés con el espacio previo incluido, token = byte `0x80+idx`, escape con `0x01` para pasar bytes 0x01/0x80+ literales. 5 tests round-trip + 1 bench `#[ignore]`.
+
+**Decisión: NO integrar al formato.** Medido sobre 2 corpus reales (3.9 MB Python docs + 10 MB Debian changelogs) vs zstd/xz a distintos niveles:
+
+| Backend | Python docs | Debian changelogs |
+|---|---|---|
+| zstd -1 | −2.45 % | **+2.12 %** (pérdida) |
+| zstd -9 | −3.07 % | −1.49 % |
+| zstd -19 | −0.94 % | −0.64 % |
+| xz -3 | −4.86 % | −2.79 % |
+| xz -6 | −1.38 % | −1.13 % |
+| xz -9 | −1.38 % | −1.13 % |
+
+En los tiers que de verdad usamos (m3=zstd -15, m4=zstd -19+btultra2, lzma xz -6+) la ganancia queda en −0.6 a −1.4 %, y hay regresión real en zstd -1 sobre prosa. El costo era bump `MAGIC_V5`→`V6` (los 8 bits del byte preproc están todos tomados), encoder/decoder en el pipeline, heurística de detección por stream, flag CLI opt-in, tests de compatibilidad hacia atrás. No justifica.
+
+Módulo queda en tree como referencia/archive — compila + tests pasan, nadie lo llama. Cierra task #1.
+
+### 2. `syc test` con continue-on-error + tally
+
+`read_file_body` (en `src/archive.rs`) ya computaba y verificaba el hash per-file, pero devolvía `Err` en el primer mismatch, interrumpiendo el recorrido. Para un backup con bitrot distribuido eso es un reporte inútil ("1 error" ≠ "3 archivos corruptos de 31").
+
+**Refactor quirúrgico**:
+- Nuevo `BodyOutcome { Ok, HashMismatch }`; `read_file_body` retorna `Result<BodyOutcome>`. Errs = stream inconsistente (no se puede resyncar). Outcome = decisión del caller.
+- Callers estrictos (extract, list, verify) traducen `HashMismatch` a `Err` — correcto, no escribir data sospechosa.
+- `cmd_test` envuelve el loop en un bloque que captura stream errors en `stream_error: Option<String>` y hace break (sin `?` propagando fuera del summary). Hash mismatches se tallean en `hashes_failed` y se acumulan en `failed_paths`. El summary siempre se imprime: OK vs FAIL con contadores, hasta 20 paths listados, exit 1 si hubo fallos.
+
+**Casos de corrupción ejercitados**:
+
+| Escenario | Resultado |
+|---|---|
+| Byte flip en medio del body | `FAIL (N-1 verified, 1 failed)` + stream err |
+| **3 bytes spread en 12 MB** | 3 paths distintos listados |
+| **5 bytes spread en 12 MB** | **4 paths listados** (el 5º rompe el stream) |
+| Truncación −1000 B | `incomplete frame` |
+| Preamble magic flip | `bad magic (got "BYC5")` — aborta temprano |
+| Corrupt LZP/DELTA/xattrs/ppmd/fastcdc/dedup/append | todos detectados |
+| Unicode paths / zero-byte files | OK sin regresión |
+
+Ese caso de los 5 bytes en 12 MB es el valor real: un sistema abort-on-first reportaría 1 error; nuestro loop reporta 4 files distintos corruptos + el stream break del 5º con código `0000N!` diferenciado.
+
+**Lo que sigue siendo limitación, no bug**: solid-zstd detecta corruption en medio del frame con su propio checksum al final, así que después de reportar los files individuales sale un segundo error `Restored data doesn't match checksum` en el footer. Son dos señales legítimas con prefijos numerados propios (`00001!` mismatch de app + `0000N!` del stream).
+
+### Cambio aledaño: remap de zstd levels m2/m3 (m1/m4 intactos)
+
+De la sesión previa quedaba uncommitted el retoque al `map_zstd_level`:
+
+- m1 = L1 (sin cambio) — rápido bruto
+- m2 = L9 (antes L15) — 3.4× más rápido, 2.5 % peor ratio
+- m3 = L15 (antes L19) — 5× más rápido, iguala la ratio del viejo m2
+- m4 = L19 + btultra2 + ChainLog28 + HashLog27 + SearchLog10 (sin cambio) — para quien quiere cada byte
+
+Medido sobre 596 MB mixed binary (icons+fonts+doc tar). Conservamos m1/m4 porque son extremos bien definidos; solo rebalanceamos los intermedios que estaban parkeados en diminishing returns.
+
 ## v0.1.12 — progress: CountingWriter sobre BufWriter + flushing pad (2026-04-16)
 
 **Bug visible en v0.1.11**: durante `flushing...` el counter `comp` quedaba en `22 B` (preámbulo) durante minutos, y al final aparecían pixeles `B/s \` colgando a la derecha de la línea.

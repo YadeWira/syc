@@ -2,6 +2,7 @@ mod archive;
 mod cli;
 mod color;
 mod delta;
+mod dict_fa;
 mod fastcdc;
 mod lzp;
 mod progress;
@@ -549,7 +550,7 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
             };
             total_bytes += header.size;
             let mut this_mismatch = false;
-            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |bytes| {
+            let body_outcome = archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |bytes| {
                 if let Some(lf) = live_f.as_mut() {
                     if lf.read_exact(&mut live[..bytes.len()]).is_err()
                         || live[..bytes.len()] != *bytes
@@ -560,6 +561,17 @@ fn cmd_verify(archive: PathBuf, source: PathBuf, opts: Opts) -> Result<()> {
                 }
                 Ok(())
             })?;
+            if matches!(body_outcome, archive::BodyOutcome::HashMismatch) {
+                eprintln!(
+                    "{}",
+                    color::err_line(&format!(
+                        "corrupt archive body for {} ({} mismatch)",
+                        header.path,
+                        hash_algo.map(|a| a.name()).unwrap_or("hash"),
+                    ))
+                );
+                this_mismatch = true;
+            }
             if let Some(mut lf) = live_f {
                 let mut tail = [0u8; 1];
                 if lf.read(&mut tail)? > 0 {
@@ -1491,12 +1503,21 @@ fn pick_ppmd_params(syc_level: i32) -> PpmdParams {
 /// Map syc level (0..=4) to zstd level. Each tier must beat ARC mN on the
 /// python3.13 docs benchmark. See NOTES.md.
 fn map_zstd_level(syc_level: i32) -> i32 {
+    // Benchmarked 2026-04-16 on 596 MB mixed binary (icons+fonts+doc tar):
+    //   old m2=L15 → 33 s / 17.9 MB/s / ratio 0.236
+    //   new m2=L9  → 10 s /  60 MB/s  / ratio 0.242   (~3.4× faster, ~2.5 % worse)
+    //   old m3=L19 → 163 s / 3.6 MB/s / ratio 0.226
+    //   new m3=L15 →  33 s / 18 MB/s  / ratio 0.236   (~5× faster, ~4.4 % worse;
+    //                                                   matches old m2 ratio)
+    // m1 and m4 are intentionally unchanged: m1 stays at L1 for raw speed, m4
+    // stays at L19 + btultra2/ChainLog/HashLog/SearchLog overrides for users
+    // who want every last bit. The speed tax on m4 is real but opt-in.
     match syc_level {
         0 => -5, // draft
         1 => 1,  // vs ARC m1 (0.228)  → 0.2142
-        2 => 15, // vs ARC m2 (0.173)  → 0.1720
-        3 => 19, // vs ARC m3 (0.166)  → 0.1546
-        4 => 19, // vs ARC m4 (0.162)  → 0.1507 (con ULTRA)
+        2 => 9,  // was L15; now middle tier w/ zstd sweet spot
+        3 => 15, // was L19; now matches old m2 ratio at 5× speed
+        4 => 19, // vs ARC m4 (0.162)  → 0.1507 (con ULTRA + overrides arriba)
         _ => 9,
     }
 }
@@ -2026,7 +2047,16 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
             rows.push((header.kind, header.mtime, header.size, header.path.clone(), header.link_target.clone()));
         }
         if header.kind.is_file_like() {
-            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))?;
+            match archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))? {
+                archive::BodyOutcome::Ok => {}
+                archive::BodyOutcome::HashMismatch => {
+                    return Err(anyhow!(
+                        "{} mismatch on {}",
+                        hash_algo.map(|a| a.name()).unwrap_or("hash"),
+                        header.path
+                    ));
+                }
+            }
         }
     }
 
@@ -2124,33 +2154,85 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
     let mut n_entries: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut hashes_verified: u64 = 0;
+    let mut hashes_failed: u64 = 0;
+    let mut failed_paths: Vec<String> = Vec::new();
+    let mut stream_error: Option<String> = None;
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("test", 0, progress_enabled);
     let mut reg = fastcdc::DecodeRegistry::new();
-    while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
-        if has_xattrs { let _ = archive::read_xattrs_block(&mut dec)?; }
+    // Inner loop wrapped so any Err (zstd frame checksum, truncated stream, …)
+    // is captured instead of bubbling past the summary. Hash mismatches stay
+    // tally-and-continue; stream-level errors mean we can't resync, so we
+    // record them and break. Either way we still print the final verdict so a
+    // nightly cron gets a useful line regardless of failure mode.
+    loop {
+        let header = match EntryHeader::read_from(&mut dec, version) {
+            Ok(Some(h)) => h,
+            Ok(None) => break,
+            Err(e) => {
+                stream_error = Some(format!("archive header read failed: {e:#}"));
+                break;
+            }
+        };
+        if has_xattrs {
+            if let Err(e) = archive::read_xattrs_block(&mut dec) {
+                stream_error = Some(format!("xattrs block on {}: {e:#}", header.path));
+                break;
+            }
+        }
         if opts.verbose {
             eprintln!("? {}", header.path);
         }
         if header.kind.is_file_like() {
             total_bytes += header.size;
             prog.advance(header.size);
-            archive::read_file_body(&mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(()))?;
-            if hash_algo.is_some() {
-                hashes_verified += 1;
+            let outcome = match archive::read_file_body(
+                &mut dec, &header, &mut reg, hash_algo, &mut buf, |_| Ok(())
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    stream_error = Some(format!(
+                        "body read failed on {}: {e:#}", header.path
+                    ));
+                    break;
+                }
+            };
+            match outcome {
+                archive::BodyOutcome::Ok => {
+                    if hash_algo.is_some() { hashes_verified += 1; }
+                }
+                archive::BodyOutcome::HashMismatch => {
+                    hashes_failed += 1;
+                    let algo = hash_algo.map(|a| a.name()).unwrap_or("hash");
+                    let msg = format!("{} mismatch on {}", algo, header.path);
+                    eprintln!("\r{}", color::err_line(&msg));
+                    failed_paths.push(header.path.clone());
+                }
             }
         }
         n_entries += 1;
     }
     prog.finish();
+    // Don't echo stream_error here — it's what we return as Err at the end,
+    // and main() already formats Errs through err_line, so logging both would
+    // duplicate the 0xxxx! counter line.
     let elapsed = started.elapsed();
     let algo_name = hash_algo.map(|a| a.name()).unwrap_or("off");
+    let verdict_ok = hashes_failed == 0 && stream_error.is_none();
     if opts.summary {
-        eprintln!(
-            "test OK  {} entries ({} {} verified) {} in {:.2}s",
-            n_entries, hashes_verified, algo_name,
-            human_si(total_bytes), elapsed.as_secs_f64(),
-        );
+        if verdict_ok {
+            eprintln!(
+                "test OK  {} entries ({} {} verified) {} in {:.2}s",
+                n_entries, hashes_verified, algo_name,
+                human_si(total_bytes), elapsed.as_secs_f64(),
+            );
+        } else {
+            eprintln!(
+                "test FAIL  {} entries ({} {} verified, {} failed) {} in {:.2}s",
+                n_entries, hashes_verified, algo_name, hashes_failed,
+                human_si(total_bytes), elapsed.as_secs_f64(),
+            );
+        }
     } else {
         let n_files = n_entries; // approximate — non-file entries skipped hashing
         eprintln!(
@@ -2168,13 +2250,38 @@ fn cmd_test(archive: PathBuf, opts: Opts) -> Result<()> {
             "Total       {} speed {}.000/s ({:.2} MB/s)",
             eu_num(total_bytes), eu_num(total_bytes), mbps,
         );
-        eprintln!(
-            "VERDICT         : {}                   ({} stored vs decompressed)",
-            color::g("OK"),
-            algo_name,
-        );
+        if verdict_ok {
+            eprintln!(
+                "VERDICT         : {}                   ({} stored vs decompressed)",
+                color::g("OK"),
+                algo_name,
+            );
+        } else {
+            eprintln!(
+                "VERDICT         : {}  ({} of {} files failed {} check)",
+                color::r("FAIL"),
+                hashes_failed, hashes_verified + hashes_failed, algo_name,
+            );
+            // Echo up to 20 failed paths so cron logs are useful without being
+            // enormous. Past that just say "... and N more".
+            let shown = failed_paths.len().min(20);
+            for p in failed_paths.iter().take(shown) {
+                eprintln!("  {} {}", color::r("FAIL"), p);
+            }
+            if failed_paths.len() > shown {
+                eprintln!("  ... and {} more", failed_paths.len() - shown);
+            }
+        }
         let _ = arc_size;
     }
     end_footer(elapsed, total_bytes);
+    if !verdict_ok {
+        let detail = if let Some(msg) = stream_error {
+            msg
+        } else {
+            format!("{} entries failed {} verification", hashes_failed, algo_name)
+        };
+        return Err(anyhow!(detail));
+    }
     Ok(())
 }
