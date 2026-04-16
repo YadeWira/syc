@@ -354,6 +354,44 @@ De la sesión previa quedaba uncommitted el retoque al `map_zstd_level`:
 
 Medido sobre 596 MB mixed binary (icons+fonts+doc tar). Conservamos m1/m4 porque son extremos bien definidos; solo rebalanceamos los intermedios que estaban parkeados en diminishing returns.
 
+## v0.1.15 — progress bar: match zpaqfranz `print_progress` exactly (2026-04-16)
+
+Revisión del progress bar para alinear char-por-char con zpaqfranz
+(`zpaqfranz.cpp:63367 print_progress`). Lo hicimos al comparar side-by-side
+durante una corrida real:
+
+```
+zpaqfranz: (077%)  76.98% 00:00:05  (   2.32 GB)->(   0.00  B)=>(   0.00  B)  132.22 MB/s
+syc old:           76.98% 00:00:05  (   2.32 GB)->(   0.00  B)=>(   0.00  B) 132.22 MB/s |   
+syc new:   (077%)  76.98% 00:00:05  (   2.32 GB)->(   0.00  B)=>(   0.00  B)  132.22 MB/s
+```
+
+**Interfaz**:
+- Añadido prefix `(NNN%)` zero-pad (antes 7 espacios, que es la rama 2 de zpaqfranz;
+  ahora usamos la rama 1 con external percentage = el mismo valor rounded-down).
+- Eliminado spinner trailing ` |   ` del main render.
+- Anchos `%10s` explícitos por campo (`{done:>10}`), defensivos aunque `human()`
+  ya devuelve 10 chars.
+
+**Behavior** (portado directo de zpaqfranz):
+- Refresh 1 Hz (antes 8 Hz con spinner). Ahora solo re-renderiza cuando cambia el
+  segundo, igual que el check `if (secondi != ultimi_secondi)` de zpaqfranz.
+- Skip render mientras `done < 1 MB` (matching `if (td < 1000000) return;`). Evita
+  el flash inicial `(000%) 0.01% 03:26:05` cuando el rate aún está en KB/s.
+- Cap `done → total` antes de formatear (matching `if (td > ts) td = ts;`). Nunca
+  muestra >100%, ni siquiera cuando el final-flush overshoot empuja el counter.
+- Skip render si ETA ≥ 350_000 s (~4 días, matching `if (eta >= 350000) return;`).
+  Mantiene el frame previo en vez de mostrar una ETA absurda.
+- Spinner se mantiene solo en `flushing()` (drain LZMA-MT), que es el único
+  estado donde ni el counter ni el segundo avanzan.
+
+Casos verificados:
+- Encode con compressed counter (rama rica): formato #1 de zpaqfranz.
+- Encode sin compressed: formato #3.
+- Test/extract (total=0): `          --   HH:MM:SS  (done) rate/s` sin cambios.
+
+Tests: 25 integración + 24 módulo, todo verde.
+
 ## v0.1.14 — windowLog 27→28: Pareto win on -m1 (2026-04-16)
 
 Sweep de 18+ configs de zstd (niveles, estrategias, hashLog, LDM params, overlapLog,

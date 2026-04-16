@@ -1,19 +1,22 @@
-//! Progress bar mirroring zpaqfranz's pack-mode line
-//! (`zpaqfranz.cpp:63480`):
+//! Progress bar mirroring zpaqfranz's `print_progress` (`zpaqfranz.cpp:63367`).
+//! Three render branches, matching the three format strings there:
 //!
-//!     `       PCT.PP% HH:MM:SS  (   X.XX MB)=>(   Y.YY MB)    Z.ZZ MB/s |`
+//!  * with total + compressed counter:
+//!    `(PPP%) PCT.PP% HH:MM:SS  (   X.XX MB)->(   Y.YY MB)=>(   Z.ZZ MB)   R.RR MB/s`
+//!  * with total, no compressed counter:
+//!    `       PCT.PP% HH:MM:SS  (   X.XX MB)=>(   Y.YY MB)    R.RR MB/s`
+//!  * no total (streaming — extract/test):
+//!    `          --   HH:MM:SS  (   X.XX MB)    R.RR MB/s`
 //!
-//! Refreshed every 125 ms (8 Hz) on stderr — slightly faster than zpaqfranz
-//! (1 Hz) so sub-second jobs feel alive. A 4-frame ASCII spinner rotates each
-//! tick to confirm motion even when the byte counter looks stuck.
-//!
-//! When `total == 0` (extract/test streams — syc has no central index, so we
-//! don't know up front), the percent slot collapses to dashes.
+//! Refreshed only when the whole-second clock ticks (zpaqfranz does the same).
+//! No spinner on the main line — the byte counter and clock advance every
+//! second, which is visual motion enough. A spinner only appears while
+//! `flushing()` is active (encoder drain with no more byte updates).
 //!
 //! `flushing()` spawns a background ticker so the line keeps updating elapsed
-//! time + spinner while the encoder's `finish()` runs (LZMA-MT can hold the
-//! main thread for tens of seconds with no upstream writes). Stop the ticker
-//! by calling `finish()`.
+//! time while the encoder's `finish()` runs (LZMA-MT can hold the main thread
+//! for tens of seconds with no upstream writes). Stop the ticker by calling
+//! `finish()`.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,18 +24,18 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const MIN_INTERVAL: Duration = Duration::from_millis(125);
+/// Spinner tick while `flushing()` is active (encoder drain).
+const FLUSH_TICK: Duration = Duration::from_millis(125);
 const SPINNER: &[char] = &['|', '/', '-', '\\'];
 
 pub struct Progress {
     start: Instant,
-    last_print: Instant,
+    last_second: u64,
     total: u64,
     done: u64,
     enabled: bool,
     label: &'static str,
     dirty: bool,
-    spin: usize,
     flush_stop: Option<Arc<AtomicBool>>,
     flush_thread: Option<JoinHandle<()>>,
     compressed: Option<Arc<AtomicU64>>,
@@ -42,16 +45,14 @@ impl Progress {
     /// `label` is kept for API compatibility but no longer rendered (zpaqfranz
     /// drops it). `total = 0` means "unknown size" — percent collapses.
     pub fn new(label: &'static str, total: u64, enabled: bool) -> Self {
-        let now = Instant::now();
         Self {
-            start: now,
-            last_print: now - MIN_INTERVAL,
+            start: Instant::now(),
+            last_second: u64::MAX,
             total,
             done: 0,
             enabled,
             label,
             dirty: false,
-            spin: 0,
             flush_stop: None,
             flush_thread: None,
             compressed: None,
@@ -75,68 +76,87 @@ impl Progress {
         if !self.enabled {
             return;
         }
-        let now = Instant::now();
-        if now.duration_since(self.last_print) < MIN_INTERVAL {
+        // Match zpaqfranz's `td < 1000000` guard: don't render while we haven't
+        // seen even 1 MB yet. Avoids the ugly 0.01% / multi-hour ETA flash on
+        // startup. Streaming (total=0) paths stay live — they're usually the
+        // extract/test case where the 1 MB lead-in matters less.
+        if self.total > 0 && self.done < 1_000_000 {
             return;
         }
-        self.last_print = now;
-        self.spin = (self.spin + 1) % SPINNER.len();
+        // zpaqfranz re-renders only when the whole-second clock ticks
+        // (`ultimi_secondi != secondi`). Matching that behavior avoids tearing
+        // and makes cold-cache disk bursts look like clean 1 Hz updates.
+        let secs = self.start.elapsed().as_secs();
+        if secs == self.last_second {
+            return;
+        }
+        self.last_second = secs;
         self.render();
     }
 
     fn render(&mut self) {
-        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
-        let rate = self.done as f64 / elapsed;
-        let rate_u = rate as u64;
-        let spin = SPINNER[self.spin];
+        let elapsed_secs = self.start.elapsed().as_secs().max(1);
+        let rate_u = self.done / elapsed_secs;
+        let rate_f = self.done as f64 / (elapsed_secs as f64);
         if self.total > 0 {
-            let pct = (self.done.min(self.total) as f64) * 100.0 / (self.total as f64);
-            let remaining = self.total.saturating_sub(self.done);
-            let eta_secs = if rate > 0.0 {
-                (remaining as f64 / rate) as u64
+            // Cap done at total so a final-flush overshoot can't render > 100%.
+            let done_capped = self.done.min(self.total);
+            let pct = (done_capped as f64) * 100.0 / (self.total as f64);
+            let pct_int = pct as u32;
+            let remaining = self.total.saturating_sub(done_capped);
+            let eta_secs = if rate_f > 0.0 {
+                (remaining as f64 / rate_f) as u64
             } else {
                 0
             };
+            // zpaqfranz skips the line when ETA looks unreasonable (~4 days);
+            // usually that's the first few ticks on a slow spinup. Keep the
+            // previous frame on screen instead of showing "99:59:59".
+            if eta_secs >= 350_000 {
+                return;
+            }
             let (h, m, s) = hms(eta_secs);
             if let Some(c) = &self.compressed {
                 let comp = c.load(Ordering::Relaxed);
-                // proj = comp * total / done : extrapolates current ratio to
-                // the full input. Saturating math keeps a runaway estimate from
-                // wrapping when comp is huge and done is small early on.
-                let proj = if self.done > 0 {
-                    ((comp as u128) * (self.total as u128) / (self.done as u128)) as u64
+                // proj = comp * total / done : extrapolate current ratio to the
+                // full input. u128 keeps the multiply from wrapping when comp
+                // is huge and done is small early on.
+                let proj = if done_capped > 0 {
+                    ((comp as u128) * (self.total as u128) / (done_capped as u128)) as u64
                 } else {
                     0
                 };
+                // Exact zpaqfranz format #1 (case i_percentuale > 0):
+                //   "(%03d%%) %6.2f%% %02d:%02d:%02d  (%10s)->(%10s)=>(%10s) %10s/s"
                 eprint!(
-                    "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done})->({comp})=>({proj}) {rate}/s {spin}   ",
+                    "\r({pi:03}%) {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done:>10})->({comp:>10})=>({proj:>10}) {rate:>10}/s  ",
+                    pi = pct_int.min(999),
                     pct = pct,
                     h = h, m = m, s = s,
-                    done = human(self.done),
+                    done = human(done_capped),
                     comp = human(comp),
                     proj = human(proj),
                     rate = human(rate_u),
-                    spin = spin,
                 );
             } else {
+                // Exact zpaqfranz format #3 (base case):
+                //   "       %6.2f%% %02d:%02d:%02d  (%10s)=>(%10s) %10s/s         "
                 eprint!(
-                    "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done})=>({total}) {rate}/s {spin}   ",
+                    "\r       {pct:6.2}% {h:02}:{m:02}:{s:02}  ({done:>10})=>({total:>10}) {rate:>10}/s         ",
                     pct = pct,
                     h = h, m = m, s = s,
-                    done = human(self.done),
+                    done = human(done_capped),
                     total = human(self.total),
                     rate = human(rate_u),
-                    spin = spin,
                 );
             }
         } else {
             let (h, m, s) = hms(self.start.elapsed().as_secs());
             eprint!(
-                "\r          --   {h:02}:{m:02}:{s:02}  ({done}) {rate}/s {spin}   ",
+                "\r          --   {h:02}:{m:02}:{s:02}  ({done:>10}) {rate:>10}/s         ",
                 h = h, m = m, s = s,
                 done = human(self.done),
                 rate = human(rate_u),
-                spin = spin,
             );
         }
         let _ = std::io::stderr().flush();
@@ -201,7 +221,7 @@ impl Progress {
                 eprint!("\r{:<82}", line);
                 let _ = std::io::stderr().flush();
                 spin = spin.wrapping_add(1);
-                std::thread::sleep(Duration::from_millis(125));
+                std::thread::sleep(FLUSH_TICK);
             }
         });
         self.flush_stop = Some(stop);
