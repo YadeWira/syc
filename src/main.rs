@@ -744,12 +744,42 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     // BCJ auto-detect all key off the compressible bucket only. Media files
     // don't belong in those stats anyway (they won't compress and their
     // headers are already compressed payloads).
-    let (default_entries, media_entries): (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>) =
+    let (mut default_entries, mut media_entries): (Vec<(PathBuf, PathBuf)>, Vec<(PathBuf, PathBuf)>) =
         if opts.route {
             all.into_iter().partition(|(_, rel)| !is_media_ext(rel))
         } else {
             (all, Vec::new())
         };
+
+    // Auto-gate: -route only pays off when media is a meaningful share of
+    // bytes. On mixed source trees (lots of small PNGs/icons), splitting
+    // adds frame overhead and drops solid-mode dedup context, measured
+    // +1.2 % ratio with no CPU savings. Threshold 20 % of total bytes.
+    const ROUTE_MIN_SHARE: f64 = 0.20;
+    if opts.route {
+        let sum_bytes = |v: &[(PathBuf, PathBuf)]| -> u64 {
+            v.iter()
+                .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        };
+        let default_b = sum_bytes(&default_entries);
+        let media_b = sum_bytes(&media_entries);
+        let total = default_b + media_b;
+        let share = if total > 0 { media_b as f64 / total as f64 } else { 0.0 };
+        if share < ROUTE_MIN_SHARE {
+            if !opts.summary {
+                eprintln!(
+                    "route   auto-off: media is {:.1}% of bytes (<{:.0}% threshold)",
+                    share * 100.0,
+                    ROUTE_MIN_SHARE * 100.0
+                );
+            }
+            default_entries.extend(media_entries.drain(..));
+            opts.route = false;
+        }
+    }
 
     // Build dedup maps per-bucket so HardLink entries always point at a
     // canonical within the same frame (canonical must be extracted before any

@@ -354,6 +354,27 @@ De la sesión previa quedaba uncommitted el retoque al `map_zstd_level`:
 
 Medido sobre 596 MB mixed binary (icons+fonts+doc tar). Conservamos m1/m4 porque son extremos bien definidos; solo rebalanceamos los intermedios que estaban parkeados en diminishing returns.
 
+## v0.1.16 — `-route` auto-gate por byte-share (2026-04-16)
+
+Bench sistemático de combos de flags sobre -m3 (41k files, 3 GiB source tree)
+reveló que `-route` **daña ratio +1.2 %** en corpora text-heavy: muchos PNGs
+pequeños (≈7 % de archivos) que solo pesan ≈4 % de bytes todavía activaban el
+split, añadiendo framing overhead y rompiendo el contexto solid-mode del
+encoder sin ahorro de CPU medible.
+
+Fix: `-route` ahora mide `media_bytes / total_bytes` después del partition.
+Si el share es <20 %, re-fusiona media en default y loguea
+`route   auto-off: media is N.N% of bytes (<20% threshold)`. Por encima del
+umbral el comportamiento es idéntico a antes.
+
+Verificado en 3 corpora:
+- tf2 source tree: 4.0 % media → auto-off, sin regresión
+- synthetic media (130 MB JPG/PNG vs 27 B texto): 99.9 % → route on
+- synthetic mixed (130 MB media vs 1 GB texto): 11.5 % → auto-off
+
+Sin cambio de formato (la decisión es pre-escritura). Flags conflictivas
+(`-lzp`, `-delta`, `-chunk`, PPMd) siguen abortando si el gate mantiene route.
+
 ## v0.1.15 — progress bar: match zpaqfranz `print_progress` exactly (2026-04-16)
 
 Revisión del progress bar para alinear char-por-char con zpaqfranz

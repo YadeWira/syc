@@ -393,7 +393,7 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
            -lzp          LZP pre-filter (context-hash long-match predictor)
                          pairs well with PPMd/LZMA; excl. REP/SREP/-delta
            -route        split pre-compressed media (jpg/mp4/zip/...) into
-                         a level-0 frame, saves CPU without losing ratio
+                         a level-0 frame; auto-off if media <20% of bytes
            -dedup        pack identical files once; duplicates become hardlink
                          entries (extracted as hardlinks, fall back to copy)
            -fastcdc      chunk-level dedup via FastCDC (2..64 KiB chunks);
