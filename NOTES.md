@@ -354,6 +354,36 @@ De la sesión previa quedaba uncommitted el retoque al `map_zstd_level`:
 
 Medido sobre 596 MB mixed binary (icons+fonts+doc tar). Conservamos m1/m4 porque son extremos bien definidos; solo rebalanceamos los intermedios que estaban parkeados en diminishing returns.
 
+## v0.1.14 — windowLog 27→28: Pareto win on -m1 (2026-04-16)
+
+Sweep de 18+ configs de zstd (niveles, estrategias, hashLog, LDM params, overlapLog,
+block splitter, IO buffer) buscando mejorar -m1 en los 3 ejes (compress speed, ratio,
+decompress speed). Único ganador: `windowLog(28)` con `window_log_max(31)` en decoder.
+
+Resultados en test-files2.tar (3.02 GB), cold-cache, ST:
+
+|               | old (w27)     | new (w28)     | delta          |
+|---------------|---------------|---------------|----------------|
+| enc ST        | 23.21 s       | 23.53 s       | ≈ mismo        |
+| enc MT4       | 19.10 s       | 17.46 s       | **−8.6 %**     |
+| size          | 1,557,974,582 | 1,543,419,306 | **−14.6 MB**   |
+| ratio         | 0.481         | 0.476         | **−1.04 %**    |
+| dec (syc t)   | 7.11 s        | 7.15 s        | ≈ mismo        |
+
+Pareto: enc ≤ igual, ratio estrictamente mejor, dec igual. MT4 además gana 8.6 % en
+encode porque LDM con ventana más grande encuentra más matches → menos bytes para el
+match-finder principal.
+
+vs arc -m1 (wine) ST: syc gana **4.2× enc, 3.4× dec, −0.46 % ratio**. Ya domina los 3 ejes.
+
+Descartados (no mejoran Pareto): niveles negativos (fast -1..-5), L2-L4, hashLog elevado,
+LDM minMatch=32, LDM hashLog=20, overlapLog=3/6/9, block splitter, IO_BUF 4 MiB,
+strategy=dfast/greedy override, ContentSizeFlag (N/A streaming).
+
+Nota: zstd decoder default cap es 128 MiB (windowLog=27); frames con w28 fallan sin
+`--long=28` en CLI. syc setea `window_log_max(31)` así que lee cualquier windowLog ≤ 31.
+Archivos previos (w27) se leen sin cambio.
+
 ## v0.1.12 — progress: CountingWriter sobre BufWriter + flushing pad (2026-04-16)
 
 **Bug visible en v0.1.11**: durante `flushing...` el counter `comp` quedaba en `22 B` (preámbulo) durante minutos, y al final aparecían pixeles `B/s \` colgando a la derecha de la línea.

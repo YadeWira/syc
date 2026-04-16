@@ -978,7 +978,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             }
             let _ = enc.include_checksum(true);
             if !opts.nolong {
-                let _ = enc.window_log(27);
+                let _ = enc.window_log(28);
                 let _ = enc.long_distance_matching(true);
             }
             if opts.level >= 4 && !opts.store {
@@ -1403,7 +1403,7 @@ fn cmd_add_append(
             }
             let _ = enc.include_checksum(true);
             if !opts.nolong {
-                let _ = enc.window_log(27);
+                let _ = enc.window_log(28);
                 let _ = enc.long_distance_matching(true);
             }
             pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &dedup, &mut prog)?;
@@ -1921,11 +1921,12 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
     let has_xattrs = preproc & archive::FEATURE_XATTRS != 0;
     let raw: Box<dyn Read> = match backend {
         Backend::Zstd => {
-            let d = if dict.is_empty() {
+            let mut d = if dict.is_empty() {
                 zstd::stream::Decoder::with_buffer(br)?
             } else {
                 zstd::stream::Decoder::with_dictionary(br, &dict)?
             };
+            let _ = d.window_log_max(31);
             Box::new(d)
         }
         // `new_multi_decoder` transparently handles a sequence of concatenated
