@@ -1779,11 +1779,19 @@ fn pack_all<W: Write>(
             if opts.xattrs {
                 archive::write_xattrs_block(enc, full, false)?;
             }
-        } else if opts.pjg && is_jpeg(rel) {
+        } else if is_jpeg(rel) {
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
-                    pack_entry_pjg(full, rel, enc, hash_algo, opts.xattrs,
-                        &mut |n| progress.advance(n))?;
+                    match pack_entry_pjg(full, rel, enc, hash_algo, opts.xattrs,
+                        &mut |n| progress.advance(n))
+                    {
+                        Ok(()) => {}
+                        Err(_) => {
+                            // Unsupported JPEG variant — fall back to plain File.
+                            pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
+                                &mut |n| progress.advance(n))?;
+                        }
+                    }
                     *total_bytes += meta.len();
                 } else {
                     pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
