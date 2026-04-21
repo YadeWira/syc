@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 
 extern "C" {
+    fn free(ptr: *mut c_void);
     fn pjglib_init_streams(
         in_src: *mut c_void,
         in_type: i32,
@@ -41,7 +42,7 @@ fn call(input: &[u8]) -> Result<Vec<u8>, String> {
         }
         // packJPG allocates the output buffer via malloc; copy then free.
         let bytes = std::slice::from_raw_parts(out_ptr, out_len as usize).to_vec();
-        libc::free(out_ptr as *mut c_void);
+        free(out_ptr as *mut c_void);
         Ok(bytes)
     }
 }
