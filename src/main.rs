@@ -5,12 +5,14 @@ mod delta;
 mod dict_fa;
 mod fastcdc;
 mod lzp;
+mod pjg;
 mod progress;
 mod rep;
 mod snapshot;
 mod srep;
 
 use anyhow::{anyhow, Context, Result};
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1777,6 +1779,17 @@ fn pack_all<W: Write>(
             if opts.xattrs {
                 archive::write_xattrs_block(enc, full, false)?;
             }
+        } else if opts.pjg && is_jpeg(rel) {
+            if let Ok(meta) = std::fs::symlink_metadata(full) {
+                if meta.is_file() {
+                    pack_entry_pjg(full, rel, enc, hash_algo, opts.xattrs,
+                        &mut |n| progress.advance(n))?;
+                    *total_bytes += meta.len();
+                } else {
+                    pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
+                        &mut |n| progress.advance(n))?;
+                }
+            }
         } else if let Some(reg) = chunk_reg.as_mut() {
             pack_entry_chunked(full, rel, enc, hash_algo, opts.xattrs, reg,
                 &mut |n| progress.advance(n))?;
@@ -1867,6 +1880,64 @@ fn pack_entry_chunked<W: Write>(
         out.write_all(&trailer[..tb])?;
     }
     Ok(())
+}
+
+/// Pack a JPEG as PJG (EntryKind::PjgFile). Body layout:
+///   [pjg_size:u32LE][pjg_bytes]
+/// `header.size` = original JPEG size; hash covers decoded JPEG bytes.
+fn pack_entry_pjg<W: Write>(
+    full: &Path,
+    rel: &Path,
+    out: &mut W,
+    hash_algo: Option<archive::HashAlgo>,
+    with_xattrs: bool,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(full)
+        .with_context(|| format!("stat {}", full.display()))?;
+    let jpg_bytes = std::fs::read(full)
+        .with_context(|| format!("read {}", full.display()))?;
+    let pjg_bytes = pjg::jpg_to_pjg(&jpg_bytes)
+        .map_err(|e| anyhow!("packJPG encode {}: {e}", full.display()))?;
+
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mtime = archive::meta_mtime(&meta);
+    #[cfg(unix)]
+    let mode = { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() };
+    #[cfg(not(unix))]
+    let mode = 0o644u32;
+
+    let header = EntryHeader {
+        kind: EntryKind::PjgFile,
+        mode,
+        size: jpg_bytes.len() as u64,
+        mtime,
+        path: rel_str,
+        link_target: String::new(),
+    };
+    header.write_to(out)?;
+    if with_xattrs { archive::write_xattrs_block(out, full, false)?; }
+
+    out.write_u32::<LittleEndian>(pjg_bytes.len() as u32)?;
+    out.write_all(&pjg_bytes)?;
+    on_bytes(pjg_bytes.len() as u64);
+
+    if let Some(algo) = hash_algo {
+        let mut hasher = archive::EntryHasher::new(algo);
+        hasher.update(&jpg_bytes);
+        let tb = algo.trailer_bytes();
+        let mut trailer = [0u8; 32];
+        hasher.finalize_into(&mut trailer[..tb]);
+        out.write_all(&trailer[..tb])?;
+    }
+    Ok(())
+}
+
+fn is_jpeg(rel: &Path) -> bool {
+    rel.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -2126,6 +2197,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
                 EntryKind::Symlink => ("<lnk>", color::y("<lnk>")),
                 EntryKind::HardLink => ("<hln>", color::y("<hln>")),
                 EntryKind::ChunkedFile => ("<cdc>", color::g("<cdc>")),
+                EntryKind::PjgFile => ("<pjg>", color::g("<pjg>")),
                 EntryKind::File => ("     ", "     ".to_string()),
             };
             // Track raw tag width (5 chars) but print colored version; column

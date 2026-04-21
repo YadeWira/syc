@@ -202,6 +202,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "byteorder",
+ "cc",
  "crc32fast",
  "libc",
  "ppmd-rust",
