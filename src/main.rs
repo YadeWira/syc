@@ -2,6 +2,7 @@ mod archive;
 mod cli;
 mod color;
 mod delta;
+mod detect;
 mod dict_fa;
 mod fastcdc;
 mod lzp;
@@ -1779,7 +1780,7 @@ fn pack_all<W: Write>(
             if opts.xattrs {
                 archive::write_xattrs_block(enc, full, false)?;
             }
-        } else if is_jpeg(rel) {
+        } else if detect::detect(full) == detect::FileKind::Jpeg {
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     match pack_entry_pjg(full, rel, enc, hash_algo, opts.xattrs,
@@ -1941,12 +1942,6 @@ fn pack_entry_pjg<W: Write>(
     Ok(())
 }
 
-fn is_jpeg(rel: &Path) -> bool {
-    rel.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
-        .unwrap_or(false)
-}
 
 #[cfg(unix)]
 fn entry_mode(full: &Path) -> u32 {
