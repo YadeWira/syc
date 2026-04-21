@@ -3,7 +3,14 @@
 Compresor/archivador en Rust, optimizado para hardware modesto
 (AMD A8-6600K, 4 cores, 7 GiB RAM, Debian 13).
 
-## Estado actual: v0.2.0 — dict training + long mode + solid sort
+## Estado actual: v0.1.17 — JPEG auto-PJG por magic bytes
+
+## v0.1.17 — JPEG auto-PJG por magic bytes
+- `src/detect.rs`: detección de tipo de archivo por magic bytes (`\xFF\xD8` para JPEG)
+- Reemplaza detección por extensión — detecta `.txt`, sin extensión, cualquier nombre
+- packJPG se aplica automáticamente a cualquier archivo que empiece con SOI marker
+
+## Estado anterior: v0.2.0 — dict training + long mode + solid sort
 
 ### Misiones encaradas (en orden cronológico)
 
