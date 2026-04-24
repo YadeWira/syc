@@ -43,6 +43,7 @@ pub struct Opts {
     pub route: bool,
     pub dedup: bool,
     pub fastcdc: bool,
+    pub ppg: bool,
     pub snapshot: bool,
     pub noprogress: bool,
     pub nocolor: bool,
@@ -189,6 +190,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "lzp" => opts.lzp = true,
                 "dedup" => opts.dedup = true,
                 "fastcdc" => opts.fastcdc = true,
+                "ppg" => opts.ppg = true,
                 "snapshot" => opts.snapshot = true,
                 "nocolor" | "nc" => opts.nocolor = true,
                 "noprogress" | "noeta" => opts.noprogress = true,
@@ -398,6 +400,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          entries (extracted as hardlinks, fall back to copy)
            -fastcdc      chunk-level dedup via FastCDC (2..64 KiB chunks);
                          catches partial overlap, e.g. near-duplicate backups
+           -ppg          pre-compress PNG/APNG via packPNG before archiving
+                         (brute-force zlib param match + solid LZMA; slow)
            -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
                          falls back to live tree on unsupported FS or non-root
            -nocolor      disable ANSI colors (alias: -nc; honors NO_COLOR env)

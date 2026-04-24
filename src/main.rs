@@ -1816,7 +1816,7 @@ fn pack_all<W: Write>(
                         &mut |n| progress.advance(n))?;
                 }
             }
-        } else if detect::detect(full) == detect::FileKind::Png {
+        } else if opts.ppg && detect::detect(full) == detect::FileKind::Png {
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     match pack_entry_ppg(full, rel, enc, hash_algo, opts.xattrs,
