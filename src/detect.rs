@@ -4,6 +4,7 @@ use std::path::Path;
 #[derive(Debug, PartialEq, Eq)]
 pub enum FileKind {
     Jpeg,
+    Png,
     Other,
 }
 
@@ -17,6 +18,11 @@ pub fn detect(path: &Path) -> FileKind {
 
     if n >= 2 && buf[0] == 0xFF && buf[1] == 0xD8 {
         return FileKind::Jpeg;
+    }
+
+    // PNG signature: \x89PNG\r\n\x1a\n
+    if n >= 4 && buf[0] == 0x89 && buf[1] == b'P' && buf[2] == b'N' && buf[3] == b'G' {
+        return FileKind::Png;
     }
 
     FileKind::Other

@@ -7,6 +7,7 @@ mod dict_fa;
 mod fastcdc;
 mod lzp;
 mod pjg;
+mod ppg;
 mod progress;
 mod rep;
 mod snapshot;
@@ -998,6 +999,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     let mut total_bytes: u64 = 0;
     let mut n_entries: u64 = 0;
     let mut n_pjg: u64 = 0;
+    let mut n_ppg: u64 = 0;
 
     match backend {
         Backend::Zstd => {
@@ -1025,14 +1027,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             }
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = dw.finish()?;
                 let counted = enc.finish()?;
                 let bw_inner = counted.into_inner();
                 let mut inner = bw_inner.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
                 inner.flush()?;
             } else {
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let counted = enc.finish()?;
                 let bw_inner = counted.into_inner();
                 let mut inner = bw_inner.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
@@ -1059,31 +1061,31 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             let enc = xz2::write::XzEncoder::new_stream(bw, stream);
             if let Some(stride) = opts.delta {
                 let mut dw = delta::DeltaWriter::new(enc, stride);
-                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut dw, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = dw.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else if preproc & PREPROC_LZP != 0 {
                 let mut lz = lzp::LzpWriter::new(enc);
-                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = lz.finish()?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -1095,25 +1097,25 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
                 .map_err(|e| anyhow!("ppmd init: {e}"))?;
             if preproc & PREPROC_SREP != 0 {
                 let mut pp = srep::SrepWriter::new(enc);
-                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut pp, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = pp.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else if preproc & PREPROC_REP != 0 {
                 let mut rep = rep::RepWriter::new(enc);
-                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut rep, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = rep.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else if preproc & PREPROC_LZP != 0 {
                 let mut lz = lzp::LzpWriter::new(enc);
-                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut lz, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let enc = lz.finish()?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             } else {
                 let mut enc = enc;
-                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_default, &mut prog)?;
+                pack_all(&mut enc, &default_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_default,&mut prog)?;
                 let mut inner = enc.finish(true)?;
                 inner.flush()?;
             }
@@ -1146,7 +1148,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
                     let _ = enc.multithread(opts.threads);
                 }
                 let _ = enc.include_checksum(true);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_media, &mut prog)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_media,&mut prog)?;
                 let counted2 = enc.finish()?;
                 let bw2 = counted2.into_inner();
                 let mut inner = bw2.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
@@ -1155,7 +1157,7 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
             Backend::Lzma => {
                 let stream = build_lzma_stream(0, opts.threads, 0, Bcj::None)?;
                 let mut enc = xz2::write::XzEncoder::new_stream(bw2, stream);
-                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup_media, &mut prog)?;
+                pack_all(&mut enc, &media_entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup_media,&mut prog)?;
                 let mut inner = enc.finish()?;
                 inner.flush()?;
             }
@@ -1273,9 +1275,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         } else {
             String::new()
         };
+        let ppg_tag = if n_ppg > 0 {
+            format!("  ppg:{}", n_ppg)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "syc-l{}  backend {}  threads {}  ratio {}{}",
-            opts.level, backend_name, opts.threads, ratio_col, pjg_tag,
+            "syc-l{}  backend {}  threads {}  ratio {}{}{}",
+            opts.level, backend_name, opts.threads, ratio_col, pjg_tag, ppg_tag,
         );
     }
     end_footer(elapsed, total_bytes);
@@ -1425,6 +1432,7 @@ fn cmd_add_append(
     let mut total_bytes: u64 = 0;
     let mut n_entries: u64 = 0;
     let mut n_pjg: u64 = 0;
+    let mut n_ppg: u64 = 0;
     let progress_total = packable_bytes(&entries, &dedup);
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("pack", progress_total, progress_enabled);
@@ -1446,7 +1454,7 @@ fn cmd_add_append(
                 let _ = enc.window_log(28);
                 let _ = enc.long_distance_matching(true);
             }
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup, &mut prog)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup,&mut prog)?;
             let counted = enc.finish()?;
             let bw = counted.into_inner();
             let mut inner = bw.into_inner().map_err(|e| anyhow!("flush: {e}"))?;
@@ -1465,7 +1473,7 @@ fn cmd_add_append(
             };
             let stream = build_lzma_stream(opts.level, opts.threads, 0, bcj)?;
             let mut enc = xz2::write::XzEncoder::new_stream(bw, stream);
-            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &dedup, &mut prog)?;
+            pack_all(&mut enc, &entries, &opts, hash_algo, &mut total_bytes, &mut n_entries, &mut n_pjg, &mut n_ppg, &dedup,&mut prog)?;
             let mut inner = enc.finish()?;
             inner.flush()?;
         }
@@ -1758,6 +1766,7 @@ fn pack_all<W: Write>(
     total_bytes: &mut u64,
     n_entries: &mut u64,
     n_pjg: &mut u64,
+    n_ppg: &mut u64,
     dedup: &std::collections::HashMap<PathBuf, String>,
     progress: &mut progress::Progress,
 ) -> Result<()> {
@@ -1797,6 +1806,25 @@ fn pack_all<W: Write>(
                         Ok(()) => { *n_pjg += 1; }
                         Err(_) => {
                             // Unsupported JPEG variant — fall back to plain File.
+                            pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
+                                &mut |n| progress.advance(n))?;
+                        }
+                    }
+                    *total_bytes += meta.len();
+                } else {
+                    pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
+                        &mut |n| progress.advance(n))?;
+                }
+            }
+        } else if detect::detect(full) == detect::FileKind::Png {
+            if let Ok(meta) = std::fs::symlink_metadata(full) {
+                if meta.is_file() {
+                    match pack_entry_ppg(full, rel, enc, hash_algo, opts.xattrs,
+                        &mut |n| progress.advance(n))
+                    {
+                        Ok(()) => { *n_ppg += 1; }
+                        Err(_) => {
+                            // Unsupported PNG variant — fall back to plain File.
                             pack_entry(full, rel, enc, &mut buf, hash_algo, opts.xattrs,
                                 &mut |n| progress.advance(n))?;
                         }
@@ -1950,6 +1978,56 @@ fn pack_entry_pjg<W: Write>(
     Ok(())
 }
 
+/// Pack a PNG/APNG as PPG (EntryKind::PpgFile). Body layout:
+///   [ppg_size:u32LE][ppg_bytes]
+/// `header.size` = original PNG size; hash covers decoded PNG bytes.
+fn pack_entry_ppg<W: Write>(
+    full: &Path,
+    rel: &Path,
+    out: &mut W,
+    hash_algo: Option<archive::HashAlgo>,
+    with_xattrs: bool,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(full)
+        .with_context(|| format!("stat {}", full.display()))?;
+    let png_bytes = std::fs::read(full)
+        .with_context(|| format!("read {}", full.display()))?;
+    let ppg_bytes = ppg::png_to_ppg(&png_bytes)
+        .map_err(|e| anyhow!("packPNG encode {}: {e}", full.display()))?;
+
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let mtime = archive::meta_mtime(&meta);
+    #[cfg(unix)]
+    let mode = { use std::os::unix::fs::PermissionsExt; meta.permissions().mode() };
+    #[cfg(not(unix))]
+    let mode = 0o644u32;
+
+    let header = EntryHeader {
+        kind: EntryKind::PpgFile,
+        mode,
+        size: png_bytes.len() as u64,
+        mtime,
+        path: rel_str,
+        link_target: String::new(),
+    };
+    header.write_to(out)?;
+    if with_xattrs { archive::write_xattrs_block(out, full, false)?; }
+
+    out.write_u32::<LittleEndian>(ppg_bytes.len() as u32)?;
+    out.write_all(&ppg_bytes)?;
+    on_bytes(ppg_bytes.len() as u64);
+
+    if let Some(algo) = hash_algo {
+        let mut hasher = archive::EntryHasher::new(algo);
+        hasher.update(&png_bytes);
+        let tb = algo.trailer_bytes();
+        let mut trailer = [0u8; 32];
+        hasher.finalize_into(&mut trailer[..tb]);
+        out.write_all(&trailer[..tb])?;
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn entry_mode(full: &Path) -> u32 {
@@ -2209,6 +2287,7 @@ fn cmd_list(archive: PathBuf, opts: Opts) -> Result<()> {
                 EntryKind::HardLink => ("<hln>", color::y("<hln>")),
                 EntryKind::ChunkedFile => ("<cdc>", color::g("<cdc>")),
                 EntryKind::PjgFile => ("<pjg>", color::g("<pjg>")),
+                EntryKind::PpgFile => ("<ppg>", color::g("<ppg>")),
                 EntryKind::File => ("     ", "     ".to_string()),
             };
             // Track raw tag width (5 chars) but print colored version; column

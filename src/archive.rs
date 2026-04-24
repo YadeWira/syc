@@ -78,11 +78,16 @@ pub enum EntryKind {
     /// is decoded back to JPEG via packJPG. Emitted only when `-pjg` is
     /// active; old readers fail cleanly on `from_u8`.
     PjgFile = 5,
+    /// PNG/APNG pre-processed to PPG format before archival. `size` holds the
+    /// original PNG size; the body contains PPG bytes. On extract the body is
+    /// decoded back to PNG/APNG via packPNG. Always-on for PNG files detected
+    /// by magic bytes; old readers fail cleanly on `from_u8`.
+    PpgFile = 6,
 }
 
 impl EntryKind {
     pub fn is_file_like(self) -> bool {
-        matches!(self, Self::File | Self::ChunkedFile | Self::PjgFile)
+        matches!(self, Self::File | Self::ChunkedFile | Self::PjgFile | Self::PpgFile)
     }
     fn from_u8(v: u8) -> Result<Self> {
         Ok(match v {
@@ -92,6 +97,7 @@ impl EntryKind {
             3 => Self::HardLink,
             4 => Self::ChunkedFile,
             5 => Self::PjgFile,
+            6 => Self::PpgFile,
             _ => return Err(anyhow!("unknown entry kind: {v}")),
         })
     }
@@ -644,6 +650,16 @@ pub fn read_file_body<R: Read, F: FnMut(&[u8]) -> Result<()>>(
             if let Some(h) = hasher.as_mut() { h.update(&jpg_bytes); }
             on_raw(&jpg_bytes)?;
         }
+        EntryKind::PpgFile => {
+            // Body layout: [ppg_size:u32LE][ppg_bytes]; hash covers decoded PNG.
+            let ppg_size = r.read_u32::<LittleEndian>()? as usize;
+            let mut ppg_buf = vec![0u8; ppg_size];
+            r.read_exact(&mut ppg_buf)?;
+            let png_bytes = crate::ppg::ppg_to_png(&ppg_buf)
+                .map_err(|e| anyhow!("PPG decode failed: {e}"))?;
+            if let Some(h) = hasher.as_mut() { h.update(&png_bytes); }
+            on_raw(&png_bytes)?;
+        }
         _ => {
             return Err(anyhow!(
                 "read_file_body on non-file kind {:?}",
@@ -744,7 +760,7 @@ pub fn unpack_entry<R: Read>(
             }
             if let Some(attrs) = &xattrs { apply_xattrs(&full, attrs, false); }
         }
-        EntryKind::File | EntryKind::ChunkedFile | EntryKind::PjgFile => {
+        EntryKind::File | EntryKind::ChunkedFile | EntryKind::PjgFile | EntryKind::PpgFile => {
             // Parent dirs should already exist (Dir entries come first in
             // solid-sorted streams). Only create on demand if missing.
             let f = match File::create(&full) {

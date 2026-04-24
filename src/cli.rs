@@ -6,7 +6,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// with a fallback to a hard-coded string so `cargo build` works without
 /// a build script. Update manually per release — keeps binary bit-identical
 /// if the date is pinned.
-pub const BUILD_DATE: &str = "2026-04-16";
+pub const BUILD_DATE: &str = "2026-04-23";
 
 #[derive(Debug, Default)]
 pub struct Opts {
