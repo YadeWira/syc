@@ -35,6 +35,10 @@
 #  include <libdeflate.h>
 #endif
 
+#ifdef USE_ZSTD
+#  include <zstd.h>
+#endif
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <fcntl.h>
@@ -69,6 +73,8 @@ static bool no_color        = false;
 static bool sfth            = false;
 static bool lzma_extreme    = false;
 static bool ldf_repack      = false;  // -ldf: pixel-exact libdeflate fallback for unmatched frames
+static bool use_zstd        = false;  // compile with -DUSE_ZSTD and pass -zstd to enable
+static int  g_zstd_level    = 19;
 static int  verbosity       = 0;
 static int  num_threads     = 1;
 static int  sfth_threads    = 1;
@@ -623,6 +629,36 @@ static bool lzma_dec(const uint8_t* in, size_t insz,
     return true;
 }
 
+/* ─── Zstd compress / decompress ────────────────────────────────────────── */
+
+#ifdef USE_ZSTD
+static bool zstd_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
+    size_t bound = ZSTD_compressBound(insz);
+    out.resize(bound);
+    size_t r = ZSTD_compress(out.data(), bound, in, insz, g_zstd_level);
+    if (ZSTD_isError(r)) {
+        snprintf(errormessage, MSG_SIZE, "ZSTD encode: %s", ZSTD_getErrorName(r)); return false;
+    }
+    out.resize(r); return true;
+}
+static bool zstd_dec(const uint8_t* in, size_t insz,
+                     std::vector<uint8_t>& out, size_t expected) {
+    out.resize(expected);
+    size_t r = ZSTD_decompress(out.data(), expected, in, insz);
+    if (ZSTD_isError(r)) {
+        snprintf(errormessage, MSG_SIZE, "ZSTD decode: %s", ZSTD_getErrorName(r)); return false;
+    }
+    out.resize(r); return true;
+}
+#else
+static bool zstd_enc(const uint8_t*, size_t, std::vector<uint8_t>&) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_ZSTD (-DUSE_ZSTD -lzstd)"); return false;
+}
+static bool zstd_dec(const uint8_t*, size_t, std::vector<uint8_t>&, size_t) {
+    snprintf(errormessage, MSG_SIZE, "not compiled with USE_ZSTD (-DUSE_ZSTD -lzstd)"); return false;
+}
+#endif
+
 /* ─── compress PNG/APNG → PPG v4 (solid LZMA + filter separation) ───────── */
 
 struct FrameEnc {
@@ -727,23 +763,30 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         }
     }
 
-    std::vector<uint8_t> lzma_data;
-    if (!lzma_enc(combined.data(), combined.size(), lzma_data)) return false;
-
-    if (verbosity >= 1) {
-        std::lock_guard<std::mutex> lk(g_print_mutex);
-        fprintf(stdout, "  solid LZMA: %zu → %zu (%.1f%%)\n",
-                total_payload, lzma_data.size(),
-                total_payload > 0 ? 100.0 * lzma_data.size() / total_payload : 0.0);
-    }
-
-    // Determine format version: v5 if any mode 2 frame, else v4
     bool has_mode2 = false;
     for (auto& fe : enc) if (fe.ldf_mode) { has_mode2 = true; break; }
 
+    std::vector<uint8_t> comp_data;
+    const char* comp_label = use_zstd ? "Zstd" : "LZMA";
+    if (use_zstd) {
+        if (!zstd_enc(combined.data(), combined.size(), comp_data)) return false;
+    } else {
+        if (!lzma_enc(combined.data(), combined.size(), comp_data)) return false;
+    }
+
+    if (verbosity >= 1) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        fprintf(stdout, "  solid %s: %zu → %zu (%.1f%%)\n",
+                comp_label, total_payload, comp_data.size(),
+                total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
+    }
+
+    // v4/v5 = LZMA; v6/v7 = Zstd (same layout, different compressor)
+    uint8_t fmt_ver = use_zstd ? (has_mode2 ? 7u : 6u) : (has_mode2 ? 5u : 4u);
+
     ppg_out.clear();
     wr_bytes(ppg_out, PPG_SIG, 4);
-    ppg_out.push_back(has_mode2 ? 5 : 4);              // format version
+    ppg_out.push_back(fmt_ver);                         // format version
     ppg_out.push_back(info.is_apng ? 1 : 0);
     wr_le32(ppg_out, info.num_plays);
     wr_le64(ppg_out, (uint64_t)info.pre.size());
@@ -786,10 +829,10 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
         }
     }
 
-    // Solid LZMA block
+    // Solid compressed block (LZMA v4/v5 or Zstd v6/v7)
     wr_le64(ppg_out, (uint64_t)total_payload);
-    wr_le64(ppg_out, (uint64_t)lzma_data.size());
-    wr_bytes(ppg_out, lzma_data.data(), lzma_data.size());
+    wr_le64(ppg_out, (uint64_t)comp_data.size());
+    wr_bytes(ppg_out, comp_data.data(), comp_data.size());
 
     return true;
 }
@@ -1042,12 +1085,16 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
         if (!read_frame_solid_meta(p, sz, pos, frames[i], payload_szs[i], ppg_version))
             return false;
 
-    if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (lzma hdr)"); return false; }
+    if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp hdr)"); return false; }
     uint64_t total_raw = rd_le64(p + pos); pos += 8;
-    uint64_t lzma_sz   = rd_le64(p + pos); pos += 8;
-    if (pos + lzma_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (lzma data)"); return false; }
+    uint64_t comp_sz   = rd_le64(p + pos); pos += 8;
+    if (pos + comp_sz > sz) { snprintf(errormessage, MSG_SIZE, "PPG solid truncated (comp data)"); return false; }
     std::vector<uint8_t> combined;
-    if (!lzma_dec(p + pos, lzma_sz, combined, total_raw)) return false;
+    if (ppg_version >= 6) {
+        if (!zstd_dec(p + pos, comp_sz, combined, total_raw)) return false;
+    } else {
+        if (!lzma_dec(p + pos, comp_sz, combined, total_raw)) return false;
+    }
 
     size_t offset = 0;
     for (uint32_t i = 0; i < num_frames; i++) {
@@ -1159,7 +1206,7 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         return true;
     }
 
-    if (version == 3 || version == 4 || version == 5)
+    if (version >= 3 && version <= 7)
         return decompress_solid(p, sz, pos, version, png_out);
 
     snprintf(errormessage, MSG_SIZE, "unknown PPG version %u", version); return false;
@@ -1393,19 +1440,20 @@ static void list_ppg(const std::string& path) {
         return;
     }
 
-    if (version == 3 || version == 4 || version == 5) {
+    if (version >= 3 && version <= 7) {
         bool is_apng   = (buf[pos++] & 1) != 0;
         uint32_t plays = rd_le32(buf.data()+pos); pos+=4;
         uint64_t pre_sz=rd_le64(buf.data()+pos); pos+=8; pos+=pre_sz;
         uint64_t post_sz=rd_le64(buf.data()+pos); pos+=8; pos+=post_sz;
         uint32_t nf   = rd_le32(buf.data()+pos); pos+=4;
+        const char* compressor = (version >= 6) ? "Zstd" : "LZMA";
         const char* fmtdesc = (version == 3) ? "" :
-                              (version == 4) ? " + filter sep" :
-                                               " + filter sep + ldf-repack";
-        fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid LZMA%s]\n",
+                              (version == 4 || version == 6) ? " + filter sep" :
+                                                               " + filter sep + ldf-repack";
+        fprintf(stdout, "  PPG v%u  %s  %u frame(s)%s  [solid %s%s]\n",
                 version, is_apng?"APNG":"PNG", nf,
                 is_apng ? (" loops=" + std::to_string(plays)).c_str() : "",
-                fmtdesc);
+                compressor, fmtdesc);
 
         for (uint32_t i = 0; i < nf && pos < buf.size(); i++) {
             bool has_fctl = buf[pos++] != 0;
@@ -1440,10 +1488,11 @@ static void list_ppg(const std::string& path) {
         }
         if (pos+16 <= buf.size()) {
             uint64_t total_raw=rd_le64(buf.data()+pos); pos+=8;
-            uint64_t lzma_sz  =rd_le64(buf.data()+pos);
-            fprintf(stdout, "  Solid LZMA: %llu → %llu (%.1f%%)\n",
-                    (unsigned long long)total_raw, (unsigned long long)lzma_sz,
-                    total_raw > 0 ? 100.0*lzma_sz/total_raw : 0.0);
+            uint64_t comp_sz  =rd_le64(buf.data()+pos);
+            fprintf(stdout, "  Solid %s: %llu → %llu (%.1f%%)\n",
+                    (version >= 6) ? "Zstd" : "LZMA",
+                    (unsigned long long)total_raw, (unsigned long long)comp_sz,
+                    total_raw > 0 ? 100.0*comp_sz/total_raw : 0.0);
         }
         return;
     }
