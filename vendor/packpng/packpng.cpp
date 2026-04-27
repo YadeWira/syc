@@ -610,11 +610,25 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
     uint32_t preset = g_lzma_preset;
     if (lzma_extreme) preset |= LZMA_PRESET_EXTREME;
+    // Image-tuned params: lc=4 beats default lc=3 by ~0.2% on PNG filter+pixel
+    // data; lp=0 stays optimal (PNG strides aren't position-aligned). lp=0
+    // is mandatory when lc=4 anyway (lc+lp <= 4).
+    lzma_options_lzma opts;
+    if (lzma_lzma_preset(&opts, preset)) {
+        snprintf(errormessage, MSG_SIZE, "LZMA preset init failed"); return false;
+    }
+    opts.lc = 4;
+    opts.lp = 0;
+    opts.pb = 2;
+    lzma_filter filters[2] = {
+        { LZMA_FILTER_LZMA2, &opts },
+        { LZMA_VLI_UNKNOWN,  nullptr }
+    };
     size_t bound = lzma_stream_buffer_bound(insz);
     out.resize(bound);
     size_t pos = 0;
-    lzma_ret r = lzma_easy_buffer_encode(
-        preset, LZMA_CHECK_CRC64, nullptr,
+    lzma_ret r = lzma_stream_buffer_encode(
+        filters, LZMA_CHECK_CRC64, nullptr,
         in, insz, out.data(), &pos, bound);
     if (r != LZMA_OK) {
         snprintf(errormessage, MSG_SIZE, "LZMA encode failed: %d", (int)r); return false;
