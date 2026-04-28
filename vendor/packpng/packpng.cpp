@@ -1,4 +1,4 @@
-/* packPNG v0.5 - PNG/APNG lossless recompressor
+/* packPNG v1.0j - PNG/APNG lossless recompressor
  *
  * Per-frame algorithm:
  *   PNG/APNG → parse frames → inflate pixels → brute-force zlib re-encode
@@ -39,6 +39,11 @@
 #  include <zstd.h>
 #endif
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <fcntl.h>
@@ -49,7 +54,8 @@
 
 static const char* subversion = "";   // letra = bugfix-only; sin letra = feature
 static const char* author     = "Yade Bravo (YadeWira)";
-static const int   appversion = 5;   // v0.5
+static const int   ver_major  = 1;    // v1.1 — pre-stable audit: 10 bug fixes (DoS in PPG decoder, atomic write, safe read, MT consec_fails, progress bar, unknown flag)
+static const int   ver_minor  = 1;
 
 /* ─── constants ──────────────────────────────────────────────────────────── */
 
@@ -57,8 +63,8 @@ static const uint8_t PNG_SIG[8] = {0x89,'P','N','G','\r','\n',0x1a,'\n'};
 static const uint8_t PPG_SIG[4] = {'P','P','G','1'};
 static const size_t  PROBE_BYTES    = 65536;
 static const int     MSG_SIZE       = 512;
-static const int     EARLYOUT_K     = 8;   // consecutive probe failures before giving up
-static const int     MAX_FULL_CALLS = 20;  // max full_deflate calls per IDAT (caps false-positive sweeps)
+static       int     EARLYOUT_K     = 8;   // bail after K consecutive probe failures (-deep raises it)
+static const int     MAX_FULL_CALLS = 20;  // cap on expensive full_deflate calls per IDAT
 
 /* ─── global options ─────────────────────────────────────────────────────── */
 
@@ -74,7 +80,7 @@ static bool no_color        = false;
 static bool sfth            = false;
 static bool lzma_extreme    = false;
 static bool ldf_repack      = false;  // -ldf: pixel-exact libdeflate fallback for unmatched frames
-static bool use_zstd        = false;  // compile with -DUSE_ZSTD and pass -zstd to enable
+static bool use_zstd        = false;  // -zstd: solid Zstd block instead of LZMA
 static int  g_zstd_level    = 19;
 static int  verbosity       = 0;
 static int  num_threads     = 1;
@@ -97,6 +103,19 @@ static std::atomic<int>    g_processed{0};
 static std::atomic<int>    g_errors{0};
 static std::atomic<double> g_acc_in{0.0};
 static std::atomic<double> g_acc_out{0.0};
+
+/* ─── progress bar (active only at v0 with >1 file in non-module mode) ───── */
+
+static const int BARLEN = 36;
+static std::atomic<int> g_files_done{0};
+static std::atomic<int> g_spinner_idx{0};
+static int  g_total_files = 0;
+static bool g_show_bar    = false;
+
+// Forward declarations — implementations after process_file
+static void clear_bar();
+static void draw_bar(int done);
+static void finish_bar();
 
 /* ─── color ──────────────────────────────────────────────────────────────── */
 
@@ -553,7 +572,7 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 
     if (sfth_threads <= 1) {
         std::vector<uint8_t> tmp, attempt;
-        int consec_fails = 0, full_calls = 0;
+        int full_calls = 0, consec_fails = 0;
         for (auto& c : cands) {
             if (!probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
                                c.lv, c.st, c.wbits, c.memlevel, tmp)) {
@@ -561,7 +580,7 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
                 continue;
             }
             consec_fails = 0;
-            if (++full_calls > MAX_FULL_CALLS) break;     // too many probe false-positives
+            if (++full_calls > MAX_FULL_CALLS) break;     // cap expensive false-positive sweeps
             if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
                 p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
             }
@@ -569,19 +588,45 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
         return false;
     }
 
+    // Lazy MT: most libpng-default PNGs match the first candidate. Spawning 4
+    // threads costs ~5ms on Windows — worse than the single probe + full_deflate
+    // for those files. Try the first candidate sequentially first; only fall
+    // back to MT for the remaining candidates if it doesn't match.
+    int sched_full_calls = 0, sched_consec_fails = 0;
+    {
+        std::vector<uint8_t> tmp, attempt;
+        auto& c = cands[0];
+        if (probe_deflate(px.data(), px.size(), tgt.data(), tgt.size(),
+                          c.lv, c.st, c.wbits, c.memlevel, tmp)) {
+            sched_full_calls = 1;
+            if (full_deflate(px, tgt, c.lv, c.st, c.wbits, c.memlevel, attempt)) {
+                p = {c.lv, c.st, c.memlevel, c.wbits}; return true;
+            }
+        } else {
+            sched_consec_fails = 1;
+        }
+    }
+    if (cands.size() <= 1) return false;
+
     std::atomic<bool> found{false};
-    std::atomic<int>  next_cand{0};
-    std::atomic<int>  consec_fails{0};
-    std::atomic<int>  full_calls{0};
+    std::atomic<int>  next_cand{1};                            // start at candidate 1
+    std::atomic<int>  full_calls{sched_full_calls};
+    std::atomic<int>  consec_fails{sched_consec_fails};
     std::mutex        result_mu;
     DeflParams        result{};
-    int nw = std::min(sfth_threads, (int)cands.size());
+    int nw = std::min(sfth_threads, (int)cands.size() - 1);
+    // Audit fix #9: in MT, consec_fails is shared across workers — ANY thread's
+    // probe success resets it. So the same EARLYOUT_K threshold fires later than
+    // in single-thread (where consec_fails is per-thread). Scale by nw to keep
+    // roughly the same per-thread sensitivity. Avoids wasted CPU on exotic-encoder
+    // images that single-thread would early-out on.
+    int mt_earlyout_k = EARLYOUT_K * nw;
     std::vector<std::thread> workers;
     for (int t = 0; t < nw; t++) {
-        workers.emplace_back([&]() {
+        workers.emplace_back([&, mt_earlyout_k]() {
             std::vector<uint8_t> tmp, attempt;
             while (!found
-                   && consec_fails.load(std::memory_order_relaxed) < EARLYOUT_K
+                   && consec_fails.load(std::memory_order_relaxed) < mt_earlyout_k
                    && full_calls.load(std::memory_order_relaxed) <= MAX_FULL_CALLS) {
                 int idx = next_cand.fetch_add(1);
                 if (idx >= (int)cands.size()) break;
@@ -610,7 +655,7 @@ static bool find_deflate_params(const std::vector<uint8_t>& px,
 static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) {
     uint32_t preset = g_lzma_preset;
     if (lzma_extreme) preset |= LZMA_PRESET_EXTREME;
-    // Image-tuned params: lc=4 beats default lc=3 by ~0.2% on PNG filter+pixel
+    // Image-tuned params: lc=4 beats default lc=3 by ~0.1% on PNG filter+pixel
     // data; lp=0 stays optimal (PNG strides aren't position-aligned). lp=0
     // is mandatory when lc=4 anyway (lc+lp <= 4).
     lzma_options_lzma opts;
@@ -624,6 +669,55 @@ static bool lzma_enc(const uint8_t* in, size_t insz, std::vector<uint8_t>& out) 
         { LZMA_FILTER_LZMA2, &opts },
         { LZMA_VLI_UNKNOWN,  nullptr }
     };
+
+    // MT-LZMA path: enabled whenever -sfth is set and the total compute thread
+    // count (num_threads × sfth_threads) does NOT exceed hardware_concurrency.
+    // In single-file mode (1 × 4 = 4) always on. In batch (-thN -sfth) on as
+    // long as N×4 ≤ hw. With -th0 -sfth on a hw-thread machine, hw×4 > hw → OFF
+    // (avoids the 144-thread oversubscription on a 36-thread Xeon).
+    // Block size 256K: ~2.7× single-file speedup, ~0.8% ratio cost on big files
+    // (small files fit in 1 block → no penalty, no benefit either).
+    int _hw     = (int)std::thread::hardware_concurrency();
+    int _total  = std::max(1, num_threads) * sfth_threads;
+    if (sfth_threads > 1 && (_hw <= 0 || _total <= _hw)) {
+        lzma_mt mt_opts = {};
+        mt_opts.flags      = 0;
+        mt_opts.threads    = (uint32_t)sfth_threads;
+        mt_opts.block_size = 256 * 1024;   // aggressive: 2.66× speedup, +0.76% ratio
+        mt_opts.timeout    = 0;
+        mt_opts.preset     = preset;
+        mt_opts.filters    = filters;
+        mt_opts.check      = LZMA_CHECK_CRC64;
+
+        lzma_stream strm = LZMA_STREAM_INIT;
+        if (lzma_stream_encoder_mt(&strm, &mt_opts) != LZMA_OK) {
+            snprintf(errormessage, MSG_SIZE, "LZMA mt init failed"); return false;
+        }
+        out.resize(insz + insz / 4 + 1024);
+        strm.next_in   = in;
+        strm.avail_in  = insz;
+        strm.next_out  = out.data();
+        strm.avail_out = out.size();
+        while (true) {
+            lzma_ret r = lzma_code(&strm, LZMA_FINISH);
+            if (r == LZMA_STREAM_END) break;
+            if (r != LZMA_OK) {
+                lzma_end(&strm);
+                snprintf(errormessage, MSG_SIZE, "LZMA mt encode failed: %d", (int)r);
+                return false;
+            }
+            if (strm.avail_out == 0) {
+                size_t used = strm.next_out - out.data();
+                out.resize(out.size() * 2);
+                strm.next_out  = out.data() + used;
+                strm.avail_out = out.size() - used;
+            }
+        }
+        out.resize(strm.next_out - out.data());
+        lzma_end(&strm);
+        return true;
+    }
+
     size_t bound = lzma_stream_buffer_bound(insz);
     out.resize(bound);
     size_t pos = 0;
@@ -750,6 +844,7 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
 
         if (verbosity >= 1) {
             std::lock_guard<std::mutex> lk(g_print_mutex);
+            clear_bar();
             if (fe.matched)
                 fprintf(stdout,
                     "  %s[match]%s  lv=%d st=%s wb=%d ml=%d  px=%zu  idat=%zu%s\n",
@@ -801,6 +896,7 @@ static bool compress_png(const std::vector<uint8_t>& png_buf,
 
     if (verbosity >= 1) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stdout, "  solid %s: %zu → %zu (%.1f%%)\n",
                 comp_label, total_payload, comp_data.size(),
                 total_payload > 0 ? 100.0 * comp_data.size() / total_payload : 0.0);
@@ -950,7 +1046,8 @@ static bool read_frame_v2(const uint8_t* p, size_t sz, size_t& pos, FrameMeta& f
     fm.memlevel = p[pos++];
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
-    if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
+    // Audit fix #4: cast to uint64_t to avoid uint32 overflow when nc > 0x40000000.
+    if ((uint64_t)nc * 4 > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
     fm.chunk_szs.resize(nc);
     for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
     if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (sizes)"); return false; }
@@ -988,7 +1085,8 @@ static bool read_frame_solid_meta(const uint8_t* p, size_t sz, size_t& pos,
     fm.memlevel = p[pos++];
     if (pos + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (n_chunks)"); return false; }
     uint32_t nc = rd_le32(p + pos); pos += 4;
-    if (pos + nc * 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
+    // Audit fix #4: cast to uint64_t to avoid uint32 overflow when nc > 0x40000000.
+    if ((uint64_t)nc * 4 > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG truncated (chunk_szs)"); return false; }
     fm.chunk_szs.resize(nc);
     for (uint32_t i = 0; i < nc; i++) { fm.chunk_szs[i] = rd_le32(p + pos); pos += 4; }
     if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG truncated (payload_sz)"); return false; }
@@ -1103,6 +1201,12 @@ static bool decompress_solid(const uint8_t* p, size_t sz, size_t pos,
     std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
     uint32_t num_frames = rd_le32(p + pos); pos += 4;
     (void)is_apng;
+    // Audit fix #3: cap num_frames by remaining file size. Solid frame meta is at
+    // least 1 (uses_idat) + 5 (deflate params) + 4 (n_chunks) + 8 (payload_sz) = 18 bytes
+    // when there's no fctl/first_seq/chunks. Use 18 as conservative lower bound.
+    if (num_frames > (sz - pos) / 18 + 1) {
+        snprintf(errormessage, MSG_SIZE, "PPG solid num_frames implausible (%u)", num_frames); return false;
+    }
 
     std::vector<FrameMeta> frames(num_frames);
     std::vector<uint64_t>  payload_szs(num_frames);
@@ -1163,19 +1267,32 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
     uint8_t version = p[pos++];
 
     if (version == 1) {
-        if (pos >= sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated"); return false; }
+        // Audit fix #1: bounds-check every read; reject huge n_idat that would OOM.
+        if (pos + 3 + 4 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (hdr)"); return false; }
         uint8_t mode     = p[pos++];
         uint8_t level    = p[pos++];
         uint8_t strategy = p[pos++];
         uint32_t n_idat  = rd_le32(p + pos); pos += 4;
+        // Each idat size is 4 bytes; cap n_idat by remaining file size.
+        if ((uint64_t)n_idat * 4 > sz - pos) {
+            snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (idat sizes)"); return false;
+        }
         std::vector<uint32_t> isizes(n_idat);
         for (uint32_t i = 0; i < n_idat; i++) { isizes[i] = rd_le32(p + pos); pos += 4; }
+        if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (pre_sz)"); return false; }
         uint64_t pre_sz = rd_le64(p + pos); pos += 8;
+        if (pre_sz > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (pre)"); return false; }
         std::vector<uint8_t> pre(p + pos, p + pos + pre_sz); pos += pre_sz;
+        if (pos + 8 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (suf_sz)"); return false; }
         uint64_t suf_sz = rd_le64(p + pos); pos += 8;
+        if (suf_sz > sz - pos) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (suf)"); return false; }
         std::vector<uint8_t> suf(p + pos, p + pos + suf_sz); pos += suf_sz;
+        if (pos + 16 > sz) { snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (sz hdr)"); return false; }
         uint64_t raw_sz  = rd_le64(p + pos); pos += 8;
         uint64_t lzma_sz = rd_le64(p + pos); pos += 8;
+        if (lzma_sz > sz - pos) {
+            snprintf(errormessage, MSG_SIZE, "PPG v1 truncated (lzma payload)"); return false;
+        }
         std::vector<uint8_t> payload;
         if (!lzma_dec(p + pos, lzma_sz, payload, raw_sz)) return false;
         std::vector<uint8_t> deflate_stream;
@@ -1209,6 +1326,12 @@ static bool decompress_ppg(const std::vector<uint8_t>& ppg_buf,
         std::vector<uint8_t> post(p + pos, p + pos + post_sz); pos += post_sz;
         uint32_t num_frames = rd_le32(p + pos); pos += 4;
         (void)is_apng;
+        // Audit fix #2: cap num_frames by remaining file size (each frame meta has at least
+        // 1 byte uses_idat + 5 bytes deflate params + 4 bytes nc + 16 bytes szs = 26 min).
+        // Use 20 as conservative lower bound on per-frame meta footprint.
+        if (num_frames > (sz - pos) / 20 + 1) {
+            snprintf(errormessage, MSG_SIZE, "PPG v2 num_frames implausible (%u)", num_frames); return false;
+        }
 
         std::vector<FrameMeta> frames(num_frames);
         for (uint32_t i = 0; i < num_frames; i++)
@@ -1255,20 +1378,44 @@ static bool compare_png_pixels(const std::vector<uint8_t>& a,
 /* ─── file helpers ───────────────────────────────────────────────────────── */
 
 static std::vector<uint8_t> read_file(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto sz = fs::file_size(path, ec);
+    if (ec || sz == 0) return {};
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return {};
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return {}; }
-    std::vector<uint8_t> buf(sz);
-    fread(buf.data(), 1, sz, f); fclose(f);
+    std::vector<uint8_t> buf((size_t)sz);
+    size_t got = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    // Audit fix #6: partial read = corrupt file, refuse to process garbage tail.
+    if (got != buf.size()) return {};
     return buf;
 }
 
 static bool write_file(const std::string& path, const std::vector<uint8_t>& data) {
-    FILE* f = fopen(path.c_str(), "wb");
+    // Audit fix #5: atomic .tmp + rename. Prevents losing the original file
+    // when the encoder errors mid-stream (disk full, ctrl+c, fwrite failure).
+    namespace fs = std::filesystem;
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
     bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
-    fclose(f); return ok;
+    if (fflush(f) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        // Some Windows filesystems error rename-over-existing — fall back to remove+rename.
+        fs::remove(path, ec);
+        fs::rename(tmp, path, ec);
+        if (ec) { fs::remove(tmp, ec); return false; }
+    }
+    return true;
 }
 
 enum FileType { F_PNG, F_PPG, F_UNK };
@@ -1296,12 +1443,86 @@ static std::string make_outpath(const std::string& inpath, const std::string& ex
 
 /* ─── process one file ───────────────────────────────────────────────────── */
 
+// Bar helpers — caller must hold g_print_mutex.
+static void clear_bar() {
+    if (!g_show_bar) return;
+    fprintf(stdout, "\r%*s\r", BARLEN + 34, "");
+}
+
+static void draw_bar(int done) {
+    if (!g_show_bar) return;
+    int total = g_total_files > 0 ? g_total_files : 1;
+    // Throttle: skip redraw if <50ms since last; always draw the final.
+    // Windows console rendering is slow (~25ms/redraw with ANSI); throttling
+    // shaves up to 12s on a 450-file batch. Linux terminals are fast either way.
+    static std::atomic<int64_t> last_draw_ms{0};
+    if (done < total) {
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t prev = last_draw_ms.load(std::memory_order_relaxed);
+        if (now_ms - prev < 50) return;
+        last_draw_ms.store(now_ms, std::memory_order_relaxed);
+    }
+    int barpos = (done * BARLEN) / total;
+#if defined(_WIN32)
+    static const char* spinners[] = { "-", "\\", "|", "/" };
+    const char* spin = spinners[g_spinner_idx.fetch_add(1, std::memory_order_relaxed) % 4];
+    const char* fill = "#"; const char* empty = " ";
+#else
+    static const char* spinners[] = {
+        "\xe2\xa0\x8b","\xe2\xa0\x99","\xe2\xa0\xb9","\xe2\xa0\xb8","\xe2\xa0\xbc",
+        "\xe2\xa0\xb4","\xe2\xa0\xa6","\xe2\xa0\xa7","\xe2\xa0\x87","\xe2\xa0\x8f"
+    };
+    const char* spin = spinners[g_spinner_idx.fetch_add(1, std::memory_order_relaxed) % 10];
+    const char* fill = "\xe2\x96\x88"; const char* empty = "\xe2\x96\x91";
+#endif
+    fprintf(stdout, "\r  %s  %3i / %-3i  %s[", spin, done, total, col(BC));
+    for (int b = 0; b < barpos; b++)         fputs(fill,  stdout);
+    fputs(col(R), stdout);
+    for (int b = barpos; b < BARLEN; b++)    fputs(empty, stdout);
+    fputs("]", stdout);
+    fflush(stdout);
+}
+
+static void finish_bar() {
+    if (!g_show_bar) return;
+    int total = g_total_files;
+#if defined(_WIN32)
+    const char* check = "+"; const char* fill = "#";
+#else
+    const char* check = "\xe2\x9c\x93"; const char* fill = "\xe2\x96\x88";
+#endif
+    fprintf(stdout, "\r  %s  %3i / %-3i  %s[", check, total, total, col(BC));
+    for (int b = 0; b < BARLEN; b++) fputs(fill, stdout);
+    fprintf(stdout, "%s]   \n", col(R));
+    fflush(stdout);
+}
+
+// Audit fix #8: keep the progress bar advancing even for files that are skipped
+// (wrong type, output exists, error, etc.). Caller must hold g_print_mutex.
+static inline void tick_bar() {
+    int done = g_files_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    draw_bar(done);
+}
+
 static void process_file(const std::string& inpath) {
     namespace fs = std::filesystem;
     FileType ft = detect_type(inpath);
-    if (ft == F_UNK) return;
-    if (ft == F_PNG && decompress_only) return;
-    if (ft == F_PPG && compress_only)   return;
+    if (ft == F_UNK) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
+    if (ft == F_PNG && decompress_only) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
+    if (ft == F_PPG && compress_only) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        tick_bar();
+        return;
+    }
 
     bool do_compress = (ft == F_PNG);
     std::string ext     = do_compress ? ".ppg" : ".png";
@@ -1309,8 +1530,10 @@ static void process_file(const std::string& inpath) {
 
     if (!overwrite && fs::exists(outpath)) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: output exists\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1318,8 +1541,10 @@ static void process_file(const std::string& inpath) {
     auto in = read_file(inpath);
     if (in.empty()) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot read\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1327,8 +1552,10 @@ static void process_file(const std::string& inpath) {
     bool ok = do_compress ? compress_png(in, out) : decompress_ppg(in, out);
     if (!ok) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: %s\n", col(RD), col(R), inpath.c_str(), errormessage);
         g_errors++;
+        tick_bar();
         return;
     }
 
@@ -1341,16 +1568,20 @@ static void process_file(const std::string& inpath) {
             bool match = ldf_repack ? compare_png_pixels(rt, in) : (rt == in);
             if (!vok || !match) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
+                clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
+                tick_bar();
                 return;
             }
         } else {
             vok = decompress_ppg(in, rt);
             if (!vok || rt != out) {
                 std::lock_guard<std::mutex> lk(g_print_mutex);
+                clear_bar();
                 fprintf(stderr, "%sERROR%s %s: round-trip mismatch\n", col(RD), col(R), inpath.c_str());
                 g_errors++;
+                tick_bar();
                 return;
             }
         }
@@ -1358,24 +1589,29 @@ static void process_file(const std::string& inpath) {
 
     if (!dry_run && !write_file(outpath, out)) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
+        clear_bar();
         fprintf(stderr, "%sERROR%s %s: cannot write output\n", col(RD), col(R), inpath.c_str());
         g_errors++;
+        tick_bar();
         return;
     }
 
     double ratio = in_sz > 0 ? 100.0 * out.size() / in_sz : 0.0;
     {
         std::lock_guard<std::mutex> lk(g_print_mutex);
-        if (!module_mode) {
+        // Per-file line: skipped at v0 when bar is active (bar replaces it).
+        if (!module_mode && (verbosity >= 1 || !g_show_bar)) {
             bool expanded = (ratio > 100.0);
             const char* pc = expanded ? col(YL) : col(GR);
+            clear_bar();   // no-op when !g_show_bar
             fprintf(stdout, "%s%s%s -> %s%s%s  %.2f%%%s\n",
                     pc, inpath.c_str(), col(R),
                     pc, outpath.c_str(), col(R), ratio,
                     expanded ? " [incompressible — consider skipping]" : "");
         }
+        g_processed++;
+        tick_bar();
     }
-    g_processed++;
     double prev = g_acc_in.load();
     while (!g_acc_in.compare_exchange_weak(prev, prev + (double)in_sz)) {}
     prev = g_acc_out.load();
@@ -1529,7 +1765,7 @@ static void list_ppg(const std::string& path) {
 
 static void show_help() {
     fprintf(stdout,
-        "\n%spackPNG%s v0.%i%s  •  by %s\n"
+        "\n%spackPNG%s v%d.%d%s  •  by %s\n"
         "PNG/APNG lossless recompressor — brute-force zlib match + solid LZMA\n\n"
         "Usage: packPNG [subcommand] [flags] file(s)\n\n"
         "Subcommands:\n"
@@ -1547,9 +1783,10 @@ static void show_help() {
         "  -dry         dry run (no output files)\n"
         "  -m<1-9>      LZMA preset (default 6)\n"
         "  -me          LZMA extreme flag (slower, better ratio)\n"
+        "  -deep        disable brute-force early-out (~2x slower, ~6%% smaller)\n"
         "  -ldf         libdeflate pixel-exact fallback for unmatched frames (PPG v5)\n"
         "  -th<N>       N file-level threads (0=auto)\n"
-        "  -sfth        parallel brute-force within each file\n"
+        "  -sfth        parallel brute-force + MT-LZMA within each file (4 threads, single-file mode; -th<N/4> for batch)\n"
         "  -od<path>    write output to directory\n"
         "  -module      machine-friendly output\n"
         "  --no-color   disable ANSI color\n\n"
@@ -1558,15 +1795,18 @@ static void show_help() {
         "  packPNG a -me -sfth animation.apng\n"
         "  packPNG a -th4 -od out/ *.png\n"
         "  packPNG x archive.ppg\n\n",
-        col(BC), col(R), appversion, subversion, author);
+        col(BC), col(R), ver_major, ver_minor, subversion, author);
 }
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
 
 #ifndef BUILD_LIB
-
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    // Console UTF-8 output so the bullets/arrows in banner/help render correctly
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     init_colors();
     if (argc < 2) { show_help(); return 0; }
 
@@ -1592,10 +1832,16 @@ int main(int argc, char** argv)
         else if (arg == "-r")         recursive    = true;
         else if (arg == "-dry")       dry_run      = true;
         else if (arg == "-sfth")      sfth         = true;
+        else if (arg == "-deep")      EARLYOUT_K   = 1 << 30;  // disable early-out → better ratio, ~2× time
         else if (arg == "-me")        lzma_extreme = true;
         else if (arg == "-ldf")       ldf_repack   = true;
+        else if (arg == "-zstd")      use_zstd     = true;
         else if (arg == "--no-color") no_color     = true;
         else if (arg == "-module")  { module_mode = true; wait_exit = false; }
+        else if (arg.size() > 4 && arg.substr(0,4) == "-zl=") {
+            int v = atoi(arg.c_str() + 4);
+            if (v >= 1 && v <= 22) g_zstd_level = v;
+        }
         else if (arg.size() > 2 && arg.substr(0,2) == "-m") {
             int v = atoi(arg.c_str() + 2);
             if (v >= 1 && v <= 9) g_lzma_preset = (unsigned)v;
@@ -1609,24 +1855,34 @@ int main(int argc, char** argv)
             outdir = arg.substr(3);
             std::filesystem::create_directories(outdir);
         }
-        else if (!arg.empty() && arg[0] == '-')
+        else if (!arg.empty() && arg[0] == '-') {
+            // Audit fix #10: abort on unknown flag (consistent with packJPG).
+            // Previously the warning was printed and the flag silently dropped,
+            // so typos like `-deeP` would be ignored without affecting behavior.
             fprintf(stderr, "unknown flag: %s\n", arg.c_str());
+            return 2;
+        }
         else
             collect(arg);
     }
 
     if (sfth) {
-        if (num_threads <= 1) {
-            sfth_threads = (int)std::thread::hardware_concurrency();
-            if (sfth_threads < 2) sfth_threads = 4;
+        // packJPG-style: fixed cap regardless of -thN. Combine as -th<N/4> -sfth.
+        // Cap at 4 because beyond that the brute-force candidate sweep hits
+        // diminishing returns (atomic counter + result mutex contention).
+        int hw = (int)std::thread::hardware_concurrency();
+        if (hw < 1) hw = 1;
+        sfth_threads = std::min(4, hw);
+        if (!module_mode && hw < 4) {
+            fprintf(stderr, "Warning: -sfth works best with 4+ cores (detected: %d)\n", hw);
         }
     }
 
     if (filelist.empty()) { show_help(); return 0; }
 
     if (!module_mode) {
-        fprintf(stdout, "\n%spackPNG%s v0.%i%s  •  by %s\n\n",
-                col(BC), col(R), appversion, subversion, author);
+        fprintf(stdout, "\n%spackPNG%s v%d.%d%s  •  by %s\n\n",
+                col(BC), col(R), ver_major, ver_minor, subversion, author);
     }
 
     if (list_mode) {
@@ -1636,6 +1892,9 @@ int main(int argc, char** argv)
     }
 
     auto t0 = std::chrono::steady_clock::now();
+
+    g_total_files = (int)filelist.size();
+    g_show_bar    = !module_mode && g_total_files > 1;
 
     if (num_threads <= 1) {
         for (auto& f : filelist) process_file(f);
@@ -1652,6 +1911,12 @@ int main(int argc, char** argv)
             });
         }
         for (auto& w : workers) w.join();
+    }
+
+    // Replace the in-progress bar with a final completed bar (✓ done/total).
+    if (g_show_bar) {
+        std::lock_guard<std::mutex> lk(g_print_mutex);
+        finish_bar();
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -1671,23 +1936,18 @@ int main(int argc, char** argv)
     if (wait_exit && !module_mode) { fprintf(stdout, "\nPress <enter> to quit\n"); getchar(); }
     return errs ? 1 : 0;
 }
+#endif // !BUILD_LIB
 
-#else // BUILD_LIB
+/* ─── syc FFI shims (not upstream — patched into the vendored copy) ──────── */
+/* Provide a C-style API for the Rust host to call compress_png /             */
+/* decompress_ppg via std::vector<uint8_t> in/out. Memory is malloc'd here    */
+/* and freed via ppglib_free on the Rust side (extern "C" linkage).           */
 
 extern "C" {
 
 bool ppglib_compress(const uint8_t* in_data, uint32_t in_size,
                      uint8_t** out_data, uint32_t* out_size)
 {
-    // Auto-detect hardware concurrency once; hw/2 threads, capped at 4.
-    // Heuristic: caller (syc) may use its own file-level threads; inner
-    // brute-force threads = hw/2 keeps total ≤ hw even at 2 concurrent files.
-    static std::once_flag sfth_flag;
-    std::call_once(sfth_flag, []() {
-        unsigned hw = std::thread::hardware_concurrency();
-        sfth_threads = (int)std::max(1u, std::min(4u, hw / 2u));
-    });
-
     std::vector<uint8_t> png_buf(in_data, in_data + in_size);
     std::vector<uint8_t> ppg_out;
     if (!compress_png(png_buf, ppg_out)) return false;
@@ -1714,5 +1974,3 @@ bool ppglib_decompress(const uint8_t* in_data, uint32_t in_size,
 void ppglib_free(uint8_t* ptr) { free(ptr); }
 
 } // extern "C"
-
-#endif // BUILD_LIB
