@@ -395,3 +395,161 @@ pub fn phase3_worker_count(opt_threads: u32) -> usize {
     let user = if opt_threads == 0 { hw } else { opt_threads as usize };
     user.min(hw).max(1)
 }
+
+/* ─── Parallel extract: pjg/ppg FFI decompress + write (-thN) ─────────────── */
+
+/// One pjg/ppg decode-and-write job. The main thread reads the compressed
+/// body and metadata sequentially out of the (sequential) decompressor stream,
+/// builds a DecodeJob, and dispatches it to a worker pool. Workers do the
+/// expensive FFI decode, hash check, and disk write in parallel.
+pub struct DecodeJob {
+    pub full_path: PathBuf,
+    pub kind: SpecificKind,
+    /// Compressed pjg/ppg payload (size prefix already stripped by caller).
+    pub body: Vec<u8>,
+    /// Stored hash trailer if hash_algo was active. Hash is over decoded bytes.
+    pub hash_trailer: Option<Vec<u8>>,
+    pub hash_algo: Option<crate::archive::HashAlgo>,
+    pub mtime: i64,
+    pub mode: u32,
+    pub xattrs: Option<Vec<crate::archive::XattrPair>>,
+    /// Original file size (used to advance the progress bar on completion).
+    pub size: u64,
+    /// Display path for error messages.
+    pub rel_display: String,
+}
+
+/// Result reported by a worker once a single DecodeJob is done. `size` mirrors
+/// `DecodeJob::size` so the main thread can credit progress without keeping a
+/// separate map.
+pub struct DecodeResult {
+    pub size: u64,
+    pub rel_display: String,
+    pub result: Result<(), String>,
+}
+
+/// Worker pool for parallel pjg/ppg decompress + file write during extract.
+///
+/// Mirrors `parallel_precompress` in spirit but reversed: the producer is the
+/// (single) main thread reading the LZMA/Zstd stream sequentially, and the
+/// consumers are N workers each pulling jobs and doing FFI decode + write in
+/// parallel. A bounded channel (`queue_depth = 4 * num_workers`) caps
+/// in-flight RAM at roughly `4 * num_workers * avg_compressed_size`.
+pub struct DecodePool {
+    job_tx: std::sync::mpsc::SyncSender<DecodeJob>,
+    result_rx: std::sync::mpsc::Receiver<DecodeResult>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl DecodePool {
+    pub fn new(num_workers: usize) -> Self {
+        let num_workers = num_workers.max(1);
+        let queue_depth = (num_workers * 4).max(4);
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<DecodeJob>(queue_depth);
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<DecodeResult>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+
+        let mut handles = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            handles.push(thread::spawn(move || loop {
+                let job = {
+                    let lock = job_rx.lock().unwrap();
+                    match lock.recv() {
+                        Ok(j) => j,
+                        Err(_) => break,
+                    }
+                };
+                let res = decode_and_write(&job);
+                let report = DecodeResult {
+                    size: job.size,
+                    rel_display: job.rel_display,
+                    result: res,
+                };
+                if result_tx.send(report).is_err() {
+                    break;
+                }
+            }));
+        }
+        drop(result_tx);
+
+        DecodePool { job_tx, result_rx, handles }
+    }
+
+    /// Send a job to the pool. Blocks if the bounded queue is full.
+    pub fn dispatch(&self, job: DecodeJob) -> Result<(), DecodeJob> {
+        self.job_tx.send(job).map_err(|e| e.0)
+    }
+
+    /// Drain any results that have already arrived without blocking.
+    pub fn try_recv(&self) -> Option<DecodeResult> {
+        self.result_rx.try_recv().ok()
+    }
+
+    /// Close the job channel and drain remaining results. Workers are joined.
+    pub fn finish(self) -> Vec<DecodeResult> {
+        let DecodePool { job_tx, result_rx, handles } = self;
+        drop(job_tx);
+        let mut out = Vec::new();
+        while let Ok(r) = result_rx.recv() {
+            out.push(r);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        out
+    }
+}
+
+fn decode_and_write(job: &DecodeJob) -> Result<(), String> {
+    use std::fs::File;
+    use std::io::Write;
+    let decoded = match job.kind {
+        SpecificKind::Pjg => crate::pjg::pjg_to_jpg(&job.body)
+            .map_err(|e| format!("PJG decode {}: {e}", job.rel_display))?,
+        SpecificKind::Ppg => crate::ppg::ppg_to_png(&job.body)
+            .map_err(|e| format!("PPG decode {}: {e}", job.rel_display))?,
+    };
+
+    if let (Some(algo), Some(stored)) = (job.hash_algo, job.hash_trailer.as_ref()) {
+        let mut hasher = crate::archive::EntryHasher::new(algo);
+        hasher.update(&decoded);
+        let mut computed = vec![0u8; algo.trailer_bytes()];
+        hasher.finalize_into(&mut computed);
+        if computed != stored.as_slice() {
+            return Err(format!(
+                "{} mismatch on {}",
+                algo.name(),
+                job.rel_display
+            ));
+        }
+    }
+
+    if let Some(parent) = job.full_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let mut f = File::create(&job.full_path)
+        .map_err(|e| format!("create {}: {e}", job.rel_display))?;
+    f.write_all(&decoded)
+        .map_err(|e| format!("write {}: {e}", job.rel_display))?;
+    drop(f);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &job.full_path,
+            std::fs::Permissions::from_mode(job.mode),
+        );
+    }
+    if let Some(attrs) = &job.xattrs {
+        crate::archive::apply_xattrs(&job.full_path, attrs, false);
+    }
+    if job.mtime != 0 {
+        crate::archive::apply_mtime(&job.full_path, job.mtime);
+    }
+    Ok(())
+}

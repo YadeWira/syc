@@ -968,7 +968,7 @@ pub fn apply_xattrs(_path: &Path, _attrs: &[XattrPair], _is_symlink: bool) {}
 /// silently skipped (matches the xattr policy and keeps extract robust on
 /// readonly mountpoints or filesystems without sub-second resolution).
 #[cfg(unix)]
-fn apply_mtime(path: &Path, mtime: i64) {
+pub fn apply_mtime(path: &Path, mtime: i64) {
     use std::os::unix::ffi::OsStrExt;
     use std::ffi::CString;
     let c = match CString::new(path.as_os_str().as_bytes()) {
@@ -984,9 +984,9 @@ fn apply_mtime(path: &Path, mtime: i64) {
 }
 
 #[cfg(not(unix))]
-fn apply_mtime(_path: &Path, _mtime: i64) {}
+pub fn apply_mtime(_path: &Path, _mtime: i64) {}
 
-fn sanitize_rel(p: &str) -> Result<PathBuf> {
+pub fn sanitize_rel(p: &str) -> Result<PathBuf> {
     let path = PathBuf::from(p);
     if path.is_absolute() {
         return Err(anyhow!("absolute path in archive: {p}"));

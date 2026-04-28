@@ -15,7 +15,7 @@ mod snapshot;
 mod srep;
 
 use anyhow::{anyhow, Context, Result};
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -2301,6 +2301,15 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
     let progress_enabled = !opts.noprogress && progress::stderr_is_tty() && !opts.summary;
     let mut prog = progress::Progress::new("extract", 0, progress_enabled);
     let mut reg = fastcdc::DecodeRegistry::new();
+
+    // v0.1.24: parallel pjg/ppg decompress + write. Main thread reads bodies
+    // sequentially (LZMA stream is single-producer); workers do the expensive
+    // FFI decode and disk write in parallel, scaling extract on PNG-heavy
+    // corpora roughly with -threads N (matches Phase 3 on the encode side).
+    let workers = pipeline::phase3_worker_count(opts.threads);
+    let pool = pipeline::DecodePool::new(workers);
+    let mut decode_errors: Vec<String> = Vec::new();
+
     while let Some(header) = EntryHeader::read_from(&mut dec, version)? {
         if header.kind.is_file_like() {
             total_bytes += header.size;
@@ -2308,16 +2317,80 @@ fn cmd_extract(archive: PathBuf, opts: Opts) -> Result<()> {
         if opts.verbose {
             eprintln!("- {}", header.path);
         }
-        unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs, &mut reg)?;
-        if header.kind.is_file_like() {
-            prog.advance(header.size);
+        match header.kind {
+            EntryKind::PjgFile | EntryKind::PpgFile => {
+                let xattrs = if has_xattrs {
+                    Some(archive::read_xattrs_block(&mut dec)?)
+                } else {
+                    None
+                };
+                let body_size = dec.read_u32::<LittleEndian>()? as usize;
+                let mut body = vec![0u8; body_size];
+                dec.read_exact(&mut body)?;
+                let hash_trailer = if let Some(algo) = hash_algo {
+                    let tb = algo.trailer_bytes();
+                    let mut t = vec![0u8; tb];
+                    dec.read_exact(&mut t)?;
+                    Some(t)
+                } else {
+                    None
+                };
+                let safe_rel = archive::sanitize_rel(&header.path)?;
+                let full_path = out.join(safe_rel);
+                let kind = match header.kind {
+                    EntryKind::PjgFile => pipeline::SpecificKind::Pjg,
+                    EntryKind::PpgFile => pipeline::SpecificKind::Ppg,
+                    _ => unreachable!(),
+                };
+                let job = pipeline::DecodeJob {
+                    full_path,
+                    kind,
+                    body,
+                    hash_trailer,
+                    hash_algo,
+                    mtime: header.mtime,
+                    mode: header.mode,
+                    xattrs,
+                    size: header.size,
+                    rel_display: header.path.clone(),
+                };
+                if pool.dispatch(job).is_err() {
+                    return Err(anyhow!("decode pool closed unexpectedly"));
+                }
+                while let Some(r) = pool.try_recv() {
+                    match r.result {
+                        Ok(()) => prog.advance(r.size),
+                        Err(e) => decode_errors.push(e),
+                    }
+                }
+            }
+            _ => {
+                unpack_entry(&mut dec, &out, &header, &mut buf, hash_algo, has_xattrs, &mut reg)?;
+                if header.kind.is_file_like() {
+                    prog.advance(header.size);
+                }
+            }
         }
         n_entries += 1;
     }
 
     let mut sink = [0u8; 1024];
     while dec.read(&mut sink)? > 0 {}
+
+    for r in pool.finish() {
+        match r.result {
+            Ok(()) => prog.advance(r.size),
+            Err(e) => decode_errors.push(e),
+        }
+    }
     prog.finish();
+
+    if !decode_errors.is_empty() {
+        for e in &decode_errors {
+            eprintln!("{}", color::err_line(e));
+        }
+        return Err(anyhow!("{} decode error(s)", decode_errors.len()));
+    }
 
     let elapsed = started.elapsed();
     if opts.summary {
