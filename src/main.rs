@@ -852,9 +852,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         let cores = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1);
-        // Cap at 8: zstd's internal MT scales sub-linearly past that on most
-        // hardware and just burns CPU for tiny gains.
-        opts.threads = cores.min(8).max(1);
+        // v0.1.23: dropped the previous .min(8) cap. The cap was for Zstd MT
+        // sub-linear scaling, but with Phase 3 (parallel pjg/ppg) introduced
+        // in v0.1.20 the same opts.threads now governs per-file FFI workers
+        // — and packJPG/packPNG calls scale linearly with cores. Capping at
+        // 8 made syc roughly 2× slower than packPNG standalone on 16-HT
+        // boxes. The backend's diminishing returns past 8 are still cheaper
+        // than under-utilising Phase 3.
+        opts.threads = cores.max(1);
         if !opts.summary && opts.threads > 1 {
             eprintln!("threads {} (auto: -t not set, input {})",
                 opts.threads, human_si(total_raw));

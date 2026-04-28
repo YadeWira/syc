@@ -376,20 +376,22 @@ pub fn parallel_precompress(
         .collect()
 }
 
-/// Worker count cap for `parallel_precompress`. Mirrors packJPG's `-sfth`
-/// fixed cap of 4: beyond this point per-file FFI parallelism hits diminishing
-/// returns, and oversubscribing the CPU hurts the LZMA backend that runs
-/// after Phase 3. Caller may pass a smaller value via `-thN`; this is the
-/// upper bound only.
-pub const PHASE3_MAX_WORKERS: usize = 8;
-
-/// Resolve the effective worker count for Phase 3 from the user's `-thN`
-/// flag, the hardware concurrency, and the per-task cap. Mirrors the
-/// existing -sfth-style logic in packJPG / packPNG.
+/// Resolve the effective worker count for Phase 3 from the user's `-threads`
+/// flag and the hardware concurrency.
+///
+/// v0.1.23: removed the previous `PHASE3_MAX_WORKERS = 8` cap. Original
+/// rationale was "avoid oversubscribing the LZMA backend that runs after
+/// Phase 3" — but Phase 3 and Phase 4 are sequential, not concurrent, so
+/// the worry was unfounded. The cap was making syc roughly 2× slower than
+/// packPNG standalone on machines with 16+ HT lanes, since users couldn't
+/// dispatch more than 8 parallel pjg/ppg workers no matter what.
+///
+/// `-threads 0` (auto) → hw concurrency.
+/// `-threads N` → min(N, hw) — never spawn more workers than CPU lanes.
 pub fn phase3_worker_count(opt_threads: u32) -> usize {
     let hw = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let user = if opt_threads == 0 { hw } else { opt_threads as usize };
-    user.min(hw).min(PHASE3_MAX_WORKERS).max(1)
+    user.min(hw).max(1)
 }
