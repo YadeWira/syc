@@ -1818,7 +1818,7 @@ fn pack_all<W: Write>(
                 continue;
             }
             let kind = match detect::detect(full) {
-                detect::FileKind::Jpeg => Some(pipeline::SpecificKind::Pjg),
+                detect::FileKind::Jpeg if !opts.nopjg => Some(pipeline::SpecificKind::Pjg),
                 detect::FileKind::Png if opts.ppg => Some(pipeline::SpecificKind::Ppg),
                 _ => None,
             };
@@ -1842,7 +1842,7 @@ fn pack_all<W: Write>(
                     nw,
                 );
             }
-            let results = pipeline::parallel_precompress(jobs, nw, hash_algo);
+            let results = pipeline::parallel_precompress(jobs, nw, hash_algo, progress);
             for r in results {
                 if let Ok(p) = r {
                     precomputed.insert(p.idx, p);
@@ -1889,7 +1889,7 @@ fn pack_all<W: Write>(
                 pipeline::SpecificKind::Pjg => *n_pjg += 1,
                 pipeline::SpecificKind::Ppg => *n_ppg += 1,
             }
-        } else if detect::detect(full) == detect::FileKind::Jpeg {
+        } else if !opts.nopjg && detect::detect(full) == detect::FileKind::Jpeg {
             if let Ok(meta) = std::fs::symlink_metadata(full) {
                 if meta.is_file() {
                     match pack_entry_pjg(full, rel, enc, hash_algo, opts.xattrs,
@@ -2151,7 +2151,9 @@ fn write_specific_from_cache<W: Write>(
     }
     out.write_u32::<LittleEndian>(p.body.len() as u32)?;
     out.write_all(&p.body)?;
-    on_bytes(p.body.len() as u64);
+    // v0.1.22: progress already advanced during Phase 3 (parallel_precompress
+    // bumped by original_size when the worker completed). Don't double-count.
+    let _ = on_bytes;
     if let Some(trailer) = &p.hash_trailer {
         out.write_all(trailer)?;
     }

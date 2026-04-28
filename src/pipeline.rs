@@ -323,6 +323,7 @@ pub fn parallel_precompress(
     jobs: Vec<SpecificJob>,
     num_workers: usize,
     hash_algo: Option<crate::archive::HashAlgo>,
+    progress: &mut crate::progress::Progress,
 ) -> Vec<Result<Precompressed, String>> {
     let n = jobs.len();
     if n == 0 {
@@ -352,8 +353,16 @@ pub fn parallel_precompress(
 
     let mut results: Vec<Option<Result<Precompressed, String>>> =
         (0..n).map(|_| None).collect();
+    // v0.1.22: receiver loop runs on the main thread, so it's safe to advance
+    // the (single-owner) progress bar after each completed job. Bytes counted
+    // here are the ORIGINAL (pre-FFI) file sizes, matching the input-byte
+    // metric the bar uses for plain entries during Phase 4 — the two phases
+    // sum to total_input_bytes without double-counting.
     while let Ok((idx, r)) = rx.recv() {
         if idx < results.len() {
+            if let Ok(ref p) = r {
+                progress.advance(p.original_size);
+            }
             results[idx] = Some(r);
         }
     }

@@ -49,6 +49,10 @@ pub struct Opts {
     /// of corpus composition. `-ppg` and `-noppg` together: `-noppg` wins
     /// (defensive default for users who pasted both into a script).
     pub noppg: bool,
+    /// Symmetric opt-out of the always-on packJPG pre-compression for JPEG
+    /// entries. JPEGs were always-on without a flag — `-nopjg` is the v0.1.22
+    /// addition that mirrors `-noppg`.
+    pub nopjg: bool,
     pub snapshot: bool,
     pub noprogress: bool,
     pub nocolor: bool,
@@ -197,6 +201,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "fastcdc" => opts.fastcdc = true,
                 "ppg" => opts.ppg = true,
                 "noppg" => opts.noppg = true,
+                "nopjg" => opts.nopjg = true,
                 "snapshot" => opts.snapshot = true,
                 "nocolor" | "nc" => opts.nocolor = true,
                 "noprogress" | "noeta" => opts.noprogress = true,
@@ -411,6 +416,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          match + solid LZMA; slow but better ratio. Always
                          active in all -m levels unless -noppg is passed.
            -noppg        opt-out of the default packPNG pre-compression
+           -nopjg        opt-out of the default packJPG pre-compression
+                         (mirrors -noppg; JPEGs are pre-compressed by default)
            -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
                          falls back to live tree on unsupported FS or non-root
            -nocolor      disable ANSI colors (alias: -nc; honors NO_COLOR env)
