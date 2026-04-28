@@ -748,19 +748,14 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     // bytes: matches the heuristic used by the existing -route auto-gate
     // (route auto-on when media >= 20 %; ppg auto-on when png >= 50 % is more
     // conservative because packPNG is slower than packJPG).
-    const PPG_AUTO_THRESHOLD: f64 = 0.50;
-    if !opts.ppg && !opts.noppg {
-        let png_share = plan.share(pipeline::ExtKind::Png);
-        if png_share >= PPG_AUTO_THRESHOLD {
-            opts.ppg = true;
-            if !opts.summary {
-                eprintln!(
-                    "ppg     auto-on: png {:.0}% of bytes (>={:.0}% threshold; pass -noppg to override)",
-                    png_share * 100.0,
-                    PPG_AUTO_THRESHOLD * 100.0,
-                );
-            }
-        }
+    // v0.1.21: format-specific compression is always-on by default for ALL
+    // -m levels — pjg for JPEGs (already unconditional in the pack loop) and
+    // ppg for PNGs. The previous 50 %-of-bytes threshold gated ppg too
+    // conservatively (a 1.74 GB corpus with 32 % PNG ≈ 600 MB of un-packPNG'd
+    // PNG never triggered). User opt-out via `-noppg`. Explicit `-ppg` is
+    // now redundant but kept as a no-op for script compatibility.
+    if !opts.noppg {
+        opts.ppg = true;
     }
 
     if opts.append {

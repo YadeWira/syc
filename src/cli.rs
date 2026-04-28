@@ -406,10 +406,11 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          entries (extracted as hardlinks, fall back to copy)
            -fastcdc      chunk-level dedup via FastCDC (2..64 KiB chunks);
                          catches partial overlap, e.g. near-duplicate backups
-           -ppg          pre-compress PNG/APNG via packPNG before archiving
-                         (brute-force zlib param match + solid LZMA; slow)
-           -noppg        opt-out of the v0.1.20 smart-default that auto-enables
-                         -ppg when PNG >= 50% of total bytes
+           -ppg          (default ON since v0.1.21) pre-compress PNG/APNG via
+                         packPNG before archiving. Brute-force zlib param
+                         match + solid LZMA; slow but better ratio. Always
+                         active in all -m levels unless -noppg is passed.
+           -noppg        opt-out of the default packPNG pre-compression
            -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
                          falls back to live tree on unsupported FS or non-root
            -nocolor      disable ANSI colors (alias: -nc; honors NO_COLOR env)
