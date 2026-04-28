@@ -526,10 +526,17 @@ pub fn collect_entries(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut out = Vec::new();
     let root_abs = fs::canonicalize(root)
         .with_context(|| format!("canonicalize {}", root.display()))?;
+    // v0.1.27: strip from the PARENT of root_abs so the source's own basename
+    // is preserved as the top-level archive component. `tar -cf x.tar TILIN/`
+    // and `7z a x.7z TILIN` both behave this way: entries inside the archive
+    // are `TILIN/foo.txt`, not bare `foo.txt`. Falling back to `root_abs`
+    // itself when the source is a filesystem root (no parent) keeps the old
+    // behaviour for the `/` corner case.
+    let strip_from: &Path = root_abs.parent().unwrap_or(&root_abs);
     for entry in walkdir::WalkDir::new(&root_abs).follow_links(false) {
         let entry = entry?;
         let full = entry.path().to_path_buf();
-        let rel = full.strip_prefix(&root_abs)?.to_path_buf();
+        let rel = full.strip_prefix(strip_from)?.to_path_buf();
         if rel.as_os_str().is_empty() {
             continue;
         }
