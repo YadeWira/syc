@@ -6,6 +6,7 @@ mod detect;
 mod dict_fa;
 mod fastcdc;
 mod lzp;
+mod pipeline;
 mod pjg;
 mod ppg;
 mod progress;
@@ -722,19 +723,19 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     if !opts.nosort {
         solid_sort(&mut all);
     }
+    // v0.1.20 Phase 1 — explicit Plan from the scan output. Replaces the
+    // ad-hoc scan_bytes loop. Same I/O cost (one symlink_metadata per entry)
+    // but preserves the result for smart defaults + later phases instead of
+    // throwing it away.
+    let plan = pipeline::Plan::from_entries(&all);
     if !opts.summary {
-        let scan_bytes: u64 = all
-            .iter()
-            .filter_map(|(full, _)| std::fs::symlink_metadata(full).ok())
-            .filter(|m| m.is_file())
-            .map(|m| m.len())
-            .sum();
         eprintln!(
-            "Scanned {} file/s  {}  {} ({})",
+            "Scanned {} file/s  {}  {} ({}){}",
             eu_num(all.len() as u64),
             hms(scan_started.elapsed().as_secs()),
-            eu_num(scan_bytes),
-            human_si(scan_bytes),
+            eu_num(plan.total_bytes),
+            human_si(plan.total_bytes),
+            plan.summary_line(),
         );
     }
 
