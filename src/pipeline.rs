@@ -376,6 +376,128 @@ pub fn parallel_precompress(
         .collect()
 }
 
+/// Streaming variant of `parallel_precompress` that overlaps Phase 3 with
+/// Phase 4 (the pack loop). Workers are spawned the same way, but instead of
+/// waiting for ALL jobs to finish before returning, results flow through a
+/// bounded `sync_channel`. The pack loop pulls them on demand by calling
+/// `PrecompressStream::take_or_block(idx, progress)` — which drains any
+/// already-arrived results into an internal HashMap, then blocks for the
+/// specific idx the loop wants next.
+///
+/// Memory bound: in flight ≤ `2 × channel_depth` results (channel buffer +
+/// internal HashMap). With `channel_depth = num_workers * 8` and ~80 KB avg
+/// compressed body, peak resident is in single-digit MB on a 16-HT box.
+///
+/// Backpressure: bounded channel — when full, workers block on `send()`, so
+/// Phase 3 won't outpace Phase 4 unboundedly. If Phase 4 stalls (slow Zstd
+/// write or a large media file), Phase 3 idles its workers cleanly.
+pub struct PrecompressStream {
+    rx: std::sync::mpsc::Receiver<(usize, Result<Precompressed, String>)>,
+    handles: Vec<thread::JoinHandle<()>>,
+    buffer: HashMap<usize, Result<Precompressed, String>>,
+}
+
+impl PrecompressStream {
+    /// Pull the result for the requested `idx`. Drains any pending results
+    /// into the internal buffer first so the bounded channel doesn't stall
+    /// other workers. Advances `progress` for every successful result that
+    /// arrives, regardless of which idx is asked for. Returns `None` if all
+    /// workers exited without producing this idx.
+    pub fn take_or_block(
+        &mut self,
+        idx: usize,
+        progress: &mut crate::progress::Progress,
+    ) -> Option<Result<Precompressed, String>> {
+        loop {
+            match self.rx.try_recv() {
+                Ok((i, r)) => {
+                    if let Ok(ref p) = r {
+                        progress.advance(p.original_size);
+                    }
+                    if i == idx {
+                        return Some(r);
+                    }
+                    self.buffer.insert(i, r);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        if let Some(r) = self.buffer.remove(&idx) {
+            return Some(r);
+        }
+        while let Ok((i, r)) = self.rx.recv() {
+            if let Ok(ref p) = r {
+                progress.advance(p.original_size);
+            }
+            if i == idx {
+                return Some(r);
+            }
+            self.buffer.insert(i, r);
+        }
+        None
+    }
+
+    /// Drain remaining results (advancing progress for any successes) and
+    /// join workers. Returns the count of results not consumed by the caller
+    /// for visibility — under normal use this is zero.
+    pub fn finish(mut self, progress: &mut crate::progress::Progress) -> usize {
+        while let Ok((i, r)) = self.rx.recv() {
+            if let Ok(ref p) = r {
+                progress.advance(p.original_size);
+            }
+            self.buffer.insert(i, r);
+        }
+        for h in self.handles {
+            let _ = h.join();
+        }
+        self.buffer.len()
+    }
+}
+
+/// Spawn the Phase 3 worker pool and return a streaming handle. The caller
+/// drives consumption from the pack loop via `PrecompressStream::take_or_block`.
+pub fn spawn_precompress_stream(
+    jobs: Vec<SpecificJob>,
+    num_workers: usize,
+    hash_algo: Option<crate::archive::HashAlgo>,
+) -> PrecompressStream {
+    if jobs.is_empty() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        return PrecompressStream { rx, handles: Vec::new(), buffer: HashMap::new() };
+    }
+    let num_workers = num_workers.min(jobs.len()).max(1);
+    // Sort jobs so workers pop ascending idx first (LIFO Vec → reverse-sort
+    // input). This keeps Phase 3 results aligned with the pack loop's
+    // ascending-idx consumption order, minimising the buffer high-water mark.
+    let mut jobs = jobs;
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.idx));
+
+    let queue: Arc<Mutex<Vec<SpecificJob>>> = Arc::new(Mutex::new(jobs));
+    let depth = (num_workers * 8).max(16);
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<(usize, Result<Precompressed, String>)>(depth);
+
+    let mut handles = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let q = Arc::clone(&queue);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || loop {
+            let job = match q.lock().unwrap().pop() {
+                Some(j) => j,
+                None => break,
+            };
+            let res = precompress_one(&job, hash_algo);
+            if tx.send(res).is_err() {
+                break;
+            }
+        }));
+    }
+    drop(tx);
+
+    PrecompressStream { rx, handles, buffer: HashMap::new() }
+}
+
 /// Resolve the effective worker count for Phase 3 from the user's `-threads`
 /// flag and the hardware concurrency.
 ///

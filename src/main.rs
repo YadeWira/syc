@@ -1807,15 +1807,16 @@ fn pack_all<W: Write>(
     };
 
     // ─── v0.1.20 Phase 3: specific compression (pjg / ppg) ─────────────────
-    // Parallel pjg/ppg pre-compress when -threads > 1. Runs AFTER Phase 2
-    // (dedup) so duplicates are skipped and AFTER Phase 1 smart defaults
-    // (which may have auto-enabled -ppg). Builds a HashMap<idx, Precompressed>
-    // for the pack loop to consume in order. Entries that fail the parallel
-    // compress are NOT cached — they fall through to the existing
-    // single-threaded pack path (which will retry the FFI call once and then
-    // fall back to plain File on error).
+    // v0.1.25: Phase 3 (parallel pjg/ppg pre-compress) and Phase 4 (sequential
+    // pack-loop write through the LZMA/Zstd backend) now run CONCURRENTLY.
+    // Workers stream their results into a bounded channel; the pack loop pulls
+    // them on demand via `PrecompressStream::take_or_block`. This collapses the
+    // two phases' wall-clocks into roughly max(Phase3, Phase4) instead of sum.
     let mut precomputed: std::collections::HashMap<usize, pipeline::Precompressed> =
         std::collections::HashMap::new();
+    let mut pjg_idx_set: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut precompress_stream: Option<pipeline::PrecompressStream> = None;
     if opts.threads > 1 {
         let mut jobs: Vec<pipeline::SpecificJob> = Vec::new();
         for (idx, (full, rel)) in all.iter().enumerate() {
@@ -1829,6 +1830,7 @@ fn pack_all<W: Write>(
             };
             if let Some(k) = kind {
                 if std::fs::symlink_metadata(full).map(|m| m.is_file()).unwrap_or(false) {
+                    pjg_idx_set.insert(idx);
                     jobs.push(pipeline::SpecificJob {
                         idx,
                         full: full.clone(),
@@ -1842,17 +1844,13 @@ fn pack_all<W: Write>(
             let nw = pipeline::phase3_worker_count(opts.threads);
             if !opts.summary {
                 eprintln!(
-                    "phase3  pre-compress {} pjg/ppg job(s) on {} worker(s)",
+                    "phase3  pre-compress {} pjg/ppg job(s) on {} worker(s) (overlap with phase4)",
                     jobs.len(),
                     nw,
                 );
             }
-            let results = pipeline::parallel_precompress(jobs, nw, hash_algo, progress);
-            for r in results {
-                if let Ok(p) = r {
-                    precomputed.insert(p.idx, p);
-                }
-            }
+            precompress_stream =
+                Some(pipeline::spawn_precompress_stream(jobs, nw, hash_algo));
         }
     }
 
@@ -1862,6 +1860,20 @@ fn pack_all<W: Write>(
     // sequential, but the backend may be MT-LZMA when -threads >= 2 and the
     // input is large enough (see build_lzma_stream).
     for (idx, (full, rel)) in all.iter().enumerate() {
+        // v0.1.25: pull this entry's pjg/ppg cache from the streaming Phase 3
+        // pool BEFORE the existing pack-loop branches run. take_or_block also
+        // drains any already-arrived results (advancing progress for them) so
+        // the bounded channel doesn't stall workers during slow non-pjg/ppg
+        // inline writes.
+        if let Some(s) = precompress_stream.as_mut() {
+            if pjg_idx_set.contains(&idx) {
+                if let Some(Ok(p)) = s.take_or_block(idx, progress) {
+                    precomputed.insert(idx, p);
+                }
+                // Err result silently dropped → falls through to the JPG/PNG
+                // fallback below, matching v0.1.20-v0.1.24 behaviour.
+            }
+        }
         if opts.verbose {
             eprintln!("+ {}", rel.display());
         }
@@ -1954,6 +1966,12 @@ fn pack_all<W: Write>(
             }
         }
         *n_entries += 1;
+    }
+    // v0.1.25: drain any straggler Phase 3 results and join workers. Under
+    // normal flow the pack loop has already consumed every job's result via
+    // take_or_block; this is the safety net for unusual paths.
+    if let Some(s) = precompress_stream.take() {
+        let _ = s.finish(progress);
     }
     // All entries streamed. The encoder's finish() step can still take a
     // while (LZMA MT in particular), so flip the bar to a "flushing..."
