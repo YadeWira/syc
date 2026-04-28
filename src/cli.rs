@@ -44,6 +44,11 @@ pub struct Opts {
     pub dedup: bool,
     pub fastcdc: bool,
     pub ppg: bool,
+    /// Explicit opt-out of the v0.1.20 smart-default that auto-enables `-ppg`
+    /// when PNG ≥ 50 % of total bytes. When true, `-ppg` stays off regardless
+    /// of corpus composition. `-ppg` and `-noppg` together: `-noppg` wins
+    /// (defensive default for users who pasted both into a script).
+    pub noppg: bool,
     pub snapshot: bool,
     pub noprogress: bool,
     pub nocolor: bool,
@@ -191,6 +196,7 @@ fn split_flags(args: &[String]) -> Result<(Vec<String>, Opts)> {
                 "dedup" => opts.dedup = true,
                 "fastcdc" => opts.fastcdc = true,
                 "ppg" => opts.ppg = true,
+                "noppg" => opts.noppg = true,
                 "snapshot" => opts.snapshot = true,
                 "nocolor" | "nc" => opts.nocolor = true,
                 "noprogress" | "noeta" => opts.noprogress = true,
@@ -402,6 +408,8 @@ Switches : -m N (alias -level)  -threads N  -to DIR  -find TEXT
                          catches partial overlap, e.g. near-duplicate backups
            -ppg          pre-compress PNG/APNG via packPNG before archiving
                          (brute-force zlib param match + solid LZMA; slow)
+           -noppg        opt-out of the v0.1.20 smart-default that auto-enables
+                         -ppg when PNG >= 50% of total bytes
            -snapshot     atomic FS snapshot (btrfs/zfs) before archiving;
                          falls back to live tree on unsupported FS or non-root
            -nocolor      disable ANSI colors (alias: -nc; honors NO_COLOR env)

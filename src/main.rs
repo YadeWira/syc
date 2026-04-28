@@ -739,6 +739,27 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         );
     }
 
+    // v0.1.20 Phase 1 smart default — auto-enable -ppg when PNG dominates the
+    // corpus. Three flag states: -ppg explicit ON, -noppg explicit OFF, neither.
+    // Only the third state lets the Plan decide. Threshold 50 % of total
+    // bytes: matches the heuristic used by the existing -route auto-gate
+    // (route auto-on when media >= 20 %; ppg auto-on when png >= 50 % is more
+    // conservative because packPNG is slower than packJPG).
+    const PPG_AUTO_THRESHOLD: f64 = 0.50;
+    if !opts.ppg && !opts.noppg {
+        let png_share = plan.share(pipeline::ExtKind::Png);
+        if png_share >= PPG_AUTO_THRESHOLD {
+            opts.ppg = true;
+            if !opts.summary {
+                eprintln!(
+                    "ppg     auto-on: png {:.0}% of bytes (>={:.0}% threshold; pass -noppg to override)",
+                    png_share * 100.0,
+                    PPG_AUTO_THRESHOLD * 100.0,
+                );
+            }
+        }
+    }
+
     if opts.append {
         return cmd_add_append(archive, all, opts, started);
     }
