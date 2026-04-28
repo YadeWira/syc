@@ -701,9 +701,12 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         sources.clone()
     };
 
-    // Scan phase — collect + filter + sort. Keep the scan time separate from
-    // pack time so the user can see where wall-clock is being spent. The
-    // `Scanned N file/s` line mirrors zpaqfranz's pre-pack summary.
+    // ─── v0.1.20 Phase 1: scan ─────────────────────────────────────────────
+    // Collect + filter + sort + build Plan. No file contents read here, only
+    // metadata (stat). Keep the scan time separate from pack time so the
+    // user can see where wall-clock is being spent. The `Scanned N file/s`
+    // line mirrors zpaqfranz's pre-pack summary; the Plan drives smart
+    // defaults (auto -ppg) and is consumed by Phases 2-4 downstream.
     let scan_started = Instant::now();
     let mut all: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in &effective_sources {
@@ -807,9 +810,12 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
         }
     }
 
+    // ─── v0.1.20 Phase 2: dedup ────────────────────────────────────────────
     // Build dedup maps per-bucket so HardLink entries always point at a
     // canonical within the same frame (canonical must be extracted before any
-    // of its references).
+    // of its references). Runs BEFORE Phase 3 — duplicate files don't trigger
+    // redundant packJPG/packPNG calls; their entries become HardLinks in the
+    // pack loop and the FFI cost is paid only for the canonical instance.
     let dedup_default = if opts.dedup {
         build_dedup_map(&default_entries)?
     } else {
@@ -1799,11 +1805,14 @@ fn pack_all<W: Write>(
         None
     };
 
-    // v0.1.20 Phase 3: parallel pjg/ppg pre-compress when -thN > 1.
-    // Builds a HashMap<idx, Precompressed> for the pack loop to consume in
-    // order. Entries that fail the parallel compress are NOT cached — they
-    // fall through to the existing single-threaded pack path (which will
-    // retry the FFI call once and then fall back to plain File on error).
+    // ─── v0.1.20 Phase 3: specific compression (pjg / ppg) ─────────────────
+    // Parallel pjg/ppg pre-compress when -threads > 1. Runs AFTER Phase 2
+    // (dedup) so duplicates are skipped and AFTER Phase 1 smart defaults
+    // (which may have auto-enabled -ppg). Builds a HashMap<idx, Precompressed>
+    // for the pack loop to consume in order. Entries that fail the parallel
+    // compress are NOT cached — they fall through to the existing
+    // single-threaded pack path (which will retry the FFI call once and then
+    // fall back to plain File on error).
     let mut precomputed: std::collections::HashMap<usize, pipeline::Precompressed> =
         std::collections::HashMap::new();
     if opts.threads > 1 {
@@ -1846,6 +1855,11 @@ fn pack_all<W: Write>(
         }
     }
 
+    // ─── v0.1.20 Phase 4: write entries (general compression streams via enc) ──
+    // The `enc` writer wraps the LZMA / Zstd / PPMd encoder. Each entry written
+    // here flows through that backend as it goes — the entry-level loop is
+    // sequential, but the backend may be MT-LZMA when -threads >= 2 and the
+    // input is large enough (see build_lzma_stream).
     for (idx, (full, rel)) in all.iter().enumerate() {
         if opts.verbose {
             eprintln!("+ {}", rel.display());
