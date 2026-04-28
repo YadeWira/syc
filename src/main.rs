@@ -1798,7 +1798,55 @@ fn pack_all<W: Write>(
     } else {
         None
     };
-    for (full, rel) in all {
+
+    // v0.1.20 Phase 3: parallel pjg/ppg pre-compress when -thN > 1.
+    // Builds a HashMap<idx, Precompressed> for the pack loop to consume in
+    // order. Entries that fail the parallel compress are NOT cached — they
+    // fall through to the existing single-threaded pack path (which will
+    // retry the FFI call once and then fall back to plain File on error).
+    let mut precomputed: std::collections::HashMap<usize, pipeline::Precompressed> =
+        std::collections::HashMap::new();
+    if opts.threads > 1 {
+        let mut jobs: Vec<pipeline::SpecificJob> = Vec::new();
+        for (idx, (full, rel)) in all.iter().enumerate() {
+            if dedup.contains_key(full) {
+                continue;
+            }
+            let kind = match detect::detect(full) {
+                detect::FileKind::Jpeg => Some(pipeline::SpecificKind::Pjg),
+                detect::FileKind::Png if opts.ppg => Some(pipeline::SpecificKind::Ppg),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                if std::fs::symlink_metadata(full).map(|m| m.is_file()).unwrap_or(false) {
+                    jobs.push(pipeline::SpecificJob {
+                        idx,
+                        full: full.clone(),
+                        rel: rel.clone(),
+                        kind: k,
+                    });
+                }
+            }
+        }
+        if !jobs.is_empty() {
+            let nw = pipeline::phase3_worker_count(opts.threads);
+            if !opts.summary {
+                eprintln!(
+                    "phase3  pre-compress {} pjg/ppg job(s) on {} worker(s)",
+                    jobs.len(),
+                    nw,
+                );
+            }
+            let results = pipeline::parallel_precompress(jobs, nw, hash_algo);
+            for r in results {
+                if let Ok(p) = r {
+                    precomputed.insert(p.idx, p);
+                }
+            }
+        }
+    }
+
+    for (idx, (full, rel)) in all.iter().enumerate() {
         if opts.verbose {
             eprintln!("+ {}", rel.display());
         }
@@ -1818,6 +1866,18 @@ fn pack_all<W: Write>(
             header.write_to(enc)?;
             if opts.xattrs {
                 archive::write_xattrs_block(enc, full, false)?;
+            }
+        } else if let Some(p) = precomputed.remove(&idx) {
+            // v0.1.20 Phase 3: cached pre-compress hit — write directly
+            // without the FFI call (already done by the worker pool).
+            let original_size = p.original_size;
+            let kind_label = p.kind;
+            write_specific_from_cache(p, enc, opts.xattrs, full,
+                &mut |n| progress.advance(n))?;
+            *total_bytes += original_size;
+            match kind_label {
+                pipeline::SpecificKind::Pjg => *n_pjg += 1,
+                pipeline::SpecificKind::Ppg => *n_ppg += 1,
             }
         } else if detect::detect(full) == detect::FileKind::Jpeg {
             if let Ok(meta) = std::fs::symlink_metadata(full) {
@@ -2047,6 +2107,43 @@ fn pack_entry_ppg<W: Write>(
         let mut trailer = [0u8; 32];
         hasher.finalize_into(&mut trailer[..tb]);
         out.write_all(&trailer[..tb])?;
+    }
+    Ok(())
+}
+
+/// Write a pre-compressed pjg/ppg entry from the v0.1.20 Phase-3 cache.
+/// Mirrors the I/O part of pack_entry_pjg / pack_entry_ppg but skips the
+/// filesystem read and the FFI call (the worker pool already did both,
+/// including the hash if requested).
+fn write_specific_from_cache<W: Write>(
+    p: pipeline::Precompressed,
+    out: &mut W,
+    with_xattrs: bool,
+    full: &Path,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<()> {
+    let kind = match p.kind {
+        pipeline::SpecificKind::Pjg => EntryKind::PjgFile,
+        pipeline::SpecificKind::Ppg => EntryKind::PpgFile,
+    };
+    let rel_str = p.rel.to_string_lossy().replace('\\', "/");
+    let header = EntryHeader {
+        kind,
+        mode: p.mode,
+        size: p.original_size,
+        mtime: p.mtime,
+        path: rel_str,
+        link_target: String::new(),
+    };
+    header.write_to(out)?;
+    if with_xattrs {
+        archive::write_xattrs_block(out, full, false)?;
+    }
+    out.write_u32::<LittleEndian>(p.body.len() as u32)?;
+    out.write_all(&p.body)?;
+    on_bytes(p.body.len() as u64);
+    if let Some(trailer) = &p.hash_trailer {
+        out.write_all(trailer)?;
     }
     Ok(())
 }

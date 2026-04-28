@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Coarse classification of a file by extension. Used to drive smart defaults
 /// and report scan summary. The actual per-file decision in Phase 3 still
@@ -198,4 +200,163 @@ mod tests {
         assert_eq!(pct(&[1, 2, 3, 4, 5], 50), 3);
         assert_eq!(pct(&[1, 2, 3, 4, 5], 95), 5);
     }
+}
+
+/* ─── Phase 3: parallel specific compression (-thN) ──────────────────────── */
+
+/// Which specific compressor to invoke for a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecificKind {
+    Pjg,
+    Ppg,
+}
+
+/// A single pjg/ppg pre-compress job. `idx` is the position in the original
+/// entry list — used by the pack loop to write results in the same order the
+/// input entries were collected (workers complete out of order).
+pub struct SpecificJob {
+    pub idx: usize,
+    pub full: PathBuf,
+    pub rel: PathBuf,
+    pub kind: SpecificKind,
+}
+
+/// Result of a successful pre-compression. Holds everything the pack loop
+/// needs to write the entry without a second filesystem read or FFI call.
+/// `body` is the .pjg / .ppg payload; `hash_trailer` is the (already-computed)
+/// content hash if the user passed `-hash`.
+pub struct Precompressed {
+    pub idx: usize,
+    pub kind: SpecificKind,
+    pub rel: PathBuf,
+    pub original_size: u64,
+    pub body: Vec<u8>,
+    pub hash_trailer: Option<Vec<u8>>,
+    pub mtime: i64,
+    pub mode: u32,
+}
+
+/// Single-job pre-compress: read file, invoke FFI, hash if requested.
+/// Pure CPU-bound (modulo the initial read) — safe to call from a worker
+/// thread. Returns the original file's idx on both Ok and Err so the caller
+/// can correlate failures back to the input list.
+fn precompress_one(
+    job: &SpecificJob,
+    hash_algo: Option<crate::archive::HashAlgo>,
+) -> (usize, Result<Precompressed, String>) {
+    let result = (|| -> Result<Precompressed, String> {
+        let meta = std::fs::symlink_metadata(&job.full)
+            .map_err(|e| format!("stat {}: {e}", job.full.display()))?;
+        let bytes = std::fs::read(&job.full)
+            .map_err(|e| format!("read {}: {e}", job.full.display()))?;
+        let body = match job.kind {
+            SpecificKind::Pjg => crate::pjg::jpg_to_pjg(&bytes)
+                .map_err(|e| format!("packJPG encode {}: {e}", job.full.display()))?,
+            SpecificKind::Ppg => crate::ppg::png_to_ppg(&bytes)
+                .map_err(|e| format!("packPNG encode {}: {e}", job.full.display()))?,
+        };
+        let mtime = crate::archive::meta_mtime(&meta);
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let mode = 0o644u32;
+        let hash_trailer = hash_algo.map(|algo| {
+            let mut hasher = crate::archive::EntryHasher::new(algo);
+            hasher.update(&bytes);
+            let mut buf = vec![0u8; algo.trailer_bytes()];
+            hasher.finalize_into(&mut buf);
+            buf
+        });
+        Ok(Precompressed {
+            idx: job.idx,
+            kind: job.kind,
+            rel: job.rel.clone(),
+            original_size: bytes.len() as u64,
+            body,
+            hash_trailer,
+            mtime,
+            mode,
+        })
+    })();
+    (job.idx, result)
+}
+
+/// Parallel pre-compress with a worker pool of `num_workers` threads.
+///
+/// Workers pop jobs off a shared `Mutex<Vec<SpecificJob>>` (work-stealing
+/// queue, last-in-first-out — order doesn't matter because results are
+/// reordered by `idx` on the receiver side). Returns `Vec<Result>` aligned
+/// with the input job vector's positions.
+///
+/// Memory peak: sum of all `body` bytes for successfully compressed jobs,
+/// held in the returned vector until the caller drains it. Currently a
+/// full pre-pass — for huge corpora this could dominate RAM. A streaming
+/// variant with a bounded result channel is a reasonable v0.1.21 follow-up.
+pub fn parallel_precompress(
+    jobs: Vec<SpecificJob>,
+    num_workers: usize,
+    hash_algo: Option<crate::archive::HashAlgo>,
+) -> Vec<Result<Precompressed, String>> {
+    let n = jobs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let num_workers = num_workers.min(n).max(1);
+
+    let queue: Arc<Mutex<Vec<SpecificJob>>> = Arc::new(Mutex::new(jobs));
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Precompressed, String>)>();
+
+    let mut handles = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let q = Arc::clone(&queue);
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || loop {
+            let job = match q.lock().unwrap().pop() {
+                Some(j) => j,
+                None => break,
+            };
+            let res = precompress_one(&job, hash_algo);
+            if tx.send(res).is_err() {
+                break;
+            }
+        }));
+    }
+    drop(tx);
+
+    let mut results: Vec<Option<Result<Precompressed, String>>> =
+        (0..n).map(|_| None).collect();
+    while let Ok((idx, r)) = rx.recv() {
+        if idx < results.len() {
+            results[idx] = Some(r);
+        }
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    results
+        .into_iter()
+        .map(|o| o.unwrap_or_else(|| Err("worker dropped result".to_string())))
+        .collect()
+}
+
+/// Worker count cap for `parallel_precompress`. Mirrors packJPG's `-sfth`
+/// fixed cap of 4: beyond this point per-file FFI parallelism hits diminishing
+/// returns, and oversubscribing the CPU hurts the LZMA backend that runs
+/// after Phase 3. Caller may pass a smaller value via `-thN`; this is the
+/// upper bound only.
+pub const PHASE3_MAX_WORKERS: usize = 8;
+
+/// Resolve the effective worker count for Phase 3 from the user's `-thN`
+/// flag, the hardware concurrency, and the per-task cap. Mirrors the
+/// existing -sfth-style logic in packJPG / packPNG.
+pub fn phase3_worker_count(opt_threads: u32) -> usize {
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let user = if opt_threads == 0 { hw } else { opt_threads as usize };
+    user.min(hw).min(PHASE3_MAX_WORKERS).max(1)
 }
