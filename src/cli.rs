@@ -67,6 +67,7 @@ pub enum Cmd {
     Compare { left: PathBuf, right: PathBuf, opts: Opts },
     Dedupe { root: PathBuf, opts: Opts },
     Verify { archive: PathBuf, source: PathBuf, opts: Opts },
+    Scan { path: PathBuf, opts: Opts },
     Help { topic: Option<String> },
     Banner,
 }
@@ -161,6 +162,16 @@ pub fn parse(args: Vec<String>) -> Result<Cmd> {
             Ok(Cmd::Compare {
                 left: PathBuf::from(&positional[0]),
                 right: PathBuf::from(&positional[1]),
+                opts,
+            })
+        }
+        "scan" => {
+            let (positional, opts) = split_flags(&rest)?;
+            if positional.is_empty() {
+                return Err(anyhow!("scan: needs <dir>"));
+            }
+            Ok(Cmd::Scan {
+                path: PathBuf::from(&positional[0]),
                 opts,
             })
         }

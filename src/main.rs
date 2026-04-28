@@ -93,6 +93,7 @@ fn main() {
         Cmd::Compare { left, right, opts } => cmd_compare(left, right, opts),
         Cmd::Dedupe { root, opts } => cmd_dedupe(root, opts),
         Cmd::Verify { archive, source, opts } => cmd_verify(archive, source, opts),
+        Cmd::Scan { path, opts } => cmd_scan(path, opts),
     };
     let (status, hook) = match &res {
         Ok(()) => ("ok", exec_ok.as_deref()),
@@ -676,6 +677,207 @@ fn cmd_dedupe(root: PathBuf, opts: Opts) -> Result<()> {
         wasted as f64 / (1024.0 * 1024.0),
         started.elapsed().as_secs_f64()
     );
+    Ok(())
+}
+
+/// `syc scan <DIR>` — walk a directory and print a per-extension breakdown of
+/// file count + total bytes, plus the high-level type categories (png / jpeg /
+/// media / other) that the encoder uses to pick smart defaults.
+///
+/// Read-only, no archive involvement. Useful for sizing up a corpus before
+/// running `syc a` so you can predict the work split (e.g. how many PNGs go
+/// through Phase 3, how much "other" hits Zstd / LZMA).
+fn cmd_scan(path: PathBuf, opts: Opts) -> Result<()> {
+    use std::collections::HashMap;
+    let started = Instant::now();
+    let root = path
+        .canonicalize()
+        .with_context(|| format!("scan: cannot resolve {}", path.display()))?;
+    let meta = std::fs::symlink_metadata(&root)
+        .with_context(|| format!("scan: stat {}", root.display()))?;
+    if !meta.is_dir() {
+        return Err(anyhow!("scan: {} is not a directory", root.display()));
+    }
+
+    // (count, bytes) per extension (lowercase). Files with no extension live
+    // under the empty string key; we render them as `(no ext)` later.
+    let mut per_ext: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut n_files: u64 = 0;
+    let mut n_dirs: u64 = 0;
+    let mut n_symlinks: u64 = 0;
+    let mut n_unreadable: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    // Per ExtKind categories — same buckets pipeline::ExtKind uses, so the
+    // output mirrors what the encoder will see at scan time.
+    let mut cat_count: HashMap<pipeline::ExtKind, u64> = HashMap::new();
+    let mut cat_bytes: HashMap<pipeline::ExtKind, u64> = HashMap::new();
+
+    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                n_unreadable += 1;
+                continue;
+            }
+        };
+        let p = entry.path();
+        let m = match p.symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                n_unreadable += 1;
+                continue;
+            }
+        };
+        if m.is_dir() {
+            n_dirs += 1;
+            continue;
+        }
+        if m.file_type().is_symlink() {
+            n_symlinks += 1;
+            continue;
+        }
+        if !m.is_file() {
+            continue;
+        }
+        n_files += 1;
+        let size = m.len();
+        total_bytes = total_bytes.saturating_add(size);
+
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let row = per_ext.entry(ext).or_insert((0, 0));
+        row.0 += 1;
+        row.1 = row.1.saturating_add(size);
+
+        let kind = pipeline::ExtKind::classify(p);
+        *cat_count.entry(kind).or_insert(0) += 1;
+        *cat_bytes.entry(kind).or_insert(0) =
+            cat_bytes.get(&kind).copied().unwrap_or(0).saturating_add(size);
+    }
+
+    let elapsed = started.elapsed();
+
+    if opts.summary {
+        println!(
+            "{} files, {} dirs, {} ({})  in {:.2}s",
+            eu_num(n_files),
+            eu_num(n_dirs),
+            eu_num(total_bytes),
+            human_si(total_bytes),
+            elapsed.as_secs_f64(),
+        );
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!("scan {}", root.display());
+    eprintln!();
+    eprintln!(
+        "{} files, {} dirs, {} symlinks, {} ({})",
+        eu_num(n_files),
+        eu_num(n_dirs),
+        eu_num(n_symlinks),
+        eu_num(total_bytes),
+        human_si(total_bytes),
+    );
+    if n_unreadable > 0 {
+        eprintln!("{} unreadable entries skipped", eu_num(n_unreadable));
+    }
+    eprintln!();
+
+    // Per-extension table, sorted by bytes descending.
+    let mut rows: Vec<(String, u64, u64)> = per_ext
+        .into_iter()
+        .map(|(k, (c, b))| (k, c, b))
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let label_w = rows
+        .iter()
+        .map(|(k, _, _)| if k.is_empty() { "(no ext)".len() } else { k.len() })
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let count_w = rows
+        .iter()
+        .map(|(_, c, _)| eu_num(*c).len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    eprintln!(
+        "{:label_w$}  {:>count_w$}    {:>10}    {:>5}",
+        "ext",
+        "files",
+        "size",
+        "share",
+        label_w = label_w,
+        count_w = count_w,
+    );
+    eprintln!(
+        "{:-<label_w$}  {:->count_w$}    {:->10}    {:->5}",
+        "",
+        "",
+        "",
+        "",
+        label_w = label_w,
+        count_w = count_w,
+    );
+    for (ext, count, bytes) in &rows {
+        let label = if ext.is_empty() { "(no ext)".to_string() } else { ext.clone() };
+        let share = if total_bytes == 0 {
+            0.0
+        } else {
+            (*bytes as f64 / total_bytes as f64) * 100.0
+        };
+        eprintln!(
+            "{:label_w$}  {:>count_w$}    {:>10}    {:>4.1}%",
+            label,
+            eu_num(*count),
+            human_si(*bytes),
+            share,
+            label_w = label_w,
+            count_w = count_w,
+        );
+    }
+
+    eprintln!();
+    eprintln!("category    files     size     share");
+    eprintln!("--------  -------  -------    -----");
+    for kind in [
+        pipeline::ExtKind::Png,
+        pipeline::ExtKind::Jpeg,
+        pipeline::ExtKind::Media,
+        pipeline::ExtKind::Other,
+    ] {
+        let count = cat_count.get(&kind).copied().unwrap_or(0);
+        let bytes = cat_bytes.get(&kind).copied().unwrap_or(0);
+        let share = if total_bytes == 0 {
+            0.0
+        } else {
+            (bytes as f64 / total_bytes as f64) * 100.0
+        };
+        let label = match kind {
+            pipeline::ExtKind::Png => "png",
+            pipeline::ExtKind::Jpeg => "jpeg",
+            pipeline::ExtKind::Media => "media",
+            pipeline::ExtKind::Other => "other",
+        };
+        eprintln!(
+            "{:<8}  {:>7}  {:>7}    {:>4.1}%",
+            label,
+            eu_num(count),
+            human_si(bytes),
+            share,
+        );
+    }
+
+    eprintln!();
+    end_footer(elapsed, total_bytes);
     Ok(())
 }
 
