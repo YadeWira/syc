@@ -4,20 +4,26 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Legacy magic; no per-entry mtime. Readers still accept it so 0.1.3-and-
-/// earlier archives keep extracting.
+/// Legacy magics — no longer accepted by readers. Per project policy the
+/// v0.1.x lineage is the format-break window; v1.0.0 will freeze. The decoder
+/// keeps these constants only so it can emit a specific error message when
+/// it sees an old archive instead of a generic "bad magic".
 pub const MAGIC_V4: &[u8; 4] = b"SYC4";
-/// v5 adds a u64-LE `mtime` field to every entry header (UNIX seconds). Needed
-/// by the zpaqfranz-style `l` listing (Date/Time/Size/Ratio/Name). Bumped
-/// because the flags byte is already full — no room for a FEATURE_MTIME bit.
 pub const MAGIC_V5: &[u8; 4] = b"SYC5";
-/// Writers emit v5 exclusively starting with 0.1.4.
-pub const MAGIC: &[u8; 4] = MAGIC_V5;
+/// v0.1.20 SYC6: header gains a mandatory ScanSummary block (file_count,
+/// total_bytes, type_dist) so `syc l` can show totals without parsing every
+/// entry. Encoder may also reorder entries so pjg/ppg outputs cluster for
+/// better LZMA dictionary reuse — that part is opt-in for a future slice;
+/// the format already supports it because entry order is not a parse concern.
+pub const MAGIC_V6: &[u8; 4] = b"SYC6";
+/// Writers emit v6 exclusively starting with 0.1.20.
+pub const MAGIC: &[u8; 4] = MAGIC_V6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchiveVersion {
     V4,
     V5,
+    V6,
 }
 
 #[repr(u8)]
@@ -44,6 +50,65 @@ impl Backend {
 pub struct PpmdParams {
     pub order: u8,
     pub mem_mb: u32,
+}
+
+/// Mandatory v0.1.20 SYC6 header block. Captures the corpus-level statistics
+/// computed by Phase 1 of the encoder pipeline so commands like `syc l` can
+/// show totals (file count, total bytes, type breakdown) instantly without
+/// parsing every entry header.
+///
+/// On-disk layout:
+/// ```text
+///   total_bytes  : u64  LE
+///   file_count   : u64  LE  (regular files only; excludes dirs/symlinks)
+///   n_types      : u8        (number of (kind, count, bytes) triples)
+///   for each:
+///     kind       : u8        (0=Jpeg, 1=Png, 2=Media, 3=Other)
+///     count      : u32  LE
+///     bytes      : u64  LE
+/// ```
+/// Footprint: 17 bytes + 13 × n_types. Typical archives have n_types ≤ 4
+/// → ≤ 69 bytes added to every .syc header.
+#[derive(Clone, Debug, Default)]
+pub struct ScanSummary {
+    pub total_bytes: u64,
+    pub file_count: u64,
+    /// (kind_id, count, bytes) — kind_id is the same encoding as ExtKind in
+    /// pipeline.rs but expressed as u8 for the on-disk format. We don't
+    /// reuse the enum here to avoid a circular dep; the mapping is fixed
+    /// by spec.
+    pub type_dist: Vec<(u8, u32, u64)>,
+}
+
+impl ScanSummary {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
+        w.write_u64::<LittleEndian>(self.total_bytes)?;
+        w.write_u64::<LittleEndian>(self.file_count)?;
+        if self.type_dist.len() > u8::MAX as usize {
+            return Err(anyhow!("scan_summary type_dist too large"));
+        }
+        w.write_u8(self.type_dist.len() as u8)?;
+        for (kind, count, bytes) in &self.type_dist {
+            w.write_u8(*kind)?;
+            w.write_u32::<LittleEndian>(*count)?;
+            w.write_u64::<LittleEndian>(*bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+        let total_bytes = r.read_u64::<LittleEndian>()?;
+        let file_count = r.read_u64::<LittleEndian>()?;
+        let n = r.read_u8()? as usize;
+        let mut type_dist = Vec::with_capacity(n);
+        for _ in 0..n {
+            let kind = r.read_u8()?;
+            let count = r.read_u32::<LittleEndian>()?;
+            let bytes = r.read_u64::<LittleEndian>()?;
+            type_dist.push((kind, count, bytes));
+        }
+        Ok(ScanSummary { total_bytes, file_count, type_dist })
+    }
 }
 pub const CHUNK: usize = 256 * 1024;
 pub const IO_BUF: usize = 1024 * 1024;
@@ -139,7 +204,8 @@ impl EntryHeader {
         let kind = EntryKind::from_u8(kind_byte)?;
         let mode = r.read_u32::<LittleEndian>()?;
         let size = r.read_u64::<LittleEndian>()?;
-        let mtime = if version == ArchiveVersion::V5 {
+        // mtime present in V5 and later (V6 inherits the V5 entry layout).
+        let mtime = if matches!(version, ArchiveVersion::V5 | ArchiveVersion::V6) {
             r.read_i64::<LittleEndian>()?
         } else {
             0
@@ -280,6 +346,7 @@ pub fn write_preamble<W: Write>(
     comment: Option<&str>,
     hash_algo: Option<HashAlgo>,
     delta_stride: Option<u8>,
+    scan_summary: &ScanSummary,
 ) -> Result<()> {
     w.write_all(MAGIC)?;
     w.write_u8(backend as u8)?;
@@ -301,6 +368,8 @@ pub fn write_preamble<W: Write>(
         let s = delta_stride.ok_or_else(|| anyhow!("FEATURE_DELTA set without stride"))?;
         w.write_u8(s)?;
     }
+    // v0.1.20 SYC6: mandatory scan_summary block.
+    scan_summary.write_to(w)?;
     w.write_u32::<LittleEndian>(dict.len() as u32)?;
     if !dict.is_empty() {
         w.write_all(dict)?;
@@ -315,13 +384,23 @@ pub fn write_preamble<W: Write>(
 
 pub fn read_preamble<R: Read>(
     r: &mut R,
-) -> Result<(ArchiveVersion, Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>, Option<u8>)> {
+) -> Result<(ArchiveVersion, Backend, u8, Vec<u8>, Option<PpmdParams>, Option<String>, Option<HashAlgo>, Option<u8>, ScanSummary)> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
-    let version = if &buf == MAGIC_V5 {
-        ArchiveVersion::V5
+    let version = if &buf == MAGIC_V6 {
+        ArchiveVersion::V6
+    } else if &buf == MAGIC_V5 {
+        return Err(anyhow!(
+            "this archive uses SYC5 format (v0.1.19 and earlier). \
+             v0.1.20+ writes SYC6. Extract with the v0.1.19 binary first, \
+             then re-pack with the new version."
+        ));
     } else if &buf == MAGIC_V4 {
-        ArchiveVersion::V4
+        return Err(anyhow!(
+            "this archive uses SYC4 format (v0.1.3 and earlier). \
+             v0.1.20+ writes SYC6 and no longer reads SYC4. Use a v0.1.3 \
+             binary to extract, then re-pack."
+        ));
     } else {
         return Err(anyhow!(
             "bad magic: not a syc archive (got {:?})",
@@ -354,6 +433,8 @@ pub fn read_preamble<R: Read>(
     } else {
         None
     };
+    // v0.1.20 SYC6: mandatory scan_summary block.
+    let scan_summary = ScanSummary::read_from(r)?;
     let dict_len = r.read_u32::<LittleEndian>()? as usize;
     let mut dict = vec![0u8; dict_len];
     if dict_len > 0 {
@@ -366,7 +447,7 @@ pub fn read_preamble<R: Read>(
     } else {
         None
     };
-    Ok((version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride))
+    Ok((version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride, scan_summary))
 }
 
 /// Gather up to DICT_SAMPLES_CAP bytes of sample data from regular files in

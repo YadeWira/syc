@@ -135,6 +135,30 @@ impl Plan {
         self.type_bytes.get(&kind).copied().unwrap_or(0) as f64 / self.total_bytes as f64
     }
 
+    /// Convert this Plan into the on-disk ScanSummary block that lives in the
+    /// SYC6 header. ExtKind variants map to the spec'd u8 IDs:
+    ///   0=Jpeg, 1=Png, 2=Media, 3=Other.
+    pub fn to_scan_summary(&self) -> crate::archive::ScanSummary {
+        let mut type_dist: Vec<(u8, u32, u64)> = Vec::with_capacity(4);
+        for (k, id) in [
+            (ExtKind::Jpeg, 0u8),
+            (ExtKind::Png, 1),
+            (ExtKind::Media, 2),
+            (ExtKind::Other, 3),
+        ] {
+            let count = *self.type_count.get(&k).unwrap_or(&0);
+            let bytes = *self.type_bytes.get(&k).unwrap_or(&0);
+            if count > 0 {
+                type_dist.push((id, count.min(u32::MAX as u64) as u32, bytes));
+            }
+        }
+        crate::archive::ScanSummary {
+            total_bytes: self.total_bytes,
+            file_count: self.regular_count,
+            type_dist,
+        }
+    }
+
     /// Format a one-line summary suitable for the `Scanned ...` line in
     /// `cmd_add`. Shows the dominant types only (>5 % of bytes) to keep the
     /// line readable. Format mimics the existing scan banner so users

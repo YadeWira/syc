@@ -1019,9 +1019,10 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     } else {
         None
     };
+    let scan_summary = plan.to_scan_summary();
     write_preamble(
         &mut bw, backend, preproc, &dict, ppmd_params,
-        opts.comment.as_deref(), hash_algo, opts.delta,
+        opts.comment.as_deref(), hash_algo, opts.delta, &scan_summary,
     )?;
 
     let mut total_bytes: u64 = 0;
@@ -1384,7 +1385,7 @@ fn cmd_add_append(
         .with_context(|| format!("open {}", archive.display()))?;
     let size_before = rd.metadata()?.len();
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (_version, backend, preproc, dict, ppmd_params, existing_comment, hash_algo, delta_stride) =
+    let (_version, backend, preproc, dict, ppmd_params, existing_comment, hash_algo, delta_stride, _scan_summary) =
         read_preamble(&mut br)?;
     drop(br);
 
@@ -2240,7 +2241,7 @@ fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
 fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Option<String>, bool, archive::ArchiveVersion)> {
     let rd = open_input(archive)?;
     let mut br = BufReader::with_capacity(archive::IO_BUF, rd);
-    let (version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride) = read_preamble(&mut br)?;
+    let (version, backend, preproc, dict, ppmd, comment, hash_algo, delta_stride, _scan_summary) = read_preamble(&mut br)?;
     let has_xattrs = preproc & archive::FEATURE_XATTRS != 0;
     let raw: Box<dyn Read> = match backend {
         Backend::Zstd => {
