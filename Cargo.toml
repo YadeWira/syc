@@ -1,6 +1,6 @@
 [package]
 name = "syc"
-version = "0.1.27"
+version = "0.1.28"
 edition = "2021"
 description = "Streaming archiver + compressor in pure-ish Rust, tuned for modest hardware"
 license = "MIT OR Apache-2.0"
@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 zstd = { version = "0.13", default-features = false, features = ["zstdmt", "zdict_builder"] }
 xz2 = "0.1"
 walkdir = "2.5"
+glob = "0.3"
 anyhow = "1.0"
 byteorder = "1.5"
 crc32fast = "1.4"

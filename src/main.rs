@@ -912,11 +912,15 @@ fn cmd_add(archive: PathBuf, sources: Vec<PathBuf>, mut opts: Opts) -> Result<()
     let scan_started = Instant::now();
     let mut all: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in &effective_sources {
-        all.extend(collect_entries_or_single(src)?);
+        for expanded in expand_source(src)? {
+            all.extend(collect_entries_or_single(&expanded)?);
+        }
     }
     if let Some(fl) = opts.filelist.as_deref() {
         for src in load_filelist(fl)? {
-            all.extend(collect_entries_or_single(&src)?);
+            for expanded in expand_source(&src)? {
+                all.extend(collect_entries_or_single(&expanded)?);
+            }
         }
     }
     let before = all.len();
@@ -2444,6 +2448,41 @@ fn build_dedup_map(
         }
     }
     Ok(targets)
+}
+
+/// Expand a CLI source argument into one or more concrete paths.
+///
+/// On *nix the shell normally globs for us, but PowerShell on Windows does
+/// **not** expand wildcards for external commands — `syc a x.syc TILIN\*`
+/// arrives at the binary with the `*` intact, where `stat()` then errors
+/// out. This helper closes that gap by running glob expansion in-process for
+/// any source that contains `*`, `?`, or `[` (the standard shell wildcards).
+///
+/// If no wildcards are present, the input is returned verbatim. If wildcards
+/// are present but match nothing, we error with the original pattern so the
+/// user sees what was attempted (rather than silently dropping the source).
+fn expand_source(src: &Path) -> Result<Vec<PathBuf>> {
+    let s = match src.to_str() {
+        Some(s) => s,
+        None => return Ok(vec![src.to_path_buf()]),
+    };
+    let has_glob = s.chars().any(|c| matches!(c, '*' | '?' | '[' ));
+    if !has_glob {
+        return Ok(vec![src.to_path_buf()]);
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    let entries = glob::glob(s)
+        .with_context(|| format!("invalid glob pattern: {}", src.display()))?;
+    for entry in entries {
+        match entry {
+            Ok(p) => out.push(p),
+            Err(e) => return Err(anyhow!("glob {}: {e}", src.display())),
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("no matches for pattern: {}", src.display()));
+    }
+    Ok(out)
 }
 
 fn collect_entries_or_single(src: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
