@@ -19,10 +19,11 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.0';
+  SYC_VERSION   = '0.2.1';
   MAGIC         = 'SYZ0';
   FORMAT_VER    = 0;
   STORED_FLAG   = UInt32($80000000);
+  PAYLOAD_MASK  = UInt32($7FFFFFFF);
   DEFAULT_BLOCK = 4 shl 20;
   MAX_BLOCK     = 512 shl 20;
   SUFFIX        = '.sylz';
@@ -188,7 +189,7 @@ begin
         Break;
       packedField := ReadU32(fin);
       sum := ReadU32(fin);
-      payLen := packedField and not STORED_FLAG;
+      payLen := packedField and PAYLOAD_MASK;
       if (rawLen > MAX_BLOCK) or (payLen > MAX_BLOCK) then
         Die(inPath + ': corrupt block header');
       if SizeInt(rawLen) > rawCap then

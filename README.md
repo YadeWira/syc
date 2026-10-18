@@ -50,7 +50,12 @@ Free Pascal 3.2.2:
 ./build.sh                    # out/syc and out/sylzbench
 ./build.sh -Twin64            # Windows x86-64 (FPC's win64 units)
 ./build.sh -dSYLZ_PUREPASCAL  # no assembler, Pascal paths only
+FPC=ppcross386 ./build.sh -Twin32                  # Windows 32-bit
+FPC=ppcrossa64 ./build.sh -XPaarch64-linux-gnu-    # Linux arm64
 ```
+
+Release binaries: Linux x86-64 and arm64, Windows x86-64 and 32-bit.
+Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/Building).
 
 ## Use
 
