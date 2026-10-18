@@ -111,7 +111,7 @@ type
   TSylzCtx = record
     scratch: PByte;
     scratchSize: SizeInt;
-    table: PUInt32;      { level 1 hash table }
+    table: PUInt16;      { fast-level hash table (low 16 bits of positions) }
     head: PInt32;        { levels 2+: hash heads }
     chain: PUInt16;      { levels 2+: chain deltas }
     opt: PByte;          { optimal parser: nodes, candidates, path }
@@ -256,8 +256,8 @@ end;
 function FastHashLog(level: Integer): Integer;
 begin
   case level of
-    0: Result := 12;
-    1: Result := 14;
+    0: Result := 13;
+    1: Result := 15;
   else
     Result := 16;   { level 2 }
   end;
@@ -466,14 +466,27 @@ end;
   wrapper: a try/finally or a managed local (dynamic array) gives a routine
   an exception frame built on fpc_setjmp, and with one the compressor loop
   kept nearly every local on the stack. }
-function CompressFastCore(src: PByte; n: SizeInt; var e: TEmit; table: PUInt32;
+{ The fast levels' hash tables keep only the low 16 bits of a position:
+  the window is 64 KiB, so the distance to a candidate is the difference of
+  low halves, mod 2^16, with 0 meaning 65536. An entry older than 64 KiB
+  was useless anyway and now aliases to some position inside the window,
+  which the 4-byte check sorts out. Half the memory: level 1's table is
+  32 KiB and fits in L1. }
+function FastDist(pos: SizeInt; stored: UInt16): SizeInt; inline;
+begin
+  Result := (UInt32(pos) - stored) and $FFFF;
+  if Result = 0 then
+    Result := 65536;
+end;
+
+function CompressFastCore(src: PByte; n: SizeInt; var e: TEmit; table: PUInt16;
   hashLog: Integer): SizeInt;
 { (written without labels/goto: the goto version kept more of its locals
   on the stack, 127 vs 104 references, and ran at 226 vs 273 MB/s) }
 var
   ip, anchor, iend, mflimit, ref, fwd: PByte;
   h, fwdH: UInt32;
-  len, probes: SizeInt;
+  len, probes, d: SizeInt;
 begin
   anchor := src;
   iend := src + n;
@@ -495,10 +508,11 @@ begin
         Inc(probes);
         if fwd > mflimit then
           Break;
-        ref := src + table[h];
+        d := FastDist(ip - src, table[h]);
         fwdH := HashFast(fwd, hashLog);
-        table[h] := UInt32(ip - src);
-      until (ip - ref <= SYLZ_MAXDIST) and (Read32(ref) = Read32(ip));
+        table[h] := UInt16(ip - src);
+        ref := ip - d;
+      until (d <= ip - src) and (Read32(ref) = Read32(ip));
       if fwd > mflimit then
         Break;
 
@@ -518,11 +532,12 @@ begin
         anchor := ip;
         if ip > mflimit then
           Break;
-        table[HashFast(ip - 2, hashLog)] := UInt32(ip - 2 - src);
+        table[HashFast(ip - 2, hashLog)] := UInt16(ip - 2 - src);
         h := HashFast(ip, hashLog);
-        ref := src + table[h];
-        table[h] := UInt32(ip - src);
-      until (ip - ref > SYLZ_MAXDIST) or (Read32(ref) <> Read32(ip));
+        d := FastDist(ip - src, table[h]);
+        table[h] := UInt16(ip - src);
+        ref := ip - d;
+      until (d > ip - src) or (Read32(ref) <> Read32(ip));
       if ip > mflimit then
         Break;
 
@@ -538,7 +553,7 @@ type
   { In/out state of the assembler fast compressor; fixed field order. }
   TFastEncState = record
     src, iend, mflimit: PByte;   {  0,  8, 16: in }
-    table: PUInt32;              { 24: in }
+    table: PUInt16;              { 24: in }
     ctrl, lit: PByte;            { 32, 40: in/out (control and literal write pointers) }
     anchor: PByte;               { 48: out (start of the tail literals) }
     exact: PByte;                { 56: in, ExactCode }
@@ -550,7 +565,7 @@ type
   byte for byte (tests check it). Only used when the output buffer holds
   SylzBound(n): that bound guarantees every sequence fits, so it skips the
   capacity checks of EmitSequence.
-  Registers: r8 ip, r9 anchor, r10 src, r11 table, r12 mflimit, r13 iend,
+  Registers: r8 ip, r9 anchor, r10 src, r11 table (u16 entries), r12 mflimit, r13 iend,
   r14 control write pointer, r15 literal write pointer, rbx fwd, rbp probe
   count, esi hash of ip, edi hash of fwd, rax match candidate, rcx/rdx
   scratch. [rsp] holds the 5-byte hash multiplier, [rsp+8] the state. }
@@ -601,8 +616,7 @@ asm
   add rbp, 1
   cmp rbx, r12
   ja @last
-  mov eax, [r11 + rsi * 4]
-  add rax, r10                    { ref = src + table[h] }
+  movzx eax, word ptr [r11 + rsi * 2]   { low 16 bits of the candidate's position }
   mov rdx, [rbx]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
   imul rdx, [rsp + 16]
@@ -610,12 +624,17 @@ asm
   shr rdx, cl
   mov edi, edx                    { fwdH = hash(fwd) }
   mov rdx, r8
-  sub rdx, r10
-  mov [r11 + rsi * 4], edx        { table[h] = ip - src }
-  mov rdx, r8
-  sub rdx, rax
-  cmp rdx, SYLZ_MAXDIST
-  ja @probe
+  sub rdx, r10                    { pos = ip - src }
+  mov [r11 + rsi * 2], dx         { table[h] = pos (low 16 bits) }
+  sub edx, eax
+  and edx, $FFFF                  { distance mod 2^16 ... }
+  mov ecx, 65536
+  test edx, edx
+  cmovz edx, ecx                  { ... with 0 meaning 65536 }
+  mov rax, r8
+  sub rax, rdx                    { ref = ip - distance }
+  cmp rax, r10
+  jb @probe                       { before the start of the input }
   mov edx, [rax]
   cmp edx, [r8]
   jne @probe
@@ -767,22 +786,26 @@ asm
   shr rdx, cl
   lea rcx, [r8 - 2]
   sub rcx, r10
-  mov [r11 + rdx * 4], ecx
+  mov [r11 + rdx * 2], cx
   { a match right here needs no literals }
   mov rdx, [r8]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
   imul rdx, [rsp + 16]
   mov ecx, [rsp]
   shr rdx, cl
-  mov eax, [r11 + rdx * 4]
-  add rax, r10
+  movzx eax, word ptr [r11 + rdx * 2]
   mov rcx, r8
   sub rcx, r10
-  mov [r11 + rdx * 4], ecx
-  mov rcx, r8
-  sub rcx, rax
-  cmp rcx, SYLZ_MAXDIST
-  ja @next
+  mov [r11 + rdx * 2], cx
+  sub ecx, eax
+  and ecx, $FFFF
+  mov edx, 65536
+  test ecx, ecx
+  cmovz ecx, edx
+  mov rax, r8
+  sub rax, rcx
+  cmp rax, r10
+  jb @next
   mov ecx, [rax]
   cmp ecx, [r8]
   je @emit
@@ -821,18 +844,18 @@ function CompressFast(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 var
   e: TEmit;
-  table: PUInt32;
+  table: PUInt16;
   hashLog: Integer;
 {$ifdef SYLZ_ASM_X64}
   st: TFastEncState;
 {$endif}
 begin
   if ctx.table = nil then
-    ctx.table := GetMem(SizeOf(UInt32) shl FAST_MAXLOG);
+    ctx.table := GetMem(SizeOf(UInt16) shl FAST_MAXLOG);
   table := ctx.table;
   hashLog := FastHashLog(level);
   begin
-    FillChar(table^, SizeOf(UInt32) shl hashLog, 0);   { position 0 }
+    FillChar(table^, SizeOf(UInt16) shl hashLog, 0);
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
 {$ifdef SYLZ_ASM_X64}
     if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then

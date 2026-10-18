@@ -433,6 +433,42 @@ sequences). Against zxc -6 (36.28%, 2755 MB/s, 9.42 MB/s): level 11
 decodes 34% faster at about its ratio, level 12 is smaller and 22%
 faster; both compress slower.
 
+### Fast levels 0-2, 2026-10-18: 16-bit hash tables
+
+perf on the level-1 assembler compressor (silesia.tar): IPC 1.29, 28.7 M
+branch misses (~26% of the time: "is the candidate a match" is
+inherently unpredictable) and 108 M L1 misses: the 2^14-entry table of
+u32 positions is 64 KiB, twice the L1. The window is 64 KiB, so a table
+entry only needs the low 16 bits of a position: distance = (pos - entry)
+mod 2^16, 0 meaning 65536; an entry older than 64 KiB was useless anyway
+and now aliases to some position inside the window, which the 4-byte
+check rejects. Half the memory, same or slightly better ratio. Pascal
+and assembler still write the same bytes.
+
+With cheaper tables the ladder moved up one step at levels 0 and 1
+(2^12/2^14/2^16 -> 2^13/2^15/2^16): level 0's 2^13 table (16 KiB) still
+fits in L1, and level 1's 2^15 trades 2.6% of speed for 0.7 points.
+2^17 at level 2 cost 17% of speed for 0.18 points: no.
+
+Same session, against the previous commit (assembler):
+
+| | compress | ratio silesia | ratio mixed | decompress |
+|---|---|---|---|---|
+| 0 before | 572 MB/s | 48.64% | 66.96% | 3422 MB/s |
+| 0 now | 539 MB/s | 46.51% | 66.31% | 3512 MB/s |
+| 1 before | 426 MB/s | 45.26% | 65.86% | 3497 MB/s |
+| 1 now | 503 MB/s | 44.55% | 65.59% | 3523 MB/s |
+| 2 before | 320 MB/s | 44.20% | 65.45% | 3481 MB/s |
+| 2 now | 479 MB/s | 44.19% | 65.45% | 3522 MB/s |
+
+Tried at the same time and dropped (Pascal compressor, relative): a
+repeat-offset candidate when the hash misses (-0.1 to -0.3 points, -1
+to -10% speed), inserting ip-1 or the start of long matches too (~0 /
+up to -0.22 points at level 1 for -1 to -5%), a faster probe step
+(skip 5: +3-9% speed in Pascal for +0.1-0.24 points, but no speed gain
+at all in the assembler with 16-bit tables, where probing is no longer
+the bottleneck).
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio
