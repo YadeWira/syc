@@ -126,6 +126,40 @@ mode +2-3% more. At ~15 cycles per sequence for ~25 instructions, the
 rest is stalls (memory, mispredicted extension and long-match branches);
 `perf` is not available to tell which (perf_event_paranoid = 3).
 
+### Decoder profile (perf, 2026-10-17 23:00)
+
+`perf stat` on 20 decodes of silesia.tar minus a 0-iteration run (file
+loading), asm decoder:
+
+| | level 1 | level 9 |
+|---|---|---|
+| cycles per sequence | 17.4 | 16.0 |
+| instructions per sequence | 40.8 | 39.0 |
+| IPC | 2.34 | 2.44 |
+| branch misses per sequence | 0.22 | 0.16 |
+| L1 load misses per sequence | 0.57 | 0.73 |
+
+Mispredictions at ~16 cycles each are about 20% of the time.
+`perf record -e branch-misses:pp` (PEBS, exact branch) on level 1:
+
+| branch | share of misses |
+|---|---|
+| literal field extended (`jae @ext` + its compare) | 49% |
+| match field extended (`je @ext` + its compare) | 16% |
+| long-literal copy loop exit | 12% |
+| long-match copy loop exit | 9% |
+| offset < 16 | 8% |
+| match > 32 | 2% |
+
+Tried and dropped:
+
+- Branch-free one-byte extensions (cmov): 2400 vs 2930 MB/s. The next
+  token's address then depends on this sequence's loaded bytes, a serial
+  chain of loads; with the branch, the CPU predicts ctrl + 3 and runs
+  ahead. The extension misses are a format problem, not a code one.
+- Copying 48 match bytes unconditionally to drop the "match > 32" branch:
+  4% more cycles, and that branch was only 2% of the misses.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio
