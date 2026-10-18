@@ -327,6 +327,27 @@ The table size is now a run-time parameter, so the assembler shifts by
 cl reloaded from the stack at each hash (rcx is free at all five): 2-4%
 slower compression than an immediate shift, within the noise.
 
+Tried and dropped (2026-10-18): two candidates per fast-level hash entry
+(newest + previous, keep the longer match). Pascal compressor, so speeds
+are relative only; silesia.tar unless noted:
+
+| | memory | compress | ratio | decode cycles |
+|---|---|---|---|---|
+| 1 way 2^13 | 32 KB | 294 MB/s | 46.51% | 224 M |
+| 2 ways 2^12 | 32 KB | 238 MB/s | 45.87% | 218 M |
+| 1 way 2^15 | 128 KB | 250 MB/s | 44.57% | 221 M |
+| 2 ways 2^13 | 64 KB | 200 MB/s | 44.33% | 218 M |
+| 1 way 2^16 | 256 KB | 222 MB/s | 44.20% | 221 M |
+| 2 ways 2^14 | 128 KB | 174 MB/s | 43.57% | 219 M |
+| ooffice, 1 way 2^15 | | 176 MB/s | 69.16% | |
+| ooffice, 2 ways 2^13 | | 168 MB/s | 69.68% | |
+| ooffice, 1 way 2^16 | | 147 MB/s | 68.54% | |
+| ooffice, 2 ways 2^14 | | 130 MB/s | 68.41% | |
+
+At equal compression speed a bigger single table wins on ratio,
+executables included; two ways only win on memory and by 1-2% decode
+cycles.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio
