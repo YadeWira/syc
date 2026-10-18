@@ -5,7 +5,7 @@
   version are not expected to open with later ones.
 
     file   := "SYZ0" version:u8 level:u8 block*  end
-              version 1 = sylz format v2 blocks
+              version 2 = sylz format v2 or v3 blocks (1: v2 only, also read)
     block  := rawLen:u32le packed:u32le crc32:u32le payload
               packed bit 31 set = payload stored raw, else a sylz block;
               the low 31 bits are the payload length
@@ -22,7 +22,8 @@ uses
 const
   SYC_VERSION   = '0.2.4';
   MAGIC         = 'SYZ0';
-  FORMAT_VER    = 1;   { 1: sylz format v2 blocks (0 was v1, syc 0.2.0-0.2.1) }
+  FORMAT_VER    = 2;   { 2: sylz v2 or v3 blocks; 1: v2 only (syc 0.2.2-0.2.4);
+                         0 was sylz v1 (syc 0.2.0-0.2.1) }
   STORED_FLAG   = UInt32($80000000);
   PAYLOAD_MASK  = UInt32($7FFFFFFF);
   DEFAULT_BLOCK = 4 shl 20;
@@ -71,6 +72,7 @@ begin
   WriteLn;
   WriteLn('  -LEVEL    1 (default) .. ', SYLZ_MAXLEVEL, ' (best ratio); 1-2 single hash, 3+ hash chains');
   WriteLn('  --fast=N  faster still, N = 1..', -SYLZ_MINLEVEL, ' (worse ratio)');
+  WriteLn('  -e        entropy-coded literals (sylz format v3): smaller, slower to decode');
   WriteLn('  -b MIB  block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 
@@ -107,7 +109,7 @@ begin
   end;
 end;
 
-procedure Compress(const inPath, outPath: string; level, blockSize: Integer);
+procedure Compress(const inPath, outPath: string; level, blockSize, flags: Integer);
 var
   fin, fout: TFileStream;
   raw, packed_: PByte;
@@ -132,7 +134,7 @@ begin
       n := ReadFull(fin, raw, blockSize);
       if n = 0 then
         Break;
-      c := SylzCompressCtx(ctx, raw, n, packed_, SylzBound(blockSize), level);
+      c := SylzCompressEx(ctx, raw, n, packed_, SylzBound(blockSize), level, flags);
       if c < 0 then
         Die('internal error: compression failed');
       WriteU32(fout, UInt32(n));
@@ -181,7 +183,7 @@ begin
   try
     if (ReadFull(fin, @hdr[0], 6) <> 6) or (CompareByte(hdr[0], MAGIC[1], 4) <> 0) then
       Die(inPath + ': not a syc file');
-    if hdr[4] <> FORMAT_VER then
+    if (hdr[4] < 1) or (hdr[4] > FORMAT_VER) then
       Die(Format('%s: format version %d not supported by syc %s', [inPath, hdr[4], SYC_VERSION]));
     fout := TFileStream.Create(outPath, fmCreate);
     total := 0;
@@ -237,7 +239,7 @@ end;
 
 var
   cmd, inPath, outPath, arg: string;
-  level, blockMiB, i: Integer;
+  level, blockMiB, i, flags: Integer;
 begin
   CrcInit;
   if ParamCount < 1 then
@@ -258,6 +260,7 @@ begin
   end;
 
   level := 1;
+  flags := 0;
   blockMiB := DEFAULT_BLOCK shr 20;
   inPath := '';
   outPath := '';
@@ -271,6 +274,8 @@ begin
         Die(Format('--fast takes 1..%d', [-SYLZ_MINLEVEL]));
       level := -level;
     end
+    else if arg = '-e' then
+      flags := flags or SYLZ_ENTROPY
     else if arg = '-b' then
     begin
       Inc(i);
@@ -299,7 +304,7 @@ begin
     begin
       if outPath = '' then
         outPath := inPath + SUFFIX;
-      Compress(inPath, outPath, level, blockMiB shl 20);
+      Compress(inPath, outPath, level, blockMiB shl 20, flags);
     end
     else if cmd = 'd' then
     begin

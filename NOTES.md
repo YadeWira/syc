@@ -41,7 +41,8 @@ has no sylz counterpart.
 
 ## Layout
 
-- `src/sylz.pas` — sylz codec; `src/syc.pas` — minimal CLI
+- `src/sylz.pas` — sylz codec; `src/sylzhuf.pas` — its Huffman chunk
+  coder (format v3); `src/syc.pas` — minimal CLI
 - `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output;
   `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`,
   `SYLZ_NOASM=1` uses the Pascal paths only
@@ -54,6 +55,47 @@ has no sylz counterpart.
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## sylz format v3 (experimental, 2026-10-18)
+
+v2 plus optionally Huffman-coded literals. Bit 31 of the block's first
+u32 flags it (a v2 decoder rejects it as an impossible control length;
+a v2 block is a valid v3 block). Literals go in chunks of 65536, each
+raw or canonical Huffman (codes up to 11 bits, 128-byte nibble-packed
+length table, four interleaved LSB-first streams), only when it saves at
+least 4% of the chunk. Decoding is two-pass: chunks into a literal
+buffer (kept in a TSylzDCtx), then the unchanged LZ decoder.
+
+Why: order-0 entropy per 64 KiB chunk on silesia.tar promised literals
+-13 to -21%, and -16% overall at level 12 with tokens and offsets too;
+one histogram for the whole 212 MB promised only -4 to -9% (the tar mixes
+data types). Measured Huffman sizes landed within 0.5% of the estimate.
+
+Huffman decoder: per-symbol 8-byte big-endian loads with bounds checks
+ran at 280-330 MB/s; FPC's SwapEndian is a call, so LSB-first streams
+(no byte swap); branch-free refills (Giesen) in Pascal 380 MB/s, held
+back by register pressure; x86-64 assembler with the bit buffers and
+counts in registers and the read pointers on the stack: 800-830 MB/s
+(~10 instructions per symbol). Reusing the literal buffer instead of a
+GetMem per block: silesia -11 decode 1793 -> 2020 MB/s, mixed 1116 ->
+1457.
+
+Minimum gain per chunk: 0% / 4% / 8% gave mixed -11 decode 1035 / 1166 /
+1297 MB/s at 57.26 / 57.37 / 57.80%; 4% kept.
+
+Same session as zstd (load ~6):
+
+| | silesia | decompress | mixed | decompress |
+|---|---|---|---|---|
+| zstd -1 | 34.53% | 1035 MB/s | 56.14% | 1080 MB/s |
+| zstd -2 | 32.70% | 757 MB/s | 54.88% | 995 MB/s |
+| zxc -7 | 33.09% | 1866 MB/s | 57.34% | 1725 MB/s |
+| sylz -e -10 | 34.82% | 2062 MB/s | 57.60% | 1397 MB/s |
+| sylz -e -11 | 34.29% | 2032 MB/s | 57.37% | 1441 MB/s |
+| sylz -e -12 | 34.06% | 2080 MB/s | 57.26% | 1442 MB/s |
+
+Next: a faster Huffman decoder (two symbols per lookup), and coding the
+token and offset bytes too (order-0 per chunk promises ~30.5% at -12).
 
 ## sylz format v2
 

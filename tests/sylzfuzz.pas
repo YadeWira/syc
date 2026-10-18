@@ -51,6 +51,7 @@ end;
 
 var
   samples: array of TBytes;
+  fctx: TSylzCtx;
   rng: UInt64 = UInt64($9E3779B97F4A7C15);
   roundtrips: Int64 = 0;
   corrupt: Int64 = 0;
@@ -164,6 +165,7 @@ procedure OneCase;
 var
   n, level, csize, r, i, flips, cut: SizeInt;
   input, comp, outp, bad, other: TGuarded;
+  flags: Integer;
 begin
   case RandBelow(4) of
     0: n := RandBelow(64);
@@ -177,14 +179,18 @@ begin
   input := GuardedAlloc(n);
   MakeInput(input.p, n);
   comp := GuardedAlloc(SylzBound(n));
-  csize := SylzCompress(input.p, n, comp.p, SylzBound(n), level);
+  if RandBelow(2) = 0 then
+    flags := 0
+  else
+    flags := SYLZ_ENTROPY;
+  csize := SylzCompressEx(fctx, input.p, n, comp.p, SylzBound(n), level, flags);
   if csize < 0 then
     Fail('compress returned -1 with a SylzBound buffer', n, level);
 
   { the assembler and Pascal compressors must agree byte for byte }
   other := GuardedAlloc(SylzBound(n));
   SylzUseAsm := not SylzUseAsm;
-  r := SylzCompress(input.p, n, other.p, SylzBound(n), level);
+  r := SylzCompressEx(fctx, input.p, n, other.p, SylzBound(n), level, flags);
   SylzUseAsm := not SylzUseAsm;
   if (r <> csize) or (CompareByte(comp.p^, other.p^, csize) <> 0) then
     Fail('assembler and Pascal compressors disagree', n, level);
@@ -252,6 +258,7 @@ begin
     first := 2;
   for i := first to ParamCount do
     LoadSample(ParamStr(i));
+  SylzCtxInit(fctx);
   for k := 1 to iters do
   begin
     SylzUseAsm := Odd(k);   { alternate the assembler and Pascal decoders }

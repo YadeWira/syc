@@ -1,8 +1,9 @@
 { sylzbench — in-memory benchmark for the sylz codec, lzbench-style.
 
-  Usage: sylzbench [-l LEVELS] [-t SECONDS] FILE...
+  Usage: sylzbench [-l LEVELS] [-t SECONDS] [-e] FILE...
     -l  comma-separated levels, default 1,2,4,6,9,12
     -t  minimum time per measurement, default 1.0
+    -e  format v3: entropy-coded literals (SYLZ_ENTROPY)
 
   Each file is one block. Speeds are the best of the repeated runs, in
   MB/s with MB = 10^6 bytes (as lzbench), measured on the input size.
@@ -60,15 +61,17 @@ begin
 end;
 
 procedure BenchFile(const path: string; const levels: array of Integer;
-  minNs: UInt64);
+  minNs: UInt64; flags: Integer);
 var
   src, cbuf, dbuf: TBytes;
   n, csize, dsize: SizeInt;
   li, level: Integer;
   t0, t1, best, total: UInt64;
   ctx: TSylzCtx;
+  dctx: TSylzDCtx;
 begin
   SylzCtxInit(ctx);
+  SylzDCtxInit(dctx);
   n := LoadFile(path, src);
   SetLength(cbuf, SylzBound(n) + 1);
   SetLength(dbuf, n + 1);
@@ -80,7 +83,7 @@ begin
     total := 0;
     repeat
       t0 := NowNs;
-      csize := SylzCompressCtx(ctx, @src[0], n, @cbuf[0], Length(cbuf), level);
+      csize := SylzCompressEx(ctx, @src[0], n, @cbuf[0], Length(cbuf), level, flags);
       t1 := NowNs;
       if t1 - t0 < best then
         best := t1 - t0;
@@ -105,7 +108,7 @@ begin
     total := 0;
     repeat
       t0 := NowNs;
-      dsize := SylzDecompress(@cbuf[0], csize, @dbuf[0], n);
+      dsize := SylzDecompressCtx(dctx, @cbuf[0], csize, @dbuf[0], n);
       t1 := NowNs;
       if t1 - t0 < best then
         best := t1 - t0;
@@ -121,6 +124,7 @@ begin
       [Speed(n, best), csize, csize * 100.0 / Max(n, 1), ExtractFileName(path)]));
   end;
   SylzCtxFree(ctx);
+  SylzDCtxFree(dctx);
 end;
 
 var
@@ -128,10 +132,13 @@ var
   minTime: Double;
   i, argi: Integer;
   parts: TStringArray;
+  flags: Integer;
 begin
+  flags := 0;
   levels := [1, 2, 4, 6, 9, 12];
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
     SylzUseAsm := False;
+
   minTime := 1.0;
   argi := 1;
   while (argi <= ParamCount) and (Copy(ParamStr(argi), 1, 1) = '-') do
@@ -143,6 +150,11 @@ begin
       for i := 0 to High(parts) do
         levels[i] := StrToInt(parts[i]);
       Inc(argi, 2);
+    end
+    else if ParamStr(argi) = '-e' then
+    begin
+      flags := flags or SYLZ_ENTROPY;
+      Inc(argi);
     end
     else if (ParamStr(argi) = '-t') and (argi < ParamCount) then
     begin
@@ -162,5 +174,5 @@ begin
   end;
   WriteLn('Compressor  Compress.      Decompress.     Compr. size   Ratio  Filename');
   for i := argi to ParamCount do
-    BenchFile(ParamStr(i), levels, UInt64(Round(minTime * 1e9)));
+    BenchFile(ParamStr(i), levels, UInt64(Round(minTime * 1e9)), flags);
 end.

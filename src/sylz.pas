@@ -16,6 +16,18 @@
     ext      := a value in 255-run bytes: each byte adds itself, 255 means
                 another byte follows; the literal extension comes first
 
+  Format v3 is v2 plus optionally entropy-coded literals. A v2 block is a
+  valid v3 block; a v3 block sets bit 31 of the first u32 (the control
+  length is then bits 0..30), which a v2 decoder rejects as an
+  impossible length instead of misreading it:
+
+    block    := hdr:u32le  control[ctrlLen]  litsection
+    hdr      := ctrlLen | (bit 31: literals entropy-coded)
+    litsection, bit 31 clear := literals[...] as in v2
+    litsection, bit 31 set   := litCount:u32le  chunk*
+    chunk    := see sylzhuf.pas; chunks of 65536 literals (the last one
+                shorter) cover litCount, each raw or Huffman-coded
+
   Literals live in their own stream, in order. Each sequence takes its
   literals from the front of that stream, then copies its match; whatever
   is left in the literal stream after the last sequence is the block's
@@ -104,11 +116,23 @@ type
     head: PInt32;        { levels 2+: hash heads }
     chain: PUInt16;      { levels 2+: chain deltas }
     opt: PByte;          { optimal parser: nodes, candidates, path }
+    flags: Integer;      { of the current call }
   end;
 
 
 procedure SylzCtxInit(out ctx: TSylzCtx);
 procedure SylzCtxFree(var ctx: TSylzCtx);
+
+type
+  { Reusable decompression context: the literal buffer a v3 block decodes
+    into, kept between calls. }
+  TSylzDCtx = record
+    lits: PByte;
+    litsSize: SizeInt;
+  end;
+
+procedure SylzDCtxInit(out dctx: TSylzDCtx);
+procedure SylzDCtxFree(var dctx: TSylzDCtx);
 
 { Worst-case compressed size of n input bytes. }
 function SylzBound(n: SizeInt): SizeInt;
@@ -124,10 +148,25 @@ function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
 function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 
-{ Decompresses src[0..n) into exactly dstLen bytes at dst.
-  Safe on corrupt input: never reads or writes out of bounds.
-  Returns dstLen, or -1 on corrupt input. }
+const
+  { SylzCompressEx flags }
+  SYLZ_ENTROPY = 1;   { format v3: Huffman-code the literals where it pays }
+
+{ SylzCompressCtx with flags. Without SYLZ_ENTROPY the output is format v2
+  (what SylzCompress writes); with it, format v3 if that is smaller, else
+  v2. SylzDecompress reads both. }
+function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+
+{ Decompresses a format v2 or v3 block src[0..n) into exactly dstLen bytes
+  at dst. Safe on corrupt input: never reads or writes out of bounds.
+  Returns dstLen, or -1 on corrupt input. A v3 block with coded literals
+  takes a temporary buffer of its literal count. }
 function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+
+{ SylzDecompress with a caller-kept context; same results. }
+function SylzDecompressCtx(var dctx: TSylzDCtx; src: PByte; n: SizeInt; dst: PByte;
+  dstLen: SizeInt): SizeInt;
 
 var
   { Use the assembler fast paths where there are any (x86_64, unless built
@@ -137,6 +176,9 @@ var
 
 implementation
 
+uses
+  sylzhuf;
+
 {$if defined(CPUX86_64) and not defined(SYLZ_PUREPASCAL)}
 {$define SYLZ_ASM_X64}
 {$asmmode intel}
@@ -144,6 +186,9 @@ implementation
 
 const
   HEADER_SIZE  = 4;
+  HDR_ENTROPY  = UInt32($80000000);   { v3: literals entropy-coded }
+  HDR_CTRLMASK = UInt32($7FFFFFFF);
+  LIT_CHUNK    = 65536;               { v3 literal chunk }
   EXACT_LL     = 15;    { exact codes cover literals 0..EXACT_LL }
   EXACT_M      = 28;    { and match - 4 in 0..EXACT_M (match <= 32) }
   ESC_ML       = 210;   { + literals: literals exact, match extended }
@@ -254,11 +299,14 @@ type
     dst, ctrl, oend: PByte;
     lits, lit: PByte;
     srcEnd: PByte;    { end of the input: bounds the wide literal reads }
+    entropy: Boolean; { finish as format v3 when that is smaller }
   end;
 
-procedure EmitInit(out e: TEmit; dst: PByte; cap: SizeInt; scratch, srcEnd: PByte);
+procedure EmitInit(out e: TEmit; dst: PByte; cap: SizeInt; scratch, srcEnd: PByte;
+  flags: Integer);
 begin
   e.srcEnd := srcEnd;
+  e.entropy := flags and SYLZ_ENTROPY <> 0;
   e.dst := dst;
   e.ctrl := dst + HEADER_SIZE;
   e.oend := dst + cap;
@@ -355,14 +403,57 @@ end;
 
 { Appends the block's tail literals and the literal stream; returns the
   block size or -1. }
+{ The block's literals as format v3 chunks at p, in no more than limit
+  bytes. Returns the section size, or -1 if it does not fit (or would not
+  be smaller than limit). }
+function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; limit: SizeInt): SizeInt;
+var
+  pos, c, r, used: SizeInt;
+begin
+  if limit < 4 then
+    Exit(-1);
+  PUInt32(p)^ := UInt32(count);
+  used := 4;
+  pos := 0;
+  while pos < count do
+  begin
+    c := count - pos;
+    if c > LIT_CHUNK then
+      c := LIT_CHUNK;
+    if limit - used < 1 + c then
+      Exit(-1);       { a raw chunk might not fit: the v2 layout is no bigger }
+    r := HufEncodeChunk(lits + pos, c, p + used, limit - used);
+    if r < 0 then
+      Exit(-1);
+    Inc(used, r);
+    Inc(pos, c);
+  end;
+  Result := used;
+end;
+
 function EmitFinish(var e: TEmit; lit: PByte; litLen: SizeInt): SizeInt;
 var
-  ctrlLen, litTotal: SizeInt;
+  ctrlLen, litTotal, v3: SizeInt;
 begin
   ctrlLen := e.ctrl - (e.dst + HEADER_SIZE);
   litTotal := (e.lit - e.lits) + litLen;
   if e.ctrl + litTotal > e.oend then
     Exit(-1);
+  if e.entropy and (litTotal > 0) then
+  begin
+    { all literals in the scratch stream (it holds n + slack bytes), then
+      code them; only kept when smaller than the v2 layout }
+    Move(lit^, e.lit^, litLen);
+    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, litTotal);
+    if v3 >= 0 then
+    begin
+      PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_ENTROPY;
+      Exit(HEADER_SIZE + ctrlLen + v3);
+    end;
+    PUInt32(e.dst)^ := UInt32(ctrlLen);
+    Move(e.lits^, e.ctrl^, litTotal);
+    Exit(HEADER_SIZE + ctrlLen + litTotal);
+  end;
   PUInt32(e.dst)^ := UInt32(ctrlLen);
   Move(e.lits^, e.ctrl^, e.lit - e.lits);
   Move(lit^, (e.ctrl + (e.lit - e.lits))^, litLen);
@@ -742,7 +833,7 @@ begin
   hashLog := FastHashLog(level);
   begin
     FillChar(table^, SizeOf(UInt32) shl hashLog, 0);   { position 0 }
-    EmitInit(e, dst, cap, ctx.scratch, src + n);
+    EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
 {$ifdef SYLZ_ASM_X64}
     if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
     begin
@@ -900,7 +991,7 @@ begin
   s.chain := ctx.chain;
   for i := 0 to (1 shl HC_HASHLOG) - 1 do
     s.head[i] := -1;
-  EmitInit(e, dst, cap, ctx.scratch, src + n);
+  EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
   Result := CompressHCCore(src, n, e, s, level);
 end;
 
@@ -1192,7 +1283,7 @@ begin
   s.chain := ctx.chain;
   for i := 0 to (1 shl HC_HASHLOG) - 1 do
     s.head[i] := -1;
-  EmitInit(e, dst, cap, ctx.scratch, src + n);
+  EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
   Result := CompressOptCore(src, n, e, s, ctx.opt, p);
 end;
 
@@ -1214,6 +1305,13 @@ end;
 function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 begin
+  Result := SylzCompressEx(ctx, src, n, dst, cap, level, 0);
+end;
+
+function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+begin
+  ctx.flags := flags;
   if cap < HEADER_SIZE then
     Exit(-1);
   if level = 0 then
@@ -1344,22 +1442,15 @@ type
     cfast, lfast, ofast, dst: PByte;
   end;
 
-function DecodePas(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+function DecodePas(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt): SizeInt;
 var
   lim: TDecodeLimits;
-  ctrl, lit, op, m: PByte;
+  op, m: PByte;
   e, off: SizeUInt;
   ll, ml: SizeInt;   { signed: the copy loops count them down past zero }
 begin
-  if n < HEADER_SIZE then
-    Exit(-1);
-  ll := PUInt32(src)^;
-  if ll > n - HEADER_SIZE then
-    Exit(-1);
-  ctrl := src + HEADER_SIZE;
-  lit := ctrl + ll;
-  lim.cfast := lit - CTRL_MARGIN;
-  lim.lfast := src + n - LIT_MARGIN;
+  lim.cfast := cend - CTRL_MARGIN;
+  lim.lfast := lend - LIT_MARGIN;
   lim.ofast := dst + dstLen - OUT_MARGIN;
   lim.dst := dst;
   op := dst;
@@ -1832,21 +1923,15 @@ asm
   pop rbx
 end;
 
-function DecodeAsm(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+function DecodeAsm(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt): SizeInt;
 var
   st: TDecodeState;
-  ctrlLen: SizeInt;
 begin
-  if n < HEADER_SIZE then
-    Exit(-1);
-  ctrlLen := PUInt32(src)^;
-  if ctrlLen > n - HEADER_SIZE then
-    Exit(-1);
-  st.ctrl := src + HEADER_SIZE;
-  st.lit := st.ctrl + ctrlLen;
+  st.ctrl := ctrl;
+  st.lit := lit;
   st.op := dst;
-  st.cfast := st.lit - CTRL_MARGIN;
-  st.lfast := src + n - LIT_MARGIN;
+  st.cfast := cend - CTRL_MARGIN;
+  st.lfast := lend - LIT_MARGIN;
   st.ofast := dst + dstLen - OUT_MARGIN;
   st.dst := dst;
   st.tokens := @SYLZ_TOKENS[0];
@@ -1858,13 +1943,83 @@ begin
 end;
 {$endif}
 
-function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+function DecodeStreams(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt): SizeInt;
 begin
 {$ifdef SYLZ_ASM_X64}
   if SylzUseAsm then
-    Exit(DecodeAsm(src, n, dst, dstLen));
+    Exit(DecodeAsm(ctrl, cend, lit, lend, dst, dstLen));
 {$endif}
-  Result := DecodePas(src, n, dst, dstLen);
+  Result := DecodePas(ctrl, cend, lit, lend, dst, dstLen);
+end;
+
+procedure SylzDCtxInit(out dctx: TSylzDCtx);
+begin
+  dctx.lits := nil;
+  dctx.litsSize := 0;
+end;
+
+procedure SylzDCtxFree(var dctx: TSylzDCtx);
+begin
+  FreeMem(dctx.lits);
+  SylzDCtxInit(dctx);
+end;
+
+function SylzDecompressCtx(var dctx: TSylzDCtx; src: PByte; n: SizeInt; dst: PByte;
+  dstLen: SizeInt): SizeInt;
+var
+  hdr: UInt32;
+  ctrlLen, litCount, pos, c, r: SizeInt;
+  ctrl, cend, send, p: PByte;
+begin
+  if n < HEADER_SIZE then
+    Exit(-1);
+  hdr := PUInt32(src)^;
+  ctrlLen := hdr and HDR_CTRLMASK;
+  if ctrlLen > n - HEADER_SIZE then
+    Exit(-1);
+  ctrl := src + HEADER_SIZE;
+  cend := ctrl + ctrlLen;
+  send := src + n;
+  if hdr and HDR_ENTROPY = 0 then
+    Exit(DecodeStreams(ctrl, cend, cend, send, dst, dstLen));
+
+  { v3: decode the literal chunks first, then the sequences over them }
+  if send - cend < 4 then
+    Exit(-1);
+  litCount := PUInt32(cend)^;
+  if (litCount > dstLen) or (litCount = 0) then
+    Exit(-1);
+  if dctx.litsSize < litCount then
+  begin
+    FreeMem(dctx.lits);
+    dctx.lits := GetMem(litCount);
+    dctx.litsSize := litCount;
+  end;
+  p := cend + 4;
+  pos := 0;
+  while pos < litCount do
+  begin
+    c := litCount - pos;
+    if c > LIT_CHUNK then
+      c := LIT_CHUNK;
+    r := HufDecodeChunk(p, send - p, dctx.lits + pos, c);
+    if r < 0 then
+      Exit(-1);
+    Inc(p, r);
+    Inc(pos, c);
+  end;
+  if p <> send then   { the chunks must take the rest of the block exactly }
+    Exit(-1);
+  Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
+end;
+
+function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+var
+  dctx: TSylzDCtx;
+begin
+  SylzDCtxInit(dctx);
+  Result := SylzDecompressCtx(dctx, src, n, dst, dstLen);
+  SylzDCtxFree(dctx);
 end;
 
 initialization

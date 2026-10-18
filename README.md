@@ -24,6 +24,8 @@ The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
 literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
+Format v3 (`-e`, experimental) adds Huffman-coded literals, in 64 KiB
+chunks with four interleaved streams; a v2 block is a valid v3 block.
 `--fast=2`, `--fast=1`, `-1` and `-2` are greedy single-hash levels (the
 hash table doubles at each step); `-3` to `-10` use hash chains with lazy
 matching; `-11` and `-12` an optimal parser whose prices include decode
@@ -31,8 +33,8 @@ time, so it picks cheaper sequences: `-11` decodes fastest of all levels. The de
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
-silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
-all in one session:
+silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz).
+Fast and middle levels, one session:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
@@ -47,9 +49,26 @@ all in one session:
 | zxc 0.15.0 -4 | 117 MB/s | 3421 MB/s | 43.43% |
 | zxc 0.15.0 -5 | 69.8 MB/s | 3454 MB/s | 40.83% |
 | sylz -3 | 73.7 MB/s | 3002 MB/s | 40.75% |
-| zxc 0.15.0 -6 † | 9.42 MB/s | 2755 MB/s | 36.28% |
-| **sylz -11** † | 5.79 MB/s | **3683 MB/s** | 36.37% |
-| **sylz -12** † | 2.77 MB/s | 3351 MB/s | **36.12%** |
+
+High ratios, another session (load ~6, so all speeds a little lower):
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| lz4hc 1.10.0 -9 | 25.6 MB/s | 2784 MB/s | 36.75% |
+| zxc 0.15.0 -6 | 8.46 MB/s | 2655 MB/s | 36.28% |
+| **sylz -11** | 5.24 MB/s | **3170 MB/s** | 36.37% |
+| **sylz -12** | 2.52 MB/s | 3238 MB/s | 36.12% |
+| zstd 1.5.7 -1 | 317 MB/s | 1035 MB/s | 34.53% |
+| **sylz -e -10** (v3) | 19.5 MB/s | **2062 MB/s** | 34.82% |
+| **sylz -e -11** (v3) | 4.99 MB/s | 2032 MB/s | **34.29%** |
+| **sylz -e -12** (v3) | 2.52 MB/s | **2080 MB/s** | 34.06% |
+| zxc 0.15.0 -7 | 5.67 MB/s | 1866 MB/s | 33.09% |
+| zstd 1.5.7 -2 | 223 MB/s | 757 MB/s | 32.70% |
+| zstd 1.5.7 -3 | 152 MB/s | 650 MB/s | 31.20% |
+
+`-e` is format v3 (Huffman-coded literals, experimental): on silesia.tar
+it beats zstd -1 on ratio at twice its decompression speed, but compresses
+far slower; on mixed data zstd -1 is still smaller.
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
 the same core († in a later session, on another core). More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
@@ -76,7 +95,7 @@ The current command line is minimal and its file format provisional:
 files it writes are not expected to open with later versions.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (-1 .. -12, --fast=1/2, -b MIB block size)
+out/syc c -1 file          # -> file.sylz (-1 .. -12, --fast=1/2, -e, -b MIB block size)
 out/syc d file.sylz        # -> file
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
@@ -124,7 +143,8 @@ mmap).
 ## Layout
 
 ```
-src/           sylz codec (sylz.pas) and the syc CLI (syc.pas)
+src/           sylz codec (sylz.pas), its Huffman coder (sylzhuf.pas), the
+               syc CLI (syc.pas)
 bench/         sylzbench, sylzstats (sequence histograms of a block)
 tests/         sylzfuzz
 plugin/        zpaq-std codec plugin and its test
