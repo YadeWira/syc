@@ -461,6 +461,14 @@ Same session, against the previous commit (assembler):
 | 2 before | 320 MB/s | 44.20% | 65.45% | 3481 MB/s |
 | 2 now | 479 MB/s | 44.19% | 65.45% | 3522 MB/s |
 
+After the change, perf (cycles:pp) puts the level-1 compressor's time
+in the 4-byte check of each candidate (random reads up to 64 KiB back,
+often L2 hits: 8% + 6.6% of the samples), the table loads, and the match
+length loop (~10%). A software prefetch of the next probe's candidate
+(prefetcht0, output unchanged) made it 6-10% slower: the extra
+instructions cost more than the latency they hide, which the out-of-order
+core already overlaps.
+
 Tried at the same time and dropped (Pascal compressor, relative): a
 repeat-offset candidate when the hash misses (-0.1 to -0.3 points, -1
 to -10% speed), inserting ip-1 or the start of long matches too (~0 /
