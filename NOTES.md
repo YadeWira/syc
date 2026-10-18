@@ -348,6 +348,49 @@ At equal compression speed a bigger single table wins on ratio,
 executables included; two ways only win on memory and by 1-2% decode
 cycles.
 
+### Optimal parser, levels 11-12 (2026-10-18)
+
+A forward dynamic program over windows of 4096 positions: one literal
+and every match length of every candidate (each length priced with the
+nearest candidate reaching it), prices in bytes plus decode penalties
+(per sequence, per escape token, per offset < 16). Literal runs are
+priced as they grow; charging the literal extension to the match that
+ends a run made the first version never end one (x-ray at 100%).
+
+silesia.tar, CPU 20 (socket 1), sizes and decode cycles per decode:
+
+| | size | compress | decode cycles |
+|---|---|---|---|
+| lazy, 256 attempts (level 10) | 77.58 M | 18.3 MB/s | 217 M |
+| lazy, 1024 attempts (old level 12) | 77.43 M | 13.8 MB/s | 218 M |
+| optimal, 64, no penalties | 77.04 M | 5.4 MB/s | 215 M |
+| optimal, 64, penalties 0.5/1/0.5 | 77.06 M | 5.7 MB/s | 210 M |
+| optimal, 64, penalties 2/4/2 | 79.58 M | 5.8 MB/s | 202 M |
+| optimal, 64, penalties 4/8/4 | 88.09 M | 5.7 MB/s | 175 M |
+| optimal, 16, skip 16 | 79.26 M | 17.4 MB/s | 217 M |
+| optimal, 64, skip 32 | 77.51 M | 8.4 MB/s | 208 M |
+| optimal, 256, penalties 1/2/1 | 76.67 M | 2.8 MB/s | 217 M |
+
+At equal compression speed lazy parsing with deep chains beats the
+optimal parser with shallow ones, and skipping inside long matches costs
+more ratio than it saves time, so the optimal parser only takes the top:
+level 11 = 64 attempts, level 12 = 256, penalties 0.5/1/0.5, every match
+length up to 36 (limiting it barely changed speed: the cost is per
+position, not per length). The lazy levels moved to 3..10.
+
+Full ladder, same session:
+
+| level | silesia | compress | decompress | mixed | compress | decompress |
+|---|---|---|---|---|---|---|
+| 10 | 36.60% | 22.0 MB/s | 3349 MB/s | 60.73% | 26.9 MB/s | 3148 MB/s |
+| 11 | 36.37% | 5.79 MB/s | **3683 MB/s** | 60.63% | 9.98 MB/s | **3398 MB/s** |
+| 12 | 36.12% | 2.77 MB/s | 3351 MB/s | 60.49% | 5.22 MB/s | 3326 MB/s |
+
+Level 11 decodes fastest of all levels (the penalties pick cheaper
+sequences). Against zxc -6 (36.28%, 2755 MB/s, 9.42 MB/s): level 11
+decodes 34% faster at about its ratio, level 12 is smaller and 22%
+faster; both compress slower.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio

@@ -25,8 +25,9 @@ the decoder finds the next sequence at a fixed distance whatever the
 literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
 `--fast=2`, `--fast=1`, `-1` and `-2` are greedy single-hash levels (the
-hash table doubles at each step); `-3` to `-12` use hash chains with lazy
-matching. The decoder is safe on corrupt input. Hot
+hash table doubles at each step); `-3` to `-10` use hash chains with lazy
+matching; `-11` and `-12` an optimal parser whose prices include decode
+time, so it picks cheaper sequences: `-11` decodes fastest of all levels. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
@@ -46,9 +47,12 @@ all in one session:
 | zxc 0.15.0 -4 | 117 MB/s | 3421 MB/s | 43.43% |
 | zxc 0.15.0 -5 | 69.8 MB/s | 3454 MB/s | 40.83% |
 | sylz -3 | 73.7 MB/s | 3002 MB/s | 40.75% |
+| zxc 0.15.0 -6 † | 9.42 MB/s | 2755 MB/s | 36.28% |
+| **sylz -11** † | 5.79 MB/s | **3683 MB/s** | 36.37% |
+| **sylz -12** † | 2.77 MB/s | 3351 MB/s | **36.12%** |
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
-the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+the same core († in a later session, on another core). More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
 The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 
 ## Build
