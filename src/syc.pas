@@ -20,7 +20,7 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.4';
+  SYC_VERSION   = '0.2.5';
   MAGIC         = 'SYZ0';
   FORMAT_VER    = 2;   { 2: sylz v2 or v3 blocks; 1: v2 only (syc 0.2.2-0.2.4);
                          0 was sylz v1 (syc 0.2.0-0.2.1) }
@@ -126,7 +126,10 @@ begin
   try
     fout := TFileStream.Create(outPath, fmCreate);
     Move(MAGIC[1], hdr[0], 4);
-    hdr[4] := FORMAT_VER;
+    if flags and SYLZ_ENTROPY <> 0 then
+      hdr[4] := FORMAT_VER
+    else
+      hdr[4] := 1;   { readable by syc 0.2.2-0.2.4 }
     hdr[5] := Byte(level);
     fout.WriteBuffer(hdr, 6);
     total := 0;
