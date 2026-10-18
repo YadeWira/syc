@@ -492,6 +492,11 @@ up to -0.22 points at level 1 for -1 to -5%), a faster probe step
 at all in the assembler with 16-bit tables, where probing is no longer
 the bottleneck).
 
+Status (2026-10-18): levels 0 and 1 are closed. With the hash shift kept
+in cl (-2.6% cycles at level 0) and the retrained token table measured
+and dropped, what is left is the match branch and the candidate loads;
+going further needs a different search design, not more tuning.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio
