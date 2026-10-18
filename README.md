@@ -22,7 +22,8 @@ command line is a placeholder and will also be designed from scratch.
 
 The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
-literal length. Level 1 is a greedy single-hash parser, levels 2–12 use
+literal length, and a token table derived from measured parses, so that
+few sequences need a length extension (a branch the CPU can't predict). Level 1 is a greedy single-hash parser, levels 2–12 use
 hash chains with lazy matching. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
@@ -31,12 +32,15 @@ silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz):
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 515 MB/s | 3105 MB/s | 47.59% |
-| misa77 0.6.0 -0 | 157 MB/s | 3907 MB/s | 44.60% |
-| lizard 2.1 -10 | 433 MB/s | 2965 MB/s | 48.78% |
-| zstd 1.5.7 --fast=1 | 397 MB/s | 1405 MB/s | 41.01% |
-| **sylz -1** | **402 MB/s** | **2930 MB/s** | **44.62%** |
-| **sylz -9** | 22.5 MB/s | 3150 MB/s | 36.88% |
+| lz4 1.10.0 | 544 MB/s | 3302 MB/s | 47.59% |
+| misa77 0.6.0 --1 | 284 MB/s | 3995 MB/s | 46.74% |
+| misa77 0.6.0 -0 | 171 MB/s | 3962 MB/s | 44.60% |
+| lizard 2.1 -10 | 436 MB/s | 2960 MB/s | 48.78% |
+| zstd 1.5.7 --fast=1 | 392 MB/s | 1402 MB/s | 41.01% |
+| **sylz -1** | **423 MB/s** | **3178 MB/s** | **44.18%** |
+| lz4hc 1.10.0 -9 | 28.2 MB/s | 3230 MB/s | 36.75% |
+| misa77 0.6.0 -3 | 11.3 MB/s | 3785 MB/s | 37.76% |
+| **sylz -9** | 21.9 MB/s | 3229 MB/s | 36.60% |
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2) on the same core. How,
 and more numbers: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).

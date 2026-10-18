@@ -5,6 +5,7 @@
   version are not expected to open with later ones.
 
     file   := "SYZ0" version:u8 level:u8 block*  end
+              version 1 = sylz format v2 blocks
     block  := rawLen:u32le packed:u32le crc32:u32le payload
               packed bit 31 set = payload stored raw, else a sylz block;
               the low 31 bits are the payload length
@@ -19,9 +20,9 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.1';
+  SYC_VERSION   = '0.2.2';
   MAGIC         = 'SYZ0';
-  FORMAT_VER    = 0;
+  FORMAT_VER    = 1;   { 1: sylz format v2 blocks (0 was v1, syc 0.2.0-0.2.1) }
   STORED_FLAG   = UInt32($80000000);
   PAYLOAD_MASK  = UInt32($7FFFFFFF);
   DEFAULT_BLOCK = 4 shl 20;

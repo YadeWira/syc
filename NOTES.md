@@ -14,14 +14,54 @@ ultra-fast-lzma2 (high ratio).
   `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`,
   `SYLZ_NOASM=1` uses the Pascal paths only
 - `bench/sylzstats.pas` — literal/match/offset histograms of a block
+- `bench/sylztable.pas` — derives SYLZ_TOKENS from sample blocks
 - `tests/sylzfuzz.pas` — roundtrip + corrupt/truncated input, guard-page buffers
 - `build.sh` — builds the CLI and the benchmark into `out/`
 - `legacy/rust/` — syc v0.1.x (Rust), with its own NOTES.md
 
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
-(`silesia/`, `silesia.tar`, and `lzbench/` built from source).
+(`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
+mix), and `lzbench/` built from source).
 
-## sylz format v1
+## sylz format v2
+
+Same block layout as v1; the token becomes an index into SYLZ_TOKENS:
+210 exact (literals, match) pairs, literals <= 15 and match <= 32, then
+46 escapes (literals exact + match extended, literals extended + match
+exact, both extended). Full description at the top of `src/sylz.pas`.
+
+Why: perf showed 65% of the decoder's branch misses on the "field
+extended" branches, and 15.5% of level-1 sequences on silesia.tar needed
+an extension with the 3/5 split. A branch-free extension made things
+worse (see the profile below), so the fix had to be fewer extensions.
+`bench/sylzstats` showed the joint (literals, match) distribution is
+concentrated: the top 210 pairs inside the fixed-copy region cover
+87.9-91.8% of sequences against 79.0-87.7% for the 3/5 split, measured on
+silesia.tar and on mixed.tar (141 MB: 60 random samples each of text,
+document, executable, font, other, poly, image and audio from the shared
+corpus, 20 KB-3 MB), levels 1 and 9, each input weighted equally
+(`bench/sylztable`, which prints the table). Larger fixed-copy regions
+(literals up to 31, match up to 64) stay within a point and need wider
+copies, so 15/32 it is.
+
+| | v1 | v2 |
+|---|---|---|
+| silesia -1 ratio | 44.62% | 44.18% |
+| silesia -9 ratio | 36.88% | 36.60% |
+| mixed -1 ratio | 65.30% | 64.96% |
+| mixed -9 ratio | 61.01% | 60.73% |
+| silesia -1 decode | 3000 MB/s | 3150 MB/s |
+| silesia -9 decode | 3209 MB/s | 3254 MB/s |
+| mixed -1 decode | 3143 MB/s | 3411 MB/s |
+| mixed -9 decode | 3196 MB/s | 3380 MB/s |
+
+perf, per decode of silesia.tar -1: 256.7 M -> 238.5 M cycles, 599 M ->
+504 M instructions, 3.28 M -> 2.49 M branch misses. At -9 cycles barely
+move (236.9 -> 235.8 M): fewer misses, paid back by the table load.
+
+The syc container's format version went to 1 with this change.
+
+## sylz format v1 (superseded by v2)
 
 `ctrlLen:u32le, control[ctrlLen], literals[...]`. Control entries are a
 token (3 bits literal length, 5 bits match length - 4; all-ones = extended)
@@ -159,6 +199,23 @@ Tried and dropped:
   ahead. The extension misses are a format problem, not a code one.
 - Copying 48 match bytes unconditionally to drop the "match > 32" branch:
   4% more cycles, and that branch was only 2% of the misses.
+
+2026-10-17 23:18, format v2, quieter machine (load ~1):
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| lz4 1.10.0 | 544 MB/s | 3302 MB/s | 47.59 |
+| misa77 --1 | 284 MB/s | 3995 MB/s | 46.74 |
+| misa77 -0 | 171 MB/s | 3962 MB/s | 44.60 |
+| misa77 -1 | 51.8 MB/s | 4118 MB/s | 42.64 |
+| misa77 -3 | 11.3 MB/s | 3785 MB/s | 37.76 |
+| lizard -10 | 436 MB/s | 2960 MB/s | 48.78 |
+| zstd --fast=1 | 392 MB/s | 1402 MB/s | 41.01 |
+| zstd -1 | 345 MB/s | 1146 MB/s | 34.53 |
+| lz4hc -9 | 28.2 MB/s | 3230 MB/s | 36.75 |
+| **sylz v2 -1** | 423 MB/s | 3178 MB/s | 44.18 |
+| **sylz v2 -2** | 77.3 MB/s | 3069 MB/s | 40.75 |
+| **sylz v2 -9** | 21.9 MB/s | 3229 MB/s | 36.60 |
 
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
