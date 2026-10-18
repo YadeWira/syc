@@ -1,167 +1,99 @@
 # syc
 
-Streaming archiver + compressor in (almost) pure Rust, tuned for modest hardware.
+A streaming archiver and compressor with its own LZ codecs, written from
+scratch in Free Pascal. Tuned for modest hardware.
 
-Status: **alpha** — format may evolve before v1.
+**Status: v0.2.x, pre-release.** Every release stays a pre-release until
+v1.0.0, and the formats can change between versions. syc v0.1.x was a
+Rust archiver; it lives on in [`legacy/rust/`](legacy/rust/). v0.2 restarts
+the project in Free Pascal, algorithms first: the codec is under way, the
+command line is a placeholder and will also be designed from scratch.
 
-## Why
+## Goals
 
-Most Rust archivers either wrap `tar` + a single compressor or re-implement zip.
-`syc` treats the archive as a single solid compressed stream with optional
-preprocessors, so one pass of zstd / LZMA / PPMd7 sees every file at once and
-can share dictionary state across them. Decompression is a single streaming
-read — no central directory, no seeks.
+"Modest hardware" is taken literally:
 
-Benchmarks live in [`NOTES.md`](NOTES.md). Headline: decompression is **10–18×
-faster than FreeArc/ARC** at equivalent ratio tiers; ratio ties or beats ARC up
-to `-m4`, LZMA preset catches up around `-m5`.
+- bounded memory, small match-finder tables, reusable contexts;
+- good on 1–4 cores rather than needing 16;
+- no AVX2 requirement: x86-64 baseline (SSE2) is enough;
+- 32-bit targets supported (the Pascal code paths run anywhere FPC does).
 
-## Install
+## sylz
 
-Pre-built binaries on the [releases page](https://github.com/YadeWira/syc/releases).
+The first codec: a fast LZ with separate control and literal streams, so
+the decoder finds the next sequence at a fixed distance whatever the
+literal length. Level 1 is a greedy single-hash parser, levels 2–12 use
+hash chains with lazy matching. The decoder is safe on corrupt input. Hot
+loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
+ones, and the fuzzer checks that both compressors produce the same bytes.
 
-Linux:
+silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz):
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| lz4 1.10.0 | 515 MB/s | 3105 MB/s | 47.59% |
+| misa77 0.6.0 -0 | 157 MB/s | 3907 MB/s | 44.60% |
+| lizard 2.1 -10 | 433 MB/s | 2965 MB/s | 48.78% |
+| zstd 1.5.7 --fast=1 | 397 MB/s | 1405 MB/s | 41.01% |
+| **sylz -1** | **402 MB/s** | **2930 MB/s** | **44.62%** |
+| **sylz -9** | 22.5 MB/s | 3150 MB/s | 36.88% |
+
+Competitors measured with lzbench 2.4.1 (GCC 14.2) on the same core. How,
+and more numbers: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
+
+## Build
+
+Free Pascal 3.2.2:
 
 ```sh
-chmod +x syc-0.1.8-linux-x86_64
-./syc-0.1.8-linux-x86_64 h
+./build.sh                    # out/syc and out/sylzbench
+./build.sh -Twin64            # Windows x86-64 (FPC's win64 units)
+./build.sh -dSYLZ_PUREPASCAL  # no assembler, Pascal paths only
 ```
 
-Windows: download `syc-0.1.8-windows-x86_64.exe`, run from `cmd` or
-PowerShell.
+## Use
 
-Or build from source (stable Rust, edition 2021):
+The current command line is minimal and its file format provisional:
+files it writes are not expected to open with later versions.
 
 ```sh
-git clone https://github.com/YadeWira/syc
-cd syc
-cargo build --release
-./target/release/syc h
+out/syc c -1 file          # -> file.sylz (levels -1 .. -12, -b MIB block size)
+out/syc d file.sylz        # -> file
+out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
 
-## Quick start
+Each block carries a CRC32 of its data, checked on decompression.
+
+## Test
 
 ```sh
-# pack
-syc a data.syc ./mydir -level 5
-
-# list / test / extract
-syc l data.syc
-syc t data.syc
-syc x data.syc -to ./restored
+fpc -O3 -Fusrc -FUout/units -FEout tests/sylzfuzz.pas
+out/sylzfuzz 3000 SAMPLE-FILES...
 ```
 
-Levels run `0..=10`. Default is `5` (LZMA sweet-spot). Levels `0..=4` use zstd
-(fast); `5..=10` use LZMA (best ratio).
+Roundtrips random, structured and real data at every level, decodes
+corrupted and truncated blocks against guard-page buffers (any read or
+write out of bounds faults), alternates the assembler and Pascal paths,
+and checks the two compressors agree byte for byte. Linux only (uses
+mmap).
 
-## Features
-
-**Backends**
-- `zstd` (default, levels 0–4) with long-range matching
-- `LZMA` (levels 5–10) via `xz2`
-- `PPMd7` opt-in: `SYC_BACKEND=ppmd` (single-threaded — model is sequential)
-
-**Threads**
-- Auto: when `-threads` is omitted **and** input ≥ 256 MiB, syc picks
-  `min(cores, 8)` and forwards to both zstd's MT path and the LZMA
-  `MtStreamBuilder`. zstd MT costs ~0.1% ratio; LZMA MT splits at 3× dict
-  per block (RAM cost: N × 128 MiB at default).
-- Manual: `-threads N`. `-threads 1` forces single-threaded.
-
-**Preprocessors** (applied between the archive body and the compressor)
-- **REP / SREP** — long-repeat finder, auto-enabled for corpora > 1 GiB
-- **BCJ** — x86/ARM/IA64/SPARC/PPC branch-code filter; auto-detects ELF/PE
-  in the sample and applies x86 when the majority matches (`-bcj off` to skip,
-  or pick explicitly)
-- **Delta** — `-delta N` (stride 1, 2, or 4) for PCM / raster data
-- **LZP** — `-lzp` context-hash predictor; pairs well with PPMd
-- **FastCDC** — `-fastcdc` content-defined chunking for cross-file dedup at
-  sub-file granularity
-
-**Archive modes**
-- `-append` — writes a new compressed frame to the end of an existing archive;
-  existing bytes are never rewritten (antiransomware property). Multi-frame
-  streams decode transparently.
-- `-route` — partitions entries by extension: pre-compressed media
-  (jpg/mp4/zip/pdf/apk/…) goes to a level-0 frame, the rest goes to the
-  chosen level. Saves CPU on data that won't compress anyway.
-- `-dedup` — xxh3_64 per file; duplicates become `HardLink` entries pointing
-  at the canonical path. On extract, real hardlinks (copy fallback on
-  cross-device). On 4 copies of `/usr/share/doc/python3.13`: 4× less
-  compression work and ≈16% smaller archive.
-
-**Per-file integrity**
-- `-hash crc32 | xxh3 | blake3` (default `crc32`). `blake3` is cryptographic;
-  `xxh3` is fastest; `crc32` is smallest. `-nochecksum` to skip.
-
-**Metadata**
-- Unix mode preserved, symlinks preserved, mtime restored on extract.
-- Linux extended attributes with `-xattrs` (`user.*` / `system.*` /
-  `security.*`).
-- Archive-level `-comment TEXT`, shown by `syc l`.
-- Optional `-snapshot` takes a btrfs / zfs read-only snapshot before walking
-  the tree (silent fallback to the live tree on unsupported FS).
-
-**Solid / dict**
-- Solid sort groups files by `(kind, extension, parent dir, size, path)` so
-  similar payloads stream adjacent to each other (better dictionary reuse).
-- Optional zstd dictionary training (`-dict`) with size adaptive to the
-  corpus (64 KiB → 256 KiB).
-
-**Selectors and plumbing**
-- `-exclude PATTERN` (repeatable), `-minsize N`, `-maxsize N`
-- `-filelist FILE`, `-datefrom YYYY-MM-DD`, `-dateto YYYY-MM-DD`
-- `-chunk SIZE` — split output into `archive.001`, `.002`, … Accepts size
-  suffixes: `-chunk 100MB`, `-chunk 2GB`, `-chunk 1.5GiB`. KB/MB/GB are
-  1024-base (matches zpaqfranz). `-minsize` / `-maxsize` accept the same
-  suffixes.
-- Pipe support: `-` as archive path reads from stdin / writes to stdout
-- `-exec_ok CMD` / `-exec_error CMD` hooks
-
-**UX (zpaqfranz-flavored)**
-- Live progress bar (4 Hz, stderr, auto-off without a TTY): `pack 42% ETA
-  00:01:13  720 MB of 1.75 GB  450 MB/s`. Disable with `-noprogress`. After
-  100% it switches to `flushing...` while the encoder finalizes.
-- Numbered red errors (`00042! …`) and yellow warnings (`00042: …`) with a
-  count footer.
-- Atomic write: pack streams to `<archive>.tmp` and renames on success.
-  Cancelled runs leave the `.tmp` behind; the final name is never half-written.
-
-## Commands
+## Layout
 
 ```
-a   add        pack sources into archive
-x   extract    unpack archive (streaming, no seek)
-l   list       show entries
-t   test       decompress & verify checksums (no extract)
-v   verify     stream-compare archive against a live source dir
-c   compare    diff two directories by content (size + crc32)
-d   dedupe     report duplicates in a tree (read-only)
-h   help       `syc h` for banner, `syc h <cmd>` for detail
+src/           sylz codec (sylz.pas) and the syc CLI (syc.pas)
+bench/         sylzbench, sylzstats (sequence histograms of a block)
+tests/         sylzfuzz
+build.sh
+NOTES.md       development log: measurements, FPC codegen findings
+legacy/rust/   syc v0.1.x, the Rust archiver (its own README)
 ```
 
-## Status vs FreeArc / ARC.exe
+## Documentation
 
-On `/usr/share/doc/python3.13` (71 MiB, 1502 files):
-
-| Tier   | syc ratio | ARC ratio | decomp speed vs ARC |
-|--------|-----------|-----------|---------------------|
-| low    | 0.214     | 0.228     | 9.7× faster         |
-| mid    | 0.155     | 0.166     | 10.4× faster        |
-| high   | 0.148     | 0.146     | 14.9× faster        |
-| top    | 0.148     | 0.139     | 17.9× faster        |
-
-`syc` wins ratio through `-m4`. ARC's top tier activates its `Dict + LZP +
-PPMd` stack which `syc` does not yet port; closing that gap is tracked in
-`NOTES.md`.
-
-## Build targets
-
-- Linux `x86_64-unknown-linux-gnu` (native)
-- Windows `x86_64-pc-windows-gnu` via mingw-w64
-  (`.cargo/config.toml` has the linker wired up; `cargo build --release
-  --target x86_64-pc-windows-gnu` from a Linux host with `mingw-w64`
-  installed)
+The [wiki](https://github.com/YadeWira/syc/wiki): format, benchmarks,
+building, Free Pascal codegen notes, versioning, and the legacy Rust
+version.
 
 ## License
 

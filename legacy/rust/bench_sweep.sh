@@ -5,7 +5,7 @@ set -e
 export LC_ALL=C
 DATA=/usr/share/doc/python3.13
 WORK=/tmp/syc_sweep
-SYC=/home/forum/git/syc/target/release/syc
+SYC="$(dirname "$(readlink -f "$0")")/target/release/syc"
 mkdir -p $WORK
 rm -f $WORK/*.syc
 DB=$(du -sb $DATA | awk '{print $1}')

@@ -7,7 +7,7 @@ export WINEDEBUG=-all
 DATA="${1:-/usr/share/doc/python3.13}"
 WORK="${WORK:-/home/forum/bench_scratch/syc_vs_arc}"
 SYC="$(dirname "$(readlink -f "$0")")/target/release/syc"
-ARC="/home/forum/git/syc/Arc.exe"
+ARC="$(dirname "$(readlink -f "$0")")/Arc.exe"
 
 mkdir -p "$WORK"
 rm -f "$WORK"/*.arc "$WORK"/*.syc
