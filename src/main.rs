@@ -2427,7 +2427,7 @@ fn build_dedup_map(
             Err(_) => continue,
         };
         let mut r = BufReader::with_capacity(archive::IO_BUF, f);
-        let mut h = twox_hash::XxHash3_64::new();
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
         loop {
             let n = match r.read(&mut buf) {
                 Ok(n) => n,
@@ -2511,7 +2511,10 @@ fn open_archive(archive: &Path) -> Result<(Box<dyn Read>, Option<HashAlgo>, Opti
             } else {
                 zstd::stream::Decoder::with_dictionary(br, &dict)?
             };
-            let _ = d.window_log_max(31);
+            // zstd caps windowLog at 30 on 32-bit targets; asking for 31 there
+            // fails (silently, given the `let _`) and leaves the default 27,
+            // which rejects the 28-bit frames our encoder writes.
+            let _ = d.window_log_max(if cfg!(target_pointer_width = "32") { 30 } else { 31 });
             Box::new(d)
         }
         // `new_multi_decoder` transparently handles a sequence of concatenated

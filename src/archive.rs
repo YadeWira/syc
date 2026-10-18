@@ -293,7 +293,7 @@ impl HashAlgo {
 
 pub enum EntryHasher {
     Crc32(crc32fast::Hasher),
-    Xxh3(twox_hash::XxHash3_64),
+    Xxh3(xxhash_rust::xxh3::Xxh3),
     Blake3(Box<blake3::Hasher>),
 }
 
@@ -301,7 +301,7 @@ impl EntryHasher {
     pub fn new(algo: HashAlgo) -> Self {
         match algo {
             HashAlgo::Crc32 => Self::Crc32(crc32fast::Hasher::new()),
-            HashAlgo::Xxh3 => Self::Xxh3(twox_hash::XxHash3_64::new()),
+            HashAlgo::Xxh3 => Self::Xxh3(xxhash_rust::xxh3::Xxh3::new()),
             HashAlgo::Blake3 => Self::Blake3(Box::new(blake3::Hasher::new())),
         }
     }
@@ -619,8 +619,10 @@ pub fn pack_entry<W: Write>(
         use std::os::unix::fs::PermissionsExt;
         meta.permissions().mode()
     };
+    // No Unix mode bits on Windows: synthesize them, giving dirs the x bit so
+    // a Windows-made archive extracted on Unix can be entered.
     #[cfg(not(unix))]
-    let mode = 0o644u32;
+    let mode = if meta.is_dir() { 0o755u32 } else { 0o644u32 };
 
     if meta.file_type().is_symlink() {
         let target = fs::read_link(full)?.to_string_lossy().into_owned();

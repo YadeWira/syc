@@ -126,7 +126,7 @@ impl<R: Read> Chunker<R> {
 /// rates at these chunk sizes (2..64 KiB) are far below zero-match archives;
 /// for absolute safety use `-hash blake3` at the file level on top.
 pub fn chunk_hash(chunk: &[u8]) -> u64 {
-    let mut h = twox_hash::XxHash3_64::new();
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
     h.write(chunk);
     h.finish()
 }
@@ -367,7 +367,7 @@ mod tests {
 
     fn xxhash(buf: &[u8]) -> u64 {
         use std::hash::Hasher;
-        let mut h = twox_hash::XxHash3_64::new();
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
         h.write(buf);
         h.finish()
     }

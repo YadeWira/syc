@@ -56,7 +56,9 @@ fn main() {
             );
             ppg_build.include(&lzma_sys_src);
         }
-        ppg_build.include("/usr/x86_64-w64-mingw32/include");
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let mingw = if target_arch == "x86" { "i686-w64-mingw32" } else { "x86_64-w64-mingw32" };
+        ppg_build.include(format!("/usr/{mingw}/include"));
     }
 
     ppg_build.file("vendor/packpng/packpng.cpp").compile("packpng");
