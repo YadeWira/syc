@@ -2,8 +2,15 @@
 
 > This is the original Rust implementation of syc, kept for reference and
 > for its v0.1.x releases. The project continues as v0.2.x in Free Pascal:
-> see the [top-level README](../../README.md). Build it from this
-> directory (`cd legacy/rust && cargo build --release`).
+> see the [top-level README](../../README.md).
+>
+> The sources are archived in [`syc-rust-v0.1.29.zip`](syc-rust-v0.1.29.zip)
+> (everything but this README and NOTES.md), so they don't read as the
+> current code. To build:
+>
+> ```sh
+> cd legacy/rust && unzip syc-rust-v0.1.29.zip && cargo build --release
+> ```
 
 
 Streaming archiver + compressor in (almost) pure Rust, tuned for modest hardware.

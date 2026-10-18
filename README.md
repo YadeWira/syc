@@ -5,7 +5,7 @@ scratch in Free Pascal. Tuned for modest hardware.
 
 **Status: v0.2.x, pre-release.** Every release stays a pre-release until
 v1.0.0, and the formats can change between versions. syc v0.1.x was a
-Rust archiver; it lives on in [`legacy/rust/`](legacy/rust/). v0.2 restarts
+Rust archiver; its sources are archived in [`legacy/rust/`](legacy/rust/). v0.2 restarts
 the project in Free Pascal, algorithms first: the codec is under way, the
 command line is a placeholder and will also be designed from scratch.
 
@@ -91,7 +91,8 @@ bench/         sylzbench, sylzstats (sequence histograms of a block)
 tests/         sylzfuzz
 build.sh
 NOTES.md       development log: measurements, FPC codegen findings
-legacy/rust/   syc v0.1.x, the Rust archiver (its own README)
+legacy/rust/   syc v0.1.x, the Rust archiver: README, NOTES and its sources
+               archived in syc-rust-v0.1.29.zip
 ```
 
 ## Documentation

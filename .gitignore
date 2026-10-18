@@ -1,14 +1,11 @@
 # Free Pascal build output (build.sh)
 /out/
 
-# Legacy Rust build output and local fixtures (legacy/rust)
-/legacy/rust/target
-/legacy/rust/dist
-/legacy/rust/vendor/ppmd-rust/Cargo.lock
-/legacy/rust/test-files.tar
-/legacy/rust/test-files2.tar
-/legacy/rust/Arc.exe
-/legacy/rust/_probe.txt
+# Legacy Rust: sources unzipped from syc-rust-v0.1.29.zip, build output,
+# local fixtures (legacy/rust)
+/legacy/rust/*
+!/legacy/rust/*.md
+!/legacy/rust/syc-rust-v0.1.29.zip
 
 # Local agent settings
 /.claude/
