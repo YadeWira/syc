@@ -1231,20 +1231,41 @@ asm
   jz @checked
 
 @counted:
+  { An exact token has match <= 32, so this path copies 32 bytes with no
+    length test, and keeps the stored offset (distance - 1) in rcx with
+    the -1 folded into the address displacement: 22 instructions for a
+    sequence. The rare ways out restore rcx = distance first. }
   movzx eax, byte ptr [r8]
-  movzx ecx, word ptr [r8 + 1]
-  add rcx, 1              { offset = stored + 1 }
+  movzx ecx, word ptr [r8 + 1]   { distance - 1 }
   add r8, 3
   mov eax, [rdi + rax * 4]
   cmp eax, $FFFF
-  ja @ext                 { an escape: a length is extended }
+  ja @countedExt          { an escape: a length is extended }
   movzx ebp, ah           { match length, 4..32 }
   movzx eax, al           { literal length, 0..15 }
   movdqu xmm0, [r9]
   movdqu [r10], xmm0      { 16 literal bytes, unconditionally }
   add r10, rax
   add r9, rax
-  jmp @match
+  mov rsi, r10
+  sub rsi, rcx            { match source + 1 }
+  cmp ecx, 15
+  jb @countedShort        { distance < 16 }
+  movdqu xmm0, [rsi - 1]
+  movdqu [r10], xmm0
+  movdqu xmm1, [rsi + 15]
+  movdqu [r10 + 16], xmm1 { 32 match bytes, unconditionally }
+  add r10, rbp
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+@countedExt:
+  add rcx, 1
+  jmp @ext
+@countedShort:
+  add rcx, 1
+  sub rsi, 1
+  jmp @short
 
 @checked:
   mov r15, 1              { one sequence, then recount }
@@ -1289,9 +1310,22 @@ asm
   jnz @counted
   jmp @recount
 @long:
-  add r10, 32
-  add rsi, 32
-  sub rbp, 32
+  { match > 32 (escapes only): 32 more bytes unconditionally, and a loop
+    only past 64, so most long matches take no loop exit to mispredict }
+  movdqu xmm0, [rsi + 32]
+  movdqu [r10 + 32], xmm0
+  movdqu xmm1, [rsi + 48]
+  movdqu [r10 + 48], xmm1
+  cmp rbp, 64
+  ja @longer
+  add r10, rbp
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+@longer:
+  add r10, 64
+  add rsi, 64
+  sub rbp, 64
 @long16:
   movdqu xmm0, [rsi]
   movdqu [r10], xmm0
@@ -1405,7 +1439,21 @@ asm
   add rdx, 16
   cmp rax, rdx
   ja @bailPopped          { literals + match would write past the output margin }
+  mov rdx, r12
+  sub rdx, r9
+  cmp rdx, 16
+  jb @bailPopped          { too close to the end for a 32-byte literal read }
   mov r8, rsi
+  { 32 literal bytes unconditionally, a loop only past 32 }
+  movdqu xmm0, [r9]
+  movdqu [r10], xmm0
+  movdqu xmm1, [r9 + 16]
+  movdqu [r10 + 16], xmm1
+  cmp rbx, 32
+  jbe @litDone
+  add r9, 32
+  add r10, 32
+  sub rbx, 32
 @lit16:
   movdqu xmm0, [r9]
   movdqu [r10], xmm0
@@ -1413,6 +1461,7 @@ asm
   add r10, 16
   sub rbx, 16
   jg @lit16
+@litDone:
   add r9, rbx
   add r10, rbx
   mov rdx, r10

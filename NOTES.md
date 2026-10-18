@@ -217,6 +217,50 @@ Tried and dropped:
 | **sylz v2 -2** | 77.3 MB/s | 3069 MB/s | 40.75 |
 | **sylz v2 -9** | 21.9 MB/s | 3229 MB/s | 36.60 |
 
+### Decoder after format v2 (perf, 2026-10-18)
+
+Method: per-decode counters as (40 iterations - 20 iterations) / 20, which
+cancels file loading (a 0-iteration baseline varied by 20% with the page
+cache).
+
+silesia.tar -1, v0.2.2 decoder: 238 M cycles, 504 M instructions, 2.49 M
+branch misses per decode. Branch misses by site (`branch-misses:pp`):
+escape entry 52% (inherent to the format), offset < 16 14%, long-match
+loop exit 11%, long-literal loop exit 9%, "match > 32" 8%.
+
+- Counted path rewritten: its own 32-byte match copy without a length
+  test (exact tokens have match <= 32), the stored distance - 1 kept with
+  the -1 folded into the address displacement: 504 -> 453 M instructions,
+  238 -> 236 M cycles.
+- Escape path: 32 literal bytes and 64 match bytes copied
+  unconditionally, loops only past them: 2.49 -> 2.32 M misses, 234 M
+  cycles. Together +1-4% wall clock, same output.
+
+Where the rest goes (`cycles:pp`): the match-source loads and their
+stores. Per decode 2.77 M loads blocked by store forwarding (the match
+source was written a few cycles earlier, by stores of another size or
+alignment: offsets under ~64), 2.56 M L1 misses (nearly all L2 hits).
+
+Encoder-side policies tried (format unchanged), silesia.tar:
+
+| | size | decode cycles |
+|---|---|---|
+| -1 as is | 93.64 M | 232 M |
+| -1, distance >= 32 | 98.23 M (+4.9%) | 220 M (-5%) |
+| -1, distance >= 64 | 99.59 M (+6.3%) | 216 M (-7%) |
+| -1, match >= 6 | 95.28 M (+1.8%) | 218 M (-7%), 19% fewer sequences |
+| -1, match >= 6, distance >= 32 | 99.68 M (+6.4%) | 212 M (-9%) |
+| -9 as is | 77.58 M | 224 M |
+| -9, distance >= 64 | 78.47 M (+1.2%) | 212 M (-5%) |
+| -9, match >= 6 | 83.40 M (+7.5%) | 217 M (-3.5%) |
+
+Trade-offs, not wins; none made default. Each store-forwarding block
+costs ~8 cycles (they overlap with other work), less than the ~15
+assumed. A minimum distance is how misa77's format avoids them (its
+distances start at hashtab_lag + 1). The only cheap one is match >= 6 at
+level 1 (+1.8% size for -7% decode), a candidate for a decode-speed
+level.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio

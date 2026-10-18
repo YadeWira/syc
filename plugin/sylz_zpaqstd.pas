@@ -11,6 +11,12 @@
   writes a ZPAQL decoder for exactly that format, so a later sylz format
   needs a new codec name, not a new build of this one.
 
+  CONTRACT with zpaq-std: the library field starts with "sylz format v2 "
+  for as long as this plugin writes and reads format v2. zpaq-std uses the
+  plugin to decode blocks tagged sylz2 only when it does; a plugin for a
+  later format must say "sylz format v3 ..." (and so on), and zpaq-std
+  then decodes the old v2 blocks with its own ZPAQL decoder.
+
   zpaq-std calls these from several threads at once: the RTL is told it is
   multi-threaded (cthreads on Unix, IsMultiThread) so the heap behind each
   call's compression context is thread-safe. sylz keeps no mutable global
