@@ -65,10 +65,12 @@ procedure Usage;
 begin
   WriteLn('syc ', SYC_VERSION, ' — sylz file compressor (minimal CLI, provisional format)');
   WriteLn;
-  WriteLn('  syc c [-LEVEL] [-b MIB] INPUT [OUTPUT]   compress (default OUTPUT = INPUT', SUFFIX, ')');
+  WriteLn('  syc c [-LEVEL | --fast=N] [-b MIB] INPUT [OUTPUT]');
+  WriteLn('                                           compress (default OUTPUT = INPUT', SUFFIX, ')');
   WriteLn('  syc d INPUT [OUTPUT]                     decompress (default OUTPUT = INPUT without ', SUFFIX, ')');
   WriteLn;
-  WriteLn('  -LEVEL  1 (fast, default) .. ', SYLZ_MAXLEVEL, ' (best)');
+  WriteLn('  -LEVEL    1 (default) .. ', SYLZ_MAXLEVEL, ' (best ratio); 1-2 single hash, 3+ hash chains');
+  WriteLn('  --fast=N  faster still, N = 1..', -SYLZ_MINLEVEL, ' (worse ratio)');
   WriteLn('  -b MIB  block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 
@@ -263,7 +265,13 @@ begin
   while i <= ParamCount do
   begin
     arg := ParamStr(i);
-    if arg = '-b' then
+    if Copy(arg, 1, 7) = '--fast=' then
+    begin
+      if not TryStrToInt(Copy(arg, 8, MaxInt), level) or (level < 1) or (level > -SYLZ_MINLEVEL) then
+        Die(Format('--fast takes 1..%d', [-SYLZ_MINLEVEL]));
+      level := -level;
+    end
+    else if arg = '-b' then
     begin
       Inc(i);
       if (i > ParamCount) or not TryStrToInt(ParamStr(i), blockMiB)

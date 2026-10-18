@@ -293,6 +293,40 @@ distances start at hashtab_lag + 1). The only cheap one is match >= 6 at
 level 1 (+1.8% size for -7% decode), a candidate for a decode-speed
 level.
 
+### Fast levels, 2026-10-18: 6-byte hash and a table-size ladder
+
+Level 1 hashed 5 bytes into 2^14 entries. Sweep of hash width x table
+size, silesia.tar (decode cycles per decode, perf, asm decoder):
+
+| hash | table | compress | decode cycles | ratio | mixed ratio |
+|---|---|---|---|---|---|
+| 5 B | 2^13 | 481 MB/s | 232 M | 45.26% | 65.37% |
+| 5 B | 2^14 (old -1) | 415 MB/s | 233 M | 44.18% | 64.96% |
+| 5 B | 2^15 | 356 MB/s | 231 M | 43.55% | 64.71% |
+| 6 B | 2^12 | 605 MB/s | 221 M | 48.64% | 66.96% |
+| 6 B | 2^13 | 535 MB/s | 219 M | 46.51% | 66.31% |
+| 6 B | 2^14 | 450 MB/s | 220 M | 45.26% | 65.86% |
+| 6 B | 2^15 | 361 MB/s | 219 M | 44.57% | 65.60% |
+| 6 B | 2^16 | 332 MB/s | 220 M | 44.20% | 65.45% |
+| 7 B | 2^14 | 465 MB/s | 221 M | 47.24% | 67.27% |
+
+A 6-byte hash decodes ~6% faster at every table size (fewer, longer
+matches) and compresses faster; each doubling of the table costs ~15% of
+compression speed for ~1 point of ratio. So the fast levels became a
+ladder, all 6-byte hash: --fast=2 (level -2) 2^12, --fast=1 (-1) 2^13,
+-1 2^14, -2 2^16; the chain levels moved up to -3..-12 (attempts
+2..1024). --fast=1 beats lz4 on all three numbers in the same session
+(508 vs 492 MB/s, 3433 vs 2979 MB/s, 46.51 vs 47.59%) and matches zxc -3
+(3464 MB/s, 46.65%) at 3.2x its compression speed.
+
+The cost is on executables, full of 4-5 byte matches: ooffice at -1
+went 67.82% -> 70.27% (-2 gives 68.57%). Silesia lost 1.08 points at
+-1, the mixed corpus 0.90.
+
+The table size is now a run-time parameter, so the assembler shifts by
+cl reloaded from the stack at each hash (rcx is free at all five): 2-4%
+slower compression than an immediate shift, within the noise.
+
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
 44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio

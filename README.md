@@ -23,32 +23,32 @@ command line is a placeholder and will also be designed from scratch.
 The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
 literal length, and a token table derived from measured parses, so that
-few sequences need a length extension (a branch the CPU can't predict). Level 1 is a greedy single-hash parser, levels 2–12 use
-hash chains with lazy matching. The decoder is safe on corrupt input. Hot
+few sequences need a length extension (a branch the CPU can't predict).
+`--fast=2`, `--fast=1`, `-1` and `-2` are greedy single-hash levels (the
+hash table doubles at each step); `-3` to `-12` use hash chains with lazy
+matching. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
-silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz):
+silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
+all in one session:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 544 MB/s | 3302 MB/s | 47.59% |
-| misa77 0.6.0 --1 | 284 MB/s | 3995 MB/s | 46.74% |
-| misa77 0.6.0 -0 | 171 MB/s | 3962 MB/s | 44.60% |
-| zxc 0.15.0 -4 † | 117 MB/s | 3414 MB/s | 43.43% |
-| zxc 0.15.0 -5 † | 71.3 MB/s | 3407 MB/s | 40.83% |
-| lizard 2.1 -10 | 436 MB/s | 2960 MB/s | 48.78% |
-| zstd 1.5.7 --fast=1 | 392 MB/s | 1402 MB/s | 41.01% |
-| **sylz -1** | **423 MB/s** | **3178 MB/s** | **44.18%** |
-| lz4hc 1.10.0 -9 | 28.2 MB/s | 3230 MB/s | 36.75% |
-| misa77 0.6.0 -3 | 11.3 MB/s | 3785 MB/s | 37.76% |
-| zxc 0.15.0 -6 † | 9.42 MB/s | 2755 MB/s | 36.28% |
-| **sylz -9** | 21.9 MB/s | 3229 MB/s | 36.60% |
+| lz4 1.10.0 | 492 MB/s | 2979 MB/s | 47.59% |
+| zxc 0.15.0 -3 | 159 MB/s | 3464 MB/s | 46.65% |
+| misa77 0.6.0 --1 | 277 MB/s | 3979 MB/s | 46.74% |
+| **sylz --fast=2** | **565 MB/s** | 3364 MB/s | 48.64% |
+| **sylz --fast=1** | **508 MB/s** | **3433 MB/s** | **46.51%** |
+| **sylz -1** | 432 MB/s | 3421 MB/s | 45.26% |
+| **sylz -2** | 322 MB/s | 3245 MB/s | 44.20% |
+| misa77 0.6.0 -0 | 171 MB/s | 3963 MB/s | 44.60% |
+| zxc 0.15.0 -4 | 117 MB/s | 3421 MB/s | 43.43% |
+| zxc 0.15.0 -5 | 69.8 MB/s | 3454 MB/s | 40.83% |
+| sylz -3 | 73.7 MB/s | 3002 MB/s | 40.75% |
 
-Competitors measured with lzbench 2.4.1 (GCC 14.2) on the same core
-(† measured a session later, under more load: lz4 read 3080 MB/s in that
-run). How,
-and more numbers: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
+the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
 The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 
 ## Build
@@ -72,7 +72,7 @@ The current command line is minimal and its file format provisional:
 files it writes are not expected to open with later versions.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (levels -1 .. -12, -b MIB block size)
+out/syc c -1 file          # -> file.sylz (-1 .. -12, --fast=1/2, -b MIB block size)
 out/syc d file.sylz        # -> file
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
