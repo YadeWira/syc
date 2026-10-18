@@ -94,8 +94,47 @@ Same session as zstd (load ~6):
 | sylz -e -11 | 34.29% | 2032 MB/s | 57.37% | 1441 MB/s |
 | sylz -e -12 | 34.06% | 2080 MB/s | 57.26% | 1442 MB/s |
 
-Next: a faster Huffman decoder (two symbols per lookup), and coding the
-token and offset bytes too (order-0 per chunk promises ~30.5% at -12).
+### Where v3's decode time goes (2026-10-18, v0.2.5 levels, CPU 20)
+
+Decode only (sylzbench with SYLZ_LOAD), silesia.tar: v2 -10 3318 MB/s,
+v3 -10 2446. The parse is the same (ctrl 42.3 MB, 34.3 M literals);
+Huffman saves 12.7% of the literals, 2 points of ratio. perf on v3 -10:
+LZ decoder 61% (as fast as in v2), Huffman bulk loop 25%, table builds
+2%. The Huffman loop runs at IPC 2.35, 2.29 uops per cycle: **latency
+bound**, not uop bound. Each stream's chain (shift, mask, table load,
+length, add) is ~9-10 cycles per symbol; four streams give ~2.4 cycles
+per literal, ~1.4-1.6 GB/s of literals here, about what huff0's
+single-symbol decoder does on this generation.
+
+Literals as a share of the output: 30% at -0, 27% at -1, 15-16% at -8 to
+-10. At -1 Huffman saves 20% of them, at -10 13%.
+
+Minimum gain per chunk (decode only, silesia / mixed):
+
+| gain | -1 | decode | -8 | decode | mixed -1 | decode | mixed -8 | decode |
+|---|---|---|---|---|---|---|---|---|
+| 4% | 39.21% | 1686 | 34.82% | 2216 | 60.03% | 1264 | 57.60% | 1481 |
+| 8% | 39.30% | 1749 | 35.01% | 2378 | 60.39% | 1414 | 58.07% | 1751 |
+| 12% | 39.34% | 1765 | 35.25% | 2532 | 61.18% | 1585 | 58.73% | 1994 |
+| 16% | 40.48% | 2055 | 35.46% | 2631 | 62.71% | 1917 | 59.62% | 2263 |
+| 20% | 41.08% | 2205 | 35.74% | 2757 | 63.82% | 2148 | 60.01% | 2385 |
+| 25% | 41.35% | 2263 | 35.83% | 2774 | 64.71% | 2349 | 60.52% | 2536 |
+| v2 | 44.55% | 3295 | 36.60% | ~3300 | 65.59% | 3523 | 60.73% | 3416 |
+
+No knee: decode speed and ratio trade almost linearly.
+
+New bulk loop (kept): each stream keeps the 8 bytes at p in a register
+and a count of the bits taken; a symbol is a lookup at buf >> count, a
+reload moves p by count >> 3 bytes, five symbols per reload (7 + 5 * 11
+= 62 bits). With BMI2's shrx (bytes in a `db`, FPC 3.2 lacks BMI2;
+cpuid picks it at startup) +3-5% over the old loop; with shr cl the
+same as the old one. Fewer uops, but the chain is unchanged, so little
+gain. Eight streams would shorten the chain per literal but need 16
+registers (8 buffers, 8 counts) or the buffers in memory; estimated at
+best ~2.2 cycles per literal against 2.4.
+
+Two symbols per lookup: the literals average ~7 bits (13% saved at
+-10), so two rarely fit in an 11-bit index.
 
 ## sylz format v2
 

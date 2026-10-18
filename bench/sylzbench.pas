@@ -9,7 +9,9 @@
   MB/s with MB = 10^6 bytes (as lzbench), measured on the input size.
   Compression reuses one TSylzCtx across runs, as a long-lived caller would.
   SYLZ_DUMP=PREFIX writes each compressed block to PREFIX.LEVEL;
-  SYLZ_NOASM=1 uses the Pascal code paths only. }
+  SYLZ_LOAD=PREFIX decodes those blocks instead of compressing (compress
+  speed shows as 0); SYLZ_NOASM=1 uses the Pascal code paths only;
+  SYLZ_NOBMI2=1 the Huffman decoder without BMI2. }
 program sylzbench;
 
 {$mode objfpc}{$H+}
@@ -17,7 +19,7 @@ program sylzbench;
 uses
   {$ifdef unix}Linux, UnixType,{$endif}
   {$ifdef windows}Windows,{$endif}
-  SysUtils, Classes, Math, sylz;
+  SysUtils, Classes, Math, sylz, sylzhuf;
 
 function NowNs: UInt64;
 {$ifdef unix}
@@ -81,14 +83,29 @@ begin
 
     best := High(UInt64);
     total := 0;
-    repeat
-      t0 := NowNs;
-      csize := SylzCompressEx(ctx, @src[0], n, @cbuf[0], Length(cbuf), level, flags);
-      t1 := NowNs;
-      if t1 - t0 < best then
-        best := t1 - t0;
-      Inc(total, t1 - t0);
-    until total >= minNs;
+    if GetEnvironmentVariable('SYLZ_LOAD') <> '' then
+    begin
+      { decode only: the block SYLZ_DUMP wrote for this file and level }
+      with TFileStream.Create(Format('%s.%d', [GetEnvironmentVariable('SYLZ_LOAD'), level]), fmOpenRead) do
+      try
+        csize := Size;
+        if csize > Length(cbuf) then
+          SetLength(cbuf, csize);
+        ReadBuffer(cbuf[0], csize);
+      finally
+        Free;
+      end;
+      best := 0;
+    end
+    else
+      repeat
+        t0 := NowNs;
+        csize := SylzCompressEx(ctx, @src[0], n, @cbuf[0], Length(cbuf), level, flags);
+        t1 := NowNs;
+        if t1 - t0 < best then
+          best := t1 - t0;
+        Inc(total, t1 - t0);
+      until total >= minNs;
     if csize < 0 then
     begin
       WriteLn(StdErr, path, ': compression failed at level ', level);
@@ -101,7 +118,7 @@ begin
       finally
         Free;
       end;
-    Write(Format('sylz %-3d  %9.2f MB/s', [level, Speed(n, best)]));
+    Write(Format('sylz %-3d  %9.2f MB/s', [level, IfThen(best = 0, 0.0, Speed(n, best))]));
 
     FillChar(dbuf[0], n, 0);
     best := High(UInt64);
@@ -136,6 +153,8 @@ var
 begin
   flags := 0;
   levels := [1, 2, 4, 6, 9, 12];
+  if GetEnvironmentVariable('SYLZ_NOBMI2') <> '' then
+    HufUseBmi2 := False;
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
     SylzUseAsm := False;
 

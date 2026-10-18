@@ -48,6 +48,13 @@ function HufEncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeI
   corrupt. }
 function HufDecodeChunk(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
 
+var
+  { x86-64: decode with the assembler bulk loop, and in it BMI2's shrx
+    (set at startup from cpuid). Both can be cleared (tests, benchmarks);
+    unused on other targets. }
+  HufUseAsm: Boolean = True;
+  HufUseBmi2: Boolean = False;
+
 implementation
 
 {$if defined(CPUX86_64) and not defined(SYLZ_PUREPASCAL)}
@@ -426,8 +433,8 @@ end;
 type
   { In/out state of the assembler bulk decoder; fixed field order. }
   THufBulk = record
-    buf: array[0..3] of UInt64;   {   0: in/out }
-    cnt: array[0..3] of Int64;    {  32: in/out }
+    buf: array[0..3] of UInt64;   {   0: unused }
+    cnt: array[0..3] of Int64;    {  32: in/out, bits taken past p }
     p: array[0..3] of PByte;      {  64: in/out }
     table: Pointer;               {  96: in }
     out0: PByte;                  { 104: in/out, stream 0's next output }
@@ -437,15 +444,20 @@ type
   end;
   PHufBulk = ^THufBulk;
 
-{ The bulk loop of HufDecodeChunk: rounds of a refill and four symbols per
-  stream, until out0 passes outEnd or a refill would read past plimit (a
+{ The bulk loop of HufDecodeChunk: rounds of a reload and five symbols per
+  stream, until out0 passes outEnd or a reload would read past plimit (a
   round stops before decoding anything, so the streams stay in step).
-  Registers: r8-r11 bit buffers, rbp/r13-r15 bit counts, rdi table, rsi
-  stream 0/1 output, r12 stream 2/3 output, rbx stride q; rax, rcx, rdx
-  scratch. (rbp never addresses memory: FPC reads [rbp + n] as a frame
-  access.) The read pointers and limits live on the stack: they are only
-  touched at a refill, once per four symbols. }
-procedure HufBulkX64(st: PHufBulk); assembler; nostackframe;
+  Each stream keeps the eight bytes at p in a register and the bits taken
+  from them in a count (at most 7 + 5 * 11 = 62): a symbol is a table
+  lookup at buf >> count, and a reload moves p by whole bytes, so the
+  buffer itself is never shifted. Registers: r8-r11 buffers, rbp/r13-r15
+  counts, rdi table, rsi stream 0/1 output, r12 stream 2/3 output, rbx
+  stride q; rax, rcx, rdx scratch. (rbp never addresses memory: FPC reads
+  [rbp + n] as a frame access.) The read pointers and limits live on the
+  stack: they are only touched at a reload, once per five symbols.
+  HufBulkBmi2 shifts with shrx (one uop; written as bytes, FPC 3.2's
+  assembler lacks BMI2), HufBulkX64 with shr cl, for CPUs before BMI2. }
+procedure HufBulkBmi2(st: PHufBulk); assembler; nostackframe;
 asm
   push rbx
   push r12
@@ -463,7 +475,7 @@ asm
   sub rsp, 56
   mov [rsp + 48], rax             { state }
   mov rdx, [rax + 64]
-  mov [rsp], rdx                  { p0..p3 at [rsp + 8k] }
+  mov [rsp + 0], rdx                  { p0..p3 at [rsp + 8k] }
   mov rdx, [rax + 72]
   mov [rsp + 8], rdx
   mov rdx, [rax + 80]
@@ -474,10 +486,6 @@ asm
   mov [rsp + 32], rdx             { outEnd }
   mov rdx, [rax + 128]
   mov [rsp + 40], rdx             { plimit }
-  mov r8, [rax]
-  mov r9, [rax + 8]
-  mov r10, [rax + 16]
-  mov r11, [rax + 24]
   mov rbp, [rax + 32]
   mov r13, [rax + 40]
   mov r14, [rax + 48]
@@ -490,194 +498,170 @@ asm
 @round:
   cmp rsi, [rsp + 32]
   ja @done
-  { refill all four: buf |= load64(p) << cnt; p += (63 - cnt) >> 3; cnt |= 56 }
-  mov rdx, [rsp]
-  cmp rdx, [rsp + 40]
+  { reload: p += consumed >> 3; consumed &= 7; buf = load64(p) }
+  mov rax, rbp
+  shr rax, 3
+  add rax, [rsp + 0]
+  cmp rax, [rsp + 40]
   ja @done
-  mov rdx, [rsp + 8]
-  cmp rdx, [rsp + 40]
+  mov [rsp + 0], rax
+  and rbp, 7
+  mov r8, [rax]
+  mov rax, r13
+  shr rax, 3
+  add rax, [rsp + 8]
+  cmp rax, [rsp + 40]
   ja @done
-  mov rdx, [rsp + 16]
-  cmp rdx, [rsp + 40]
+  mov [rsp + 8], rax
+  and r13, 7
+  mov r9, [rax]
+  mov rax, r14
+  shr rax, 3
+  add rax, [rsp + 16]
+  cmp rax, [rsp + 40]
   ja @done
-  mov rdx, [rsp + 24]
-  cmp rdx, [rsp + 40]
+  mov [rsp + 16], rax
+  and r14, 7
+  mov r10, [rax]
+  mov rax, r15
+  shr rax, 3
+  add rax, [rsp + 24]
+  cmp rax, [rsp + 40]
   ja @done
-
-  mov rdx, [rsp]
-  mov rax, [rdx]
-  mov rcx, rbp
-  shl rax, cl
-  or r8, rax
-  mov eax, 63
-  sub eax, ecx
-  shr eax, 3
-  add rdx, rax
-  mov [rsp], rdx
-  or rbp, 56
-
-  mov rdx, [rsp + 8]
-  mov rax, [rdx]
-  mov rcx, r13
-  shl rax, cl
-  or r9, rax
-  mov eax, 63
-  sub eax, ecx
-  shr eax, 3
-  add rdx, rax
-  mov [rsp + 8], rdx
-  or r13, 56
-
-  mov rdx, [rsp + 16]
-  mov rax, [rdx]
-  mov rcx, r14
-  shl rax, cl
-  or r10, rax
-  mov eax, 63
-  sub eax, ecx
-  shr eax, 3
-  add rdx, rax
-  mov [rsp + 16], rdx
-  or r14, 56
-
-  mov rdx, [rsp + 24]
-  mov rax, [rdx]
-  mov rcx, r15
-  shl rax, cl
-  or r11, rax
-  mov eax, 63
-  sub eax, ecx
-  shr eax, 3
-  add rdx, rax
-  mov [rsp + 24], rdx
-  or r15, 56
-  mov eax, r8d
+  mov [rsp + 24], rax
+  and r15, 7
+  mov r11, [rax]
+  db $C4, $C2, $D3, $F7, $C0   { shrx rax, r8, rbp }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + 0], al
   movzx ecx, ah
-  shr r8, cl
-  sub rbp, rcx
-  mov eax, r9d
+  add rbp, rcx
+  db $C4, $C2, $93, $F7, $C1   { shrx rax, r9, r13 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + rbx + 0], al
   movzx ecx, ah
-  shr r9, cl
-  sub r13, rcx
-  mov eax, r10d
+  add r13, rcx
+  db $C4, $C2, $8B, $F7, $C2   { shrx rax, r10, r14 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + 0], al
   movzx ecx, ah
-  shr r10, cl
-  sub r14, rcx
-  mov eax, r11d
+  add r14, rcx
+  db $C4, $C2, $83, $F7, $C3   { shrx rax, r11, r15 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + rbx + 0], al
   movzx ecx, ah
-  shr r11, cl
-  sub r15, rcx
-  mov eax, r8d
+  add r15, rcx
+  db $C4, $C2, $D3, $F7, $C0   { shrx rax, r8, rbp }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + 1], al
   movzx ecx, ah
-  shr r8, cl
-  sub rbp, rcx
-  mov eax, r9d
+  add rbp, rcx
+  db $C4, $C2, $93, $F7, $C1   { shrx rax, r9, r13 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + rbx + 1], al
   movzx ecx, ah
-  shr r9, cl
-  sub r13, rcx
-  mov eax, r10d
+  add r13, rcx
+  db $C4, $C2, $8B, $F7, $C2   { shrx rax, r10, r14 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + 1], al
   movzx ecx, ah
-  shr r10, cl
-  sub r14, rcx
-  mov eax, r11d
+  add r14, rcx
+  db $C4, $C2, $83, $F7, $C3   { shrx rax, r11, r15 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + rbx + 1], al
   movzx ecx, ah
-  shr r11, cl
-  sub r15, rcx
-  mov eax, r8d
+  add r15, rcx
+  db $C4, $C2, $D3, $F7, $C0   { shrx rax, r8, rbp }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + 2], al
   movzx ecx, ah
-  shr r8, cl
-  sub rbp, rcx
-  mov eax, r9d
+  add rbp, rcx
+  db $C4, $C2, $93, $F7, $C1   { shrx rax, r9, r13 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + rbx + 2], al
   movzx ecx, ah
-  shr r9, cl
-  sub r13, rcx
-  mov eax, r10d
+  add r13, rcx
+  db $C4, $C2, $8B, $F7, $C2   { shrx rax, r10, r14 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + 2], al
   movzx ecx, ah
-  shr r10, cl
-  sub r14, rcx
-  mov eax, r11d
+  add r14, rcx
+  db $C4, $C2, $83, $F7, $C3   { shrx rax, r11, r15 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + rbx + 2], al
   movzx ecx, ah
-  shr r11, cl
-  sub r15, rcx
-  mov eax, r8d
+  add r15, rcx
+  db $C4, $C2, $D3, $F7, $C0   { shrx rax, r8, rbp }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + 3], al
   movzx ecx, ah
-  shr r8, cl
-  sub rbp, rcx
-  mov eax, r9d
+  add rbp, rcx
+  db $C4, $C2, $93, $F7, $C1   { shrx rax, r9, r13 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [rsi + rbx + 3], al
   movzx ecx, ah
-  shr r9, cl
-  sub r13, rcx
-  mov eax, r10d
+  add r13, rcx
+  db $C4, $C2, $8B, $F7, $C2   { shrx rax, r10, r14 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + 3], al
   movzx ecx, ah
-  shr r10, cl
-  sub r14, rcx
-  mov eax, r11d
+  add r14, rcx
+  db $C4, $C2, $83, $F7, $C3   { shrx rax, r11, r15 }
   and eax, HUF_TABLESIZE - 1
   movzx eax, word ptr [rdi + rax * 2]
   mov byte ptr [r12 + rbx + 3], al
   movzx ecx, ah
-  shr r11, cl
-  sub r15, rcx
-  add rsi, 4
-  add r12, 4
+  add r15, rcx
+  db $C4, $C2, $D3, $F7, $C0   { shrx rax, r8, rbp }
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 4], al
+  movzx ecx, ah
+  add rbp, rcx
+  db $C4, $C2, $93, $F7, $C1   { shrx rax, r9, r13 }
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 4], al
+  movzx ecx, ah
+  add r13, rcx
+  db $C4, $C2, $8B, $F7, $C2   { shrx rax, r10, r14 }
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 4], al
+  movzx ecx, ah
+  add r14, rcx
+  db $C4, $C2, $83, $F7, $C3   { shrx rax, r11, r15 }
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 4], al
+  movzx ecx, ah
+  add r15, rcx
+  add rsi, 5
+  add r12, 5
   jmp @round
 
 @done:
   mov rax, [rsp + 48]
-  mov [rax], r8
-  mov [rax + 8], r9
-  mov [rax + 16], r10
-  mov [rax + 24], r11
   mov [rax + 32], rbp
   mov [rax + 40], r13
   mov [rax + 48], r14
   mov [rax + 56], r15
-  mov rdx, [rsp]
+  mov rdx, [rsp + 0]
   mov [rax + 64], rdx
   mov rdx, [rsp + 8]
   mov [rax + 72], rdx
@@ -696,6 +680,293 @@ asm
   pop r13
   pop rbp
   pop r12
+  pop rbx
+end;
+
+procedure HufBulkX64(st: PHufBulk); assembler; nostackframe;
+asm
+  push rbx
+  push r12
+  push rbp
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  sub rsp, 56
+  mov [rsp + 48], rax             { state }
+  mov rdx, [rax + 64]
+  mov [rsp + 0], rdx                  { p0..p3 at [rsp + 8k] }
+  mov rdx, [rax + 72]
+  mov [rsp + 8], rdx
+  mov rdx, [rax + 80]
+  mov [rsp + 16], rdx
+  mov rdx, [rax + 88]
+  mov [rsp + 24], rdx
+  mov rdx, [rax + 120]
+  mov [rsp + 32], rdx             { outEnd }
+  mov rdx, [rax + 128]
+  mov [rsp + 40], rdx             { plimit }
+  mov rbp, [rax + 32]
+  mov r13, [rax + 40]
+  mov r14, [rax + 48]
+  mov r15, [rax + 56]
+  mov rdi, [rax + 96]
+  mov rsi, [rax + 104]
+  mov rbx, [rax + 112]
+  lea r12, [rsi + rbx * 2]
+
+@round:
+  cmp rsi, [rsp + 32]
+  ja @done
+  { reload: p += consumed >> 3; consumed &= 7; buf = load64(p) }
+  mov rax, rbp
+  shr rax, 3
+  add rax, [rsp + 0]
+  cmp rax, [rsp + 40]
+  ja @done
+  mov [rsp + 0], rax
+  and rbp, 7
+  mov r8, [rax]
+  mov rax, r13
+  shr rax, 3
+  add rax, [rsp + 8]
+  cmp rax, [rsp + 40]
+  ja @done
+  mov [rsp + 8], rax
+  and r13, 7
+  mov r9, [rax]
+  mov rax, r14
+  shr rax, 3
+  add rax, [rsp + 16]
+  cmp rax, [rsp + 40]
+  ja @done
+  mov [rsp + 16], rax
+  and r14, 7
+  mov r10, [rax]
+  mov rax, r15
+  shr rax, 3
+  add rax, [rsp + 24]
+  cmp rax, [rsp + 40]
+  ja @done
+  mov [rsp + 24], rax
+  and r15, 7
+  mov r11, [rax]
+  mov rcx, rbp
+  mov rax, r8
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 0], al
+  movzx ecx, ah
+  add rbp, rcx
+  mov rcx, r13
+  mov rax, r9
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 0], al
+  movzx ecx, ah
+  add r13, rcx
+  mov rcx, r14
+  mov rax, r10
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 0], al
+  movzx ecx, ah
+  add r14, rcx
+  mov rcx, r15
+  mov rax, r11
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 0], al
+  movzx ecx, ah
+  add r15, rcx
+  mov rcx, rbp
+  mov rax, r8
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 1], al
+  movzx ecx, ah
+  add rbp, rcx
+  mov rcx, r13
+  mov rax, r9
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 1], al
+  movzx ecx, ah
+  add r13, rcx
+  mov rcx, r14
+  mov rax, r10
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 1], al
+  movzx ecx, ah
+  add r14, rcx
+  mov rcx, r15
+  mov rax, r11
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 1], al
+  movzx ecx, ah
+  add r15, rcx
+  mov rcx, rbp
+  mov rax, r8
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 2], al
+  movzx ecx, ah
+  add rbp, rcx
+  mov rcx, r13
+  mov rax, r9
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 2], al
+  movzx ecx, ah
+  add r13, rcx
+  mov rcx, r14
+  mov rax, r10
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 2], al
+  movzx ecx, ah
+  add r14, rcx
+  mov rcx, r15
+  mov rax, r11
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 2], al
+  movzx ecx, ah
+  add r15, rcx
+  mov rcx, rbp
+  mov rax, r8
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 3], al
+  movzx ecx, ah
+  add rbp, rcx
+  mov rcx, r13
+  mov rax, r9
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 3], al
+  movzx ecx, ah
+  add r13, rcx
+  mov rcx, r14
+  mov rax, r10
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 3], al
+  movzx ecx, ah
+  add r14, rcx
+  mov rcx, r15
+  mov rax, r11
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 3], al
+  movzx ecx, ah
+  add r15, rcx
+  mov rcx, rbp
+  mov rax, r8
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + 4], al
+  movzx ecx, ah
+  add rbp, rcx
+  mov rcx, r13
+  mov rax, r9
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [rsi + rbx + 4], al
+  movzx ecx, ah
+  add r13, rcx
+  mov rcx, r14
+  mov rax, r10
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + 4], al
+  movzx ecx, ah
+  add r14, rcx
+  mov rcx, r15
+  mov rax, r11
+  shr rax, cl
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov byte ptr [r12 + rbx + 4], al
+  movzx ecx, ah
+  add r15, rcx
+  add rsi, 5
+  add r12, 5
+  jmp @round
+
+@done:
+  mov rax, [rsp + 48]
+  mov [rax + 32], rbp
+  mov [rax + 40], r13
+  mov [rax + 48], r14
+  mov [rax + 56], r15
+  mov rdx, [rsp + 0]
+  mov [rax + 64], rdx
+  mov rdx, [rsp + 8]
+  mov [rax + 72], rdx
+  mov rdx, [rsp + 16]
+  mov [rax + 80], rdx
+  mov rdx, [rsp + 24]
+  mov [rax + 88], rdx
+  mov [rax + 104], rsi
+  add rsp, 56
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop rbp
+  pop r12
+  pop rbx
+end;
+
+{ BMI2 (cpuid leaf 7, ebx bit 8) }
+function CpuHasBmi2: Boolean; assembler; nostackframe;
+asm
+  push rbx
+  xor eax, eax
+  cpuid
+  cmp eax, 7
+  jb @no
+  mov eax, 7
+  xor ecx, ecx
+  cpuid
+  mov eax, ebx
+  shr eax, 8
+  and eax, 1
+  pop rbx
+  ret
+@no:
+  xor eax, eax
   pop rbx
 end;
 {$endif}
@@ -755,47 +1026,59 @@ begin
   i := 0;
   bulkEnd := lastN - 4;
 {$ifdef HUF_ASM_X64}
-  if bulkEnd >= 0 then
+  if (lastN >= 5) and HufUseAsm then
   begin
     FillChar(bulk, SizeOf(bulk), 0);
     bulk.p[0] := p0; bulk.p[1] := p1; bulk.p[2] := p2; bulk.p[3] := p3;
     bulk.table := @t[0];
     bulk.out0 := d0;
     bulk.q := q;
-    bulk.outEnd := d0 + bulkEnd;
+    bulk.outEnd := d0 + lastN - 5;
     bulk.plimit := plimit;
-    HufBulkX64(@bulk);
-    b0 := bulk.buf[0]; b1 := bulk.buf[1]; b2 := bulk.buf[2]; b3 := bulk.buf[3];
-    c0 := bulk.cnt[0]; c1 := bulk.cnt[1]; c2 := bulk.cnt[2]; c3 := bulk.cnt[3];
-    p0 := bulk.p[0]; p1 := bulk.p[1]; p2 := bulk.p[2]; p3 := bulk.p[3];
+    if HufUseBmi2 then
+      HufBulkBmi2(@bulk)
+    else
+      HufBulkX64(@bulk);
     i := bulk.out0 - d0;
-  end;
-{$endif}
-  while (i <= bulkEnd) and (p0 <= plimit) and (p1 <= plimit) and (p2 <= plimit) and (p3 <= plimit) do
-  begin
-    b0 := b0 or (PUInt64(p0)^ shl c0); Inc(p0, (63 - c0) shr 3); c0 := c0 or 56;
-    b1 := b1 or (PUInt64(p1)^ shl c1); Inc(p1, (63 - c1) shr 3); c1 := c1 or 56;
-    b2 := b2 or (PUInt64(p2)^ shl c2); Inc(p2, (63 - c2) shr 3); c2 := c2 or 56;
-    b3 := b3 or (PUInt64(p3)^ shl c3); Inc(p3, (63 - c3) shr 3); c3 := c3 or 56;
+    { back to the exact readers: whole bytes taken move p, the rest are
+      dropped from a fresh buffer }
     for k := 0 to 3 do
     begin
-      v := t[b0 and (HUF_TABLESIZE - 1)]; d0[i + k] := Byte(v); b0 := b0 shr (v shr 8); Dec(c0, v shr 8);
-      v := t[b1 and (HUF_TABLESIZE - 1)]; d1[i + k] := Byte(v); b1 := b1 shr (v shr 8); Dec(c1, v shr 8);
-      v := t[b2 and (HUF_TABLESIZE - 1)]; d2[i + k] := Byte(v); b2 := b2 shr (v shr 8); Dec(c2, v shr 8);
-      v := t[b3 and (HUF_TABLESIZE - 1)]; d3[i + k] := Byte(v); b3 := b3 shr (v shr 8); Dec(c3, v shr 8);
+      r[k].p := bulk.p[k] + bulk.cnt[k] shr 3;
+      RdRefillSafe(r[k]);
+      r[k].buf := r[k].buf shr (bulk.cnt[k] and 7);
+      Dec(r[k].count, bulk.cnt[k] and 7);
     end;
-    Inc(i, 4);
+  end
+  else
+{$endif}
+  begin
+    while (i <= bulkEnd) and (p0 <= plimit) and (p1 <= plimit) and (p2 <= plimit) and (p3 <= plimit) do
+    begin
+      b0 := b0 or (PUInt64(p0)^ shl c0); Inc(p0, (63 - c0) shr 3); c0 := c0 or 56;
+      b1 := b1 or (PUInt64(p1)^ shl c1); Inc(p1, (63 - c1) shr 3); c1 := c1 or 56;
+      b2 := b2 or (PUInt64(p2)^ shl c2); Inc(p2, (63 - c2) shr 3); c2 := c2 or 56;
+      b3 := b3 or (PUInt64(p3)^ shl c3); Inc(p3, (63 - c3) shr 3); c3 := c3 or 56;
+      for k := 0 to 3 do
+      begin
+        v := t[b0 and (HUF_TABLESIZE - 1)]; d0[i + k] := Byte(v); b0 := b0 shr (v shr 8); Dec(c0, v shr 8);
+        v := t[b1 and (HUF_TABLESIZE - 1)]; d1[i + k] := Byte(v); b1 := b1 shr (v shr 8); Dec(c1, v shr 8);
+        v := t[b2 and (HUF_TABLESIZE - 1)]; d2[i + k] := Byte(v); b2 := b2 shr (v shr 8); Dec(c2, v shr 8);
+        v := t[b3 and (HUF_TABLESIZE - 1)]; d3[i + k] := Byte(v); b3 := b3 shr (v shr 8); Dec(c3, v shr 8);
+      end;
+      Inc(i, 4);
+    end;
+    r[0].buf := b0; r[0].count := c0; r[0].p := p0;
+    r[1].buf := b1; r[1].count := c1; r[1].p := p1;
+    r[2].buf := b2; r[2].count := c2; r[2].p := p2;
+    r[3].buf := b3; r[3].count := c3; r[3].p := p3;
+    { the bulk refill loads 8 bytes but counts at most 63 - count bits of
+      them, so the bits past count are not reliable: clear them before the
+      exact tail refills }
+    for k := 0 to 3 do
+      if r[k].count < 64 then
+        r[k].buf := r[k].buf and ((UInt64(1) shl r[k].count) - 1);
   end;
-  r[0].buf := b0; r[0].count := c0; r[0].p := p0;
-  r[1].buf := b1; r[1].count := c1; r[1].p := p1;
-  r[2].buf := b2; r[2].count := c2; r[2].p := p2;
-  r[3].buf := b3; r[3].count := c3; r[3].p := p3;
-  { the bulk refill loads 8 bytes but counts at most 63 - count bits of
-    them, so the bits past count are not reliable: clear them before the
-    exact tail refills }
-  for k := 0 to 3 do
-    if r[k].count < 64 then
-      r[k].buf := r[k].buf and ((UInt64(1) shl r[k].count) - 1);
   d[0] := d0; d[1] := d1; d[2] := d2; d[3] := d3;
 
   { tail: one symbol at a time, exact refills }
@@ -819,4 +1102,8 @@ begin
   Result := r[3].p - src - r[3].count div 8;
 end;
 
+{$ifdef HUF_ASM_X64}
+initialization
+  HufUseBmi2 := CpuHasBmi2;
+{$endif}
 end.
