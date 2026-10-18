@@ -177,7 +177,7 @@ int main(int argc, char** argv)
     if (!C) return 1;
     CHECK(C->abi == 1, "abi %d", C->abi);
     CHECK(C->name && strcmp(C->name, "sylz") == 0, "name %s", C->name ? C->name : "(null)");
-    CHECK(C->min_level == -2 && C->max_level == 12, "levels %d..%d", C->min_level, C->max_level);
+    CHECK(C->min_level == 0 && C->max_level == 10, "levels %d..%d", C->min_level, C->max_level);
     CHECK(C->bound && C->compress && C->decompress, "missing function");
     CHECK(C->query == NULL && C->data == NULL, "query/data should be NULL");
     CHECK(C->bound((size_t)1 << 31, 1) == 0, "bound for a 2 GiB block should be 0");
@@ -202,7 +202,7 @@ int main(int argc, char** argv)
     for (int t = 0; t < THREADS; t++) {
         jobs[t].src = data[t % nfiles];
         jobs[t].n = sizes[t % nfiles];
-        jobs[t].level = -2 + t % 4 * 4;  /* -2, 2, 6, 10 */
+        jobs[t].level = t % 4 * 3;       /* 0, 3, 6, 9 */
         jobs[t].bad = 0;
 #ifdef _WIN32
         th[t] = CreateThread(NULL, 0, worker, &jobs[t], 0, NULL);

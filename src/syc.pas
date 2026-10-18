@@ -66,12 +66,12 @@ procedure Usage;
 begin
   WriteLn('syc ', SYC_VERSION, ' — sylz file compressor (minimal CLI, provisional format)');
   WriteLn;
-  WriteLn('  syc c [-LEVEL | --fast=N] [-b MIB] INPUT [OUTPUT]');
+  WriteLn('  syc c [-LEVEL] [-e] [-b MIB] INPUT [OUTPUT]');
   WriteLn('                                           compress (default OUTPUT = INPUT', SUFFIX, ')');
   WriteLn('  syc d INPUT [OUTPUT]                     decompress (default OUTPUT = INPUT without ', SUFFIX, ')');
   WriteLn;
-  WriteLn('  -LEVEL    1 (default) .. ', SYLZ_MAXLEVEL, ' (best ratio); 1-2 single hash, 3+ hash chains');
-  WriteLn('  --fast=N  faster still, N = 1..', -SYLZ_MINLEVEL, ' (worse ratio)');
+  WriteLn('  -LEVEL    0 (fastest) .. ', SYLZ_MAXLEVEL, ' (best ratio), default ', SYLZ_DEFLEVEL,
+    ': 0-2 single hash, 3-8 hash chains, 9-10 optimal parsing');
   WriteLn('  -e        entropy-coded literals (sylz format v3): smaller, slower to decode');
   WriteLn('  -b MIB  block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
@@ -259,7 +259,7 @@ begin
     Exit;
   end;
 
-  level := 1;
+  level := SYLZ_DEFLEVEL;
   flags := 0;
   blockMiB := DEFAULT_BLOCK shr 20;
   inPath := '';
@@ -268,13 +268,7 @@ begin
   while i <= ParamCount do
   begin
     arg := ParamStr(i);
-    if Copy(arg, 1, 7) = '--fast=' then
-    begin
-      if not TryStrToInt(Copy(arg, 8, MaxInt), level) or (level < 1) or (level > -SYLZ_MINLEVEL) then
-        Die(Format('--fast takes 1..%d', [-SYLZ_MINLEVEL]));
-      level := -level;
-    end
-    else if arg = '-e' then
+    if arg = '-e' then
       flags := flags or SYLZ_ENTROPY
     else if arg = '-b' then
     begin
@@ -285,8 +279,8 @@ begin
     end
     else if (Length(arg) > 1) and (arg[1] = '-') then
     begin
-      if not TryStrToInt(Copy(arg, 2, MaxInt), level) or (level < 1) or (level > SYLZ_MAXLEVEL) then
-        Die(Format('unknown option %s (levels are -1..-%d)', [arg, SYLZ_MAXLEVEL]));
+      if not TryStrToInt(Copy(arg, 2, MaxInt), level) or (level < SYLZ_MINLEVEL) or (level > SYLZ_MAXLEVEL) then
+        Die(Format('unknown option %s (levels are -%d..-%d)', [arg, SYLZ_MINLEVEL, SYLZ_MAXLEVEL]));
     end
     else if inPath = '' then
       inPath := arg

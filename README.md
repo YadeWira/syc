@@ -26,10 +26,10 @@ literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
 Format v3 (`-e`, experimental) adds Huffman-coded literals, in 64 KiB
 chunks with four interleaved streams; a v2 block is a valid v3 block.
-`--fast=2`, `--fast=1`, `-1` and `-2` are greedy single-hash levels (the
-hash table doubles at each step); `-3` to `-10` use hash chains with lazy
-matching; `-11` and `-12` an optimal parser whose prices include decode
-time, so it picks cheaper sequences: `-11` decodes fastest of all levels. The decoder is safe on corrupt input. Hot
+Eleven levels, `-0` to `-10` (default `-1`): `-0` to `-2` are greedy
+single-hash levels (a bigger hash table at each step); `-3` to `-8` use
+hash chains with lazy matching; `-9` and `-10` an optimal parser whose
+prices include decode time, so it picks cheaper sequences. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
@@ -95,7 +95,7 @@ The current command line is minimal and its file format provisional:
 files it writes are not expected to open with later versions.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (-1 .. -12, --fast=1/2, -e, -b MIB block size)
+out/syc c -1 file          # -> file.sylz (-0 .. -10, -e, -b MIB block size)
 out/syc d file.sylz        # -> file
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```

@@ -174,7 +174,7 @@ begin
   else
     n := RandBelow(400000);
   end;
-  level := SYLZ_MINLEVEL + RandBelow(SYLZ_MAXLEVEL - SYLZ_MINLEVEL + 1);   { 0 = default }
+  level := SYLZ_MINLEVEL + RandBelow(SYLZ_MAXLEVEL - SYLZ_MINLEVEL + 1);
 
   input := GuardedAlloc(n);
   MakeInput(input.p, n);
