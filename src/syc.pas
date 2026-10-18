@@ -20,7 +20,7 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.2';
+  SYC_VERSION   = '0.2.3';
   MAGIC         = 'SYZ0';
   FORMAT_VER    = 1;   { 1: sylz format v2 blocks (0 was v1, syc 0.2.0-0.2.1) }
   STORED_FLAG   = UInt32($80000000);
