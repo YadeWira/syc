@@ -10,64 +10,101 @@ ultra-fast-lzma2 (high ratio).
 ## Layout
 
 - `src/sylz.pas` — fast LZ codec
-- `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output
-- `bench/lz4xcheck.c` — decodes a sylz v0 stream with the reference LZ4 decoder
+- `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output;
+  `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`
+- `bench/sylzstats.pas` — literal/match/offset histograms of a block
 - `tests/sylzfuzz.pas` — roundtrip + corrupt/truncated input, guard-page buffers
 - `build.sh` — builds the benchmark into `out/`
 
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, and `lzbench/` built from source).
 
-## sylz format v0
+## sylz format v1
 
-Deliberately LZ4-shaped, to measure Free Pascal's codegen against C before
-the format gets ideas of its own. It is byte-compatible with the LZ4 block
-format: `LZ4_decompress_safe` decodes sylz v0 streams (checked on
-silesia.tar at levels 1 and 9).
+`ctrlLen:u32le, control[ctrlLen], literals[...]`. Control entries are a
+token (3 bits literal length, 5 bits match length - 4; all-ones = extended)
+and a 16-bit `distance - 1`, then 255-run extensions if any. Literals are a
+separate stream; what is left after the last sequence is the block's tail.
+Full description at the top of `src/sylz.pas`.
+
+Why: the next token is always 3 bytes on, whatever the literal length, so
+the decoder's next loads don't wait on the current sequence (the idea
+misa77's light format is built on). The bit split comes from measured
+distributions on silesia.tar with the v0 parser: 0..6 literals cover
+92.8-94.5% of sequences, matches of 4..34 bytes 94.9-97.3% (4..18, LZ4's
+nibble, only 86.5-92.6%). Offsets under 16 are 1.6-2.3% of matches, so they
+stay allowed behind a rarely taken branch. Repeat offsets are 2.6-4.6%:
+with a fixed-size control entry they would save nothing, left for a later
+format.
+
+v0 (LZ4 block layout, kept in git history before 2026-10-17 22:00) was the
+calibration step: `LZ4_decompress_safe` decoded its streams, and on them
+the Pascal decoder ran at 72-76% of the C one.
 
 ## FPC codegen findings
 
+All on FPC 3.2.2 x86_64, checked with `fpc -O3 -al` (count `(%rsp)`
+references in the routine).
+
 - `UInt32 * UInt32` is evaluated in 64 bits on x86_64: truncate with
   `UInt32(...)` before shifting a multiplicative hash.
-- The decoder's speed is decided by register allocation. FPC 3.2.2 has 14
-  usable GPRs and, when they run out, spills the hottest variable (`ip`)
-  first. -O4, -OoUSERBP and -OoREGVAR don't change it. What works:
-  - no calls in the hot loop (a single `Move` forces every live value into
-    the 5 callee-saved registers); the exact tail decoder is a separate
-    function;
-  - a small live set: no saved sequence start, copy loops count the length
-    down instead of keeping an end pointer, one variable reused as scratch.
-  Check with `fpc -O3 -al` and count `(%rsp)` references in the loop.
+- Register allocation decides the speed, and FPC gives a variable one
+  location for the whole routine (no live-range splitting), so the
+  routine's total variable count is what matters, inlined callees'
+  locals included.
+- A routine that makes any call keeps its variables only in the 5
+  callee-saved registers (rbx, r12-r15). One `Move` in a hot loop is
+  enough to push the rest to the stack.
+- Passing a local by `var`, even to an `inline` function, pins it to the
+  stack.
+- Records larger than a register always live in memory. That is a tool:
+  put values used only in comparisons (loop limits) in a record and the
+  registers go to the pointers on the critical path.
+- try/finally and managed locals (dynamic arrays) add an fpc_setjmp
+  exception frame; the compressor loop kept nearly every local on the
+  stack with one. Allocate in a wrapper, run the loop on raw pointers.
+- The goto version of the fast compressor kept more locals on the stack
+  (127 vs 104 references) and ran at 226 vs 273 MB/s.
+- -O4, -OoUSERBP and -OoREGVAR made no difference to these loops.
 
 ## Measurements
 
 silesia.tar (211,957,760 bytes), one block, single thread pinned with
-`taskset`, Xeon E5-2697A v4 (Broadwell, 2.6 GHz). Shared machine: expect a
-few percent of noise.
+`taskset`, Xeon E5-2697A v4 (Broadwell, 2.6 GHz). Shared machine: runs
+vary by up to ~10%.
 
-2026-10-17, lzbench 2.4.1 (GCC 14.2):
+2026-10-17 22:00, first levels, lzbench 2.4.1 (GCC 14.2):
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 511 MB/s | 3223 MB/s | 47.59 |
+| lz4 1.10.0 | 515 MB/s | 3105 MB/s | 47.59 |
+| lz4 --fast -4 | 613 MB/s | 3169 MB/s | 51.45 |
+| misa77 --1 | 260 MB/s | 3746 MB/s | 46.74 |
+| misa77 -0 | 157 MB/s | 3907 MB/s | 44.60 |
+| misa77 -1 | 50.4 MB/s | 4101 MB/s | 42.64 |
+| lizard -10 | 433 MB/s | 2965 MB/s | 48.78 |
+| zstd -1 | 345 MB/s | 1135 MB/s | 34.53 |
+| zstd --fast=1 | 397 MB/s | 1405 MB/s | 41.01 |
+| **sylz v1 -1** | 269 MB/s | 2347 MB/s | 44.69 |
+| **sylz v1 -2** | 78 MB/s | 2257 MB/s | 41.05 |
+| **sylz v1 -9** | 22.6 MB/s | 2493 MB/s | 36.88 |
+
+Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
+2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,
+44.08%; 2^16 194 MB/s, 43.74%. With lz4's table size (2^12) the ratio
+matches lz4's, at 55% of its compression speed: the gap is codegen.
+
+Earlier, 2026-10-17 21:05 (v0):
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
 | lz4hc -9 | 27.9 MB/s | 2977 MB/s | 36.75 |
 | lz4hc -12 | 8.98 MB/s | 2889 MB/s | 36.45 |
-| misa77 -1 | 48.7 MB/s | 3899 MB/s | 42.64 |
 | misa77 -3 | 10.3 MB/s | 3517 MB/s | 37.76 |
-| lizard -10 | 391 MB/s | 2679 MB/s | 48.78 |
 | lizard -19 | 3.61 MB/s | 2720 MB/s | 36.52 |
-| zstd -1 | 311 MB/s | 996 MB/s | 34.53 |
-| **sylz -1** | 172 MB/s | 1663 MB/s | 45.52 |
-| **sylz -9** | 21.3 MB/s | 2238 MB/s | 37.13 |
-| **sylz -12** | 12.2 MB/s | ~2200 MB/s | 37.05 |
+| sylz v0 -1 | 172 MB/s | 1663 MB/s | 45.52 |
+| sylz v0 -9 | 21.3 MB/s | 2238 MB/s | 37.13 |
 
-Same stream, two decoders (codegen only):
-
-| stream | LZ4 C decoder | sylz Pascal decoder | Pascal / C |
-|---|---|---|---|
-| sylz -1 | 2322 MB/s | 1663 MB/s | 72 % |
-| sylz -9 | 2937 MB/s | 2238 MB/s | 76 % |
-
-Decoder history on sylz -9: 830 MB/s (first version, `ip`/`op` on the
-stack) → 2031 (call-free fast loop) → 1385 (small-offset copy pushed `ip`
-back to the stack) → 2095 (smaller live set).
+Decoder history on level 9: v0 830 MB/s (`ip`/`op` on the stack) → 2031
+(call-free fast loop) → 2095 (smaller live set); v1 1834 (ll/ml passed by
+var) → 2210 (extensions written inline) → 2458 (limits moved to a record).

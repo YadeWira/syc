@@ -1,21 +1,26 @@
 { sylz — syc fast LZ codec.
 
-  Format v0 (one block = one call; the caller stores the decoded size):
+  Format v1 (one block = one call; the caller stores the decoded size):
 
-    sequence := token [litlen-ext] literals [offset16 [matchlen-ext]]
-    token    := high nibble literal length (15 = extended),
-                low nibble  match length - SYLZ_MINMATCH (15 = extended)
-    ext      := bytes added to the nibble; 255 means "another byte follows"
-    offset16 := little-endian distance back from the current output, 1..65535
+    block    := ctrlLen:u32le  control[ctrlLen]  literals[...]
+    control  := sequence*
+    sequence := token  offset:u16le  [litlen-ext]  [matchlen-ext]
+    token    := bits 7..5  literal length 0..6, 7 = extended
+                bits 4..0  match length - SYLZ_MINMATCH, 0..30; 31 = extended
+    offset   := distance - 1, so distances run 1..65536
+    ext      := bytes added to the field's maximum; 255 means "another
+                byte follows"
 
-  The last sequence carries literals only: the block ends right after them.
-  The encoder keeps the last SYLZ_LASTLITERALS bytes as literals and starts no
-  match within SYLZ_MFLIMIT bytes of the end, so the decoder's fast copies
-  (which may write up to 15 bytes past a sequence) stay inside the block in
-  the common case; near the end it falls back to exact copies.
+  Literals live in their own stream, in order. Each sequence takes its
+  literals from the front of that stream, then copies its match; whatever
+  is left in the literal stream after the last sequence is the block's
+  tail.
 
-  v0 is deliberately LZ4-shaped: it exists to measure how much Free Pascal's
-  codegen costs against the C reference before the format gets its own ideas. }
+  Why two streams: the next token is always 3 bytes further on (plus the
+  rare extension), whatever the literal length, so the decoder's loads for
+  the next sequence don't wait on the current one. The 3/5 bit split fits
+  the measured distributions (silesia.tar, see NOTES.md): 0..6 literals
+  cover 93-94% of sequences, 4..34 match bytes 95-97%. }
 unit sylz;
 
 {$mode objfpc}{$H+}
@@ -26,11 +31,9 @@ unit sylz;
 interface
 
 const
-  SYLZ_MINMATCH     = 4;
-  SYLZ_LASTLITERALS = 5;
-  SYLZ_MFLIMIT      = 12;
-  SYLZ_MAXDIST      = 65535;
-  SYLZ_MAXLEVEL     = 12;
+  SYLZ_MINMATCH = 4;
+  SYLZ_MAXDIST  = 65536;
+  SYLZ_MAXLEVEL = 12;
 
 { Worst-case compressed size of n input bytes. }
 function SylzBound(n: SizeInt): SizeInt;
@@ -49,14 +52,21 @@ function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): Si
 implementation
 
 const
-  FAST_HASHLOG = 16;
+  HEADER_SIZE  = 4;
+  LIT_FIELD    = 7;     { literal length field: 0..6 inline, 7 = extended }
+  ML_FIELD     = 31;    { match length field: 0..30 inline, 31 = extended }
+  SEARCH_TAIL  = 12;    { no match search within this many bytes of the end }
+  FAST_HASHLOG = 14;
+  SKIP_STRENGTH = 6;
   HC_HASHLOG   = 17;
-  HC_CHAINSIZE = 1 shl 16;   { power of two > SYLZ_MAXDIST }
+  HC_MAXDIST   = 65535; { chain deltas are UInt16 }
+  HC_CHAINSIZE = 1 shl 16;
   HC_CHAINMASK = HC_CHAINSIZE - 1;
+  SCRATCH_SLACK = 16;   { literal scratch overshoot room for Copy16 }
 
 function SylzBound(n: SizeInt): SizeInt;
 begin
-  Result := n + n div 255 + 16;
+  Result := HEADER_SIZE + n + n div 255 + 16;
 end;
 
 function Read32(p: PByte): UInt32; inline;
@@ -85,6 +95,17 @@ begin
   { FPC widens UInt32*UInt32 to the native int on 64-bit targets: truncate
     before shifting or the high bits leak into the index }
   Result := UInt32(v * UInt32(2654435761)) shr (32 - hashLog);
+end;
+
+{ Hash of the 4 or 5 bytes at p for the fast level: 5 bytes on 64-bit
+  targets (fewer false candidates), 4 where a 64-bit multiply is costly. }
+function HashFast(p: PByte): UInt32; inline;
+begin
+{$ifdef CPU64}
+  Result := UInt32((Read64(p) shl 24) * UInt64(889523592379) shr (64 - FAST_HASHLOG));
+{$else}
+  Result := Hash4(Read32(p), FAST_HASHLOG);
+{$endif}
 end;
 
 { Length of the common prefix of a and b, not reading at or past limit
@@ -116,116 +137,180 @@ end;
 
 { ── encoder output ───────────────────────────────────────────────────────── }
 
-{ Writes one sequence. litLen literals start at lit; matchLen = 0 means the
-  final, literals-only sequence. Returns false when dst would overflow. }
-function EmitSequence(var op: PByte; oend: PByte; lit: PByte; litLen: SizeInt;
-  offset, matchLen: SizeInt): Boolean; inline;
-var
-  token: PByte;
-  l: SizeInt;
+type
+  { The control stream is written straight into dst (after the header);
+    literals go to a scratch buffer and are appended when the block ends. }
+  TEmit = record
+    dst, ctrl, oend: PByte;
+    lits, lit: PByte;
+    srcEnd: PByte;    { end of the input: bounds the wide literal reads }
+  end;
+
+procedure EmitInit(out e: TEmit; dst: PByte; cap: SizeInt; scratch, srcEnd: PByte);
 begin
-  Result := False;
-  { token + literal ext + literals + offset + match ext, worst case }
-  if op + 1 + litLen div 255 + 1 + litLen + 2 + matchLen div 255 + 1 > oend then
-    Exit;
-  token := op;
-  Inc(op);
-  if litLen >= 15 then
+  e.srcEnd := srcEnd;
+  e.dst := dst;
+  e.ctrl := dst + HEADER_SIZE;
+  e.oend := dst + cap;
+  e.lits := scratch;
+  e.lit := scratch;
+end;
+
+procedure PutExt(var p: PByte; v: SizeInt); inline;
+begin
+  while v >= 255 do
   begin
-    token^ := 15 shl 4;
-    l := litLen - 15;
-    while l >= 255 do
-    begin
-      op^ := 255;
-      Inc(op);
-      Dec(l, 255);
-    end;
-    op^ := Byte(l);
-    Inc(op);
-  end
+    p^ := 255;
+    Inc(p);
+    Dec(v, 255);
+  end;
+  p^ := Byte(v);
+  Inc(p);
+end;
+
+{ One sequence: litLen literals starting at lit, then a match. Returns false
+  when the block would no longer fit in dst. }
+{ Not inline on purpose: inlined, its locals and its Move call add to the
+  compressor loop's register pressure, and that loop is the hotter one
+  (measured: 273 -> 285 MB/s at level 1). }
+function EmitSequence(var e: TEmit; lit: PByte; litLen, dist, matchLen: SizeInt): Boolean;
+var
+  l, m: SizeInt;
+  p: PByte;
+begin
+  { control so far + this entry, worst case + all literals so far }
+  if e.ctrl + 3 + litLen div 255 + 1 + matchLen div 255 + 1
+     + (e.lit - e.lits) + litLen > e.oend then
+    Exit(False);
+  m := matchLen - SYLZ_MINMATCH;
+  if litLen < LIT_FIELD then l := litLen else l := LIT_FIELD;
+  if m >= ML_FIELD then
+    e.ctrl[0] := Byte((l shl 5) or ML_FIELD)
   else
-    token^ := Byte(litLen shl 4);
-  Move(lit^, op^, litLen);
-  Inc(op, litLen);
-  if matchLen = 0 then
-    Exit(True);
-  op[0] := Byte(offset);
-  op[1] := Byte(offset shr 8);
-  Inc(op, 2);
-  l := matchLen - SYLZ_MINMATCH;
-  if l >= 15 then
-  begin
-    token^ := token^ or 15;
-    Dec(l, 15);
-    while l >= 255 do
-    begin
-      op^ := 255;
-      Inc(op);
-      Dec(l, 255);
-    end;
-    op^ := Byte(l);
-    Inc(op);
-  end
+    e.ctrl[0] := Byte((l shl 5) or m);
+  e.ctrl[1] := Byte(dist - 1);
+  e.ctrl[2] := Byte((dist - 1) shr 8);
+  p := e.ctrl + 3;
+  if litLen >= LIT_FIELD then
+    PutExt(p, litLen - LIT_FIELD);
+  if m >= ML_FIELD then
+    PutExt(p, m - ML_FIELD);
+  e.ctrl := p;
+  { the scratch buffer has SCRATCH_SLACK spare bytes }
+  if (litLen <= 16) and (lit + 16 <= e.srcEnd) then
+    Copy16(e.lit, lit)
   else
-    token^ := token^ or Byte(l);
+    Move(lit^, e.lit^, litLen);
+  Inc(e.lit, litLen);
   Result := True;
 end;
 
-{ ── level 1: greedy, single hash table ───────────────────────────────────── }
-
-function CompressFast(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+{ Appends the block's tail literals and the literal stream; returns the
+  block size or -1. }
+function EmitFinish(var e: TEmit; lit: PByte; litLen: SizeInt): SizeInt;
 var
-  table: array of UInt32;
-  ip, anchor, iend, mflimit, matchlimit, ref, op, oend: PByte;
-  h: UInt32;
-  len, step, misses: SizeInt;
+  ctrlLen, litTotal: SizeInt;
 begin
-  op := dst;
-  oend := dst + cap;
+  ctrlLen := e.ctrl - (e.dst + HEADER_SIZE);
+  litTotal := (e.lit - e.lits) + litLen;
+  if e.ctrl + litTotal > e.oend then
+    Exit(-1);
+  PUInt32(e.dst)^ := UInt32(ctrlLen);
+  Move(e.lits^, e.ctrl^, e.lit - e.lits);
+  Move(lit^, (e.ctrl + (e.lit - e.lits))^, litLen);
+  Result := HEADER_SIZE + ctrlLen + litTotal;
+end;
+
+{ ── level 1: greedy, single hash table, accelerating skip ────────────────── }
+
+{ The hot loops take raw, preallocated buffers and leave allocation to a
+  wrapper: a try/finally or a managed local (dynamic array) gives a routine
+  an exception frame built on fpc_setjmp, and with one the compressor loop
+  kept nearly every local on the stack. }
+function CompressFastCore(src: PByte; n: SizeInt; var e: TEmit; table: PUInt32): SizeInt;
+{ (written without labels/goto: the goto version kept more of its locals
+  on the stack, 127 vs 104 references, and ran at 226 vs 273 MB/s) }
+var
+  ip, anchor, iend, mflimit, ref, fwd: PByte;
+  h, fwdH: UInt32;
+  len, step, probes: SizeInt;
+begin
   anchor := src;
   iend := src + n;
-  if n >= SYLZ_MFLIMIT + 1 then
+  ref := src;   { only read after a successful probe; silences a warning }
+  if n >= SEARCH_TAIL + 1 then
   begin
-    SetLength(table, 1 shl FAST_HASHLOG);   { zero-filled: position 0 }
-    mflimit := iend - SYLZ_MFLIMIT;
-    matchlimit := iend - SYLZ_LASTLITERALS;
+    mflimit := iend - SEARCH_TAIL;
     ip := src + 1;
-    misses := 0;
-    while ip < mflimit do
+    fwdH := HashFast(ip);
+    while True do
     begin
-      h := Hash4(Read32(ip), FAST_HASHLOG);
-      ref := src + table[h];
-      table[h] := UInt32(ip - src);
-      if (ip - ref <= SYLZ_MAXDIST) and (Read32(ref) = Read32(ip)) then
+      { find a match; the probe step grows with the number of misses }
+      fwd := ip;
+      step := 1;
+      probes := 1 shl SKIP_STRENGTH;
+      repeat
+        h := fwdH;
+        ip := fwd;
+        Inc(fwd, step);
+        step := probes shr SKIP_STRENGTH;
+        Inc(probes);
+        if fwd > mflimit then
+          Break;
+        ref := src + table[h];
+        fwdH := HashFast(fwd);
+        table[h] := UInt32(ip - src);
+      until (ip - ref <= SYLZ_MAXDIST) and (Read32(ref) = Read32(ip));
+      if fwd > mflimit then
+        Break;
+
+      while (ip > anchor) and (ref > src) and (ip[-1] = ref[-1]) do
       begin
-        while (ip > anchor) and (ref > src) and (ip[-1] = ref[-1]) do
-        begin
-          Dec(ip);
-          Dec(ref);
-        end;
-        len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, matchlimit);
-        if not EmitSequence(op, oend, anchor, ip - anchor, ip - ref, len) then
+        Dec(ip);
+        Dec(ref);
+      end;
+
+      { emit, then chain straight into a match at the next position: it
+        needs no literals }
+      repeat
+        len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, iend);
+        if not EmitSequence(e, anchor, ip - anchor, ip - ref, len) then
           Exit(-1);
         Inc(ip, len);
         anchor := ip;
-        if ip < mflimit then
-          table[Hash4(Read32(ip - 2), FAST_HASHLOG)] := UInt32(ip - 2 - src);
-        misses := 0;
-      end
-      else
-      begin
-        { skip faster through incompressible stretches: the step grows with
-          the number of failed probes, not the distance (that would be
-          quadratic and skip whole files) }
-        step := 1 + misses shr 6;
-        Inc(misses);
-        Inc(ip, step);
-      end;
+        if ip > mflimit then
+          Break;
+        table[HashFast(ip - 2)] := UInt32(ip - 2 - src);
+        h := HashFast(ip);
+        ref := src + table[h];
+        table[h] := UInt32(ip - src);
+      until (ip - ref > SYLZ_MAXDIST) or (Read32(ref) <> Read32(ip));
+      if ip > mflimit then
+        Break;
+
+      Inc(ip);
+      fwdH := HashFast(ip);
     end;
   end;
-  if not EmitSequence(op, oend, anchor, iend - anchor, 0, 0) then
-    Exit(-1);
-  Result := op - dst;
+  Result := EmitFinish(e, anchor, iend - anchor);
+end;
+
+function CompressFast(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+var
+  e: TEmit;
+  scratch: PByte;
+  table: PUInt32;
+begin
+  scratch := GetMem(n + SCRATCH_SLACK);
+  table := GetMem(SizeOf(UInt32) shl FAST_HASHLOG);
+  try
+    FillChar(table^, SizeOf(UInt32) shl FAST_HASHLOG, 0);   { position 0 }
+    EmitInit(e, dst, cap, scratch, src + n);
+    Result := CompressFastCore(src, n, e, table);
+  finally
+    FreeMem(table);
+    FreeMem(scratch);
+  end;
 end;
 
 { ── levels 2+: hash chains, lazy matching ────────────────────────────────── }
@@ -233,8 +318,8 @@ end;
 type
   THcState = record
     src: PByte;
-    head: array of Int32;     { last position with this hash, -1 = none }
-    chain: array of UInt16;   { distance to the previous position with the same hash }
+    head: PInt32;             { last position with this hash, -1 = none }
+    chain: PUInt16;           { distance to the previous position with the same hash }
     nextToInsert: SizeInt;
     attempts: Integer;
   end;
@@ -250,7 +335,7 @@ begin
     h := Hash4(Read32(s.src + i), HC_HASHLOG);
     prev := s.head[h];
     delta := i - prev;
-    if (prev < 0) or (delta > SYLZ_MAXDIST) then
+    if (prev < 0) or (delta > HC_MAXDIST) then
       delta := 0;               { 0 terminates the chain }
     s.chain[i and HC_CHAINMASK] := UInt16(delta);
     s.head[h] := Int32(i);
@@ -279,10 +364,11 @@ begin
   begin
     tries := s.attempts;
     { the head entry for pos itself is inserted only later, so cand < pos }
-    while (tries > 0) and (pos - cand <= SYLZ_MAXDIST) do
+    while (tries > 0) and (pos - cand <= HC_MAXDIST) do
     begin
       ref := s.src + cand;
-      { check the byte that would extend the best match first: cheap reject }
+      { check the byte that would extend the best match first: cheap reject;
+        ip + best < matchlimit here, see the Break below }
       if (ref[best] = ip[best]) and (Read32(ref) = first) then
       begin
         len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, matchlimit);
@@ -306,33 +392,24 @@ begin
   Result := best;
 end;
 
-function CompressHC(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
+function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
   level: Integer): SizeInt;
 var
-  s: THcState;
-  op, oend, iend, mflimit, matchlimit: PByte;
+  iend, mflimit: PByte;
   pos, anchor, len, dist, len2, dist2: SizeInt;
-  i: Integer;
 begin
-  op := dst;
-  oend := dst + cap;
   iend := src + n;
   anchor := 0;
-  if n >= SYLZ_MFLIMIT + 1 then
+  if n >= SEARCH_TAIL + 1 then
   begin
     s.src := src;
-    SetLength(s.head, 1 shl HC_HASHLOG);
-    for i := 0 to High(s.head) do
-      s.head[i] := -1;
-    SetLength(s.chain, HC_CHAINSIZE);
     s.nextToInsert := 0;
     s.attempts := 1 shl (level - 1);
-    mflimit := iend - SYLZ_MFLIMIT;
-    matchlimit := iend - SYLZ_LASTLITERALS;
+    mflimit := iend - SEARCH_TAIL;
     pos := 0;
     while src + pos < mflimit do
     begin
-      len := HcFindBest(s, pos, matchlimit, dist);
+      len := HcFindBest(s, pos, iend, dist);
       if len = 0 then
       begin
         Inc(pos);
@@ -341,27 +418,50 @@ begin
       { lazy: a longer match one byte later is worth a literal }
       while src + pos + 1 < mflimit do
       begin
-        len2 := HcFindBest(s, pos + 1, matchlimit, dist2);
+        len2 := HcFindBest(s, pos + 1, iend, dist2);
         if len2 <= len then
           Break;
         Inc(pos);
         len := len2;
         dist := dist2;
       end;
-      if not EmitSequence(op, oend, src + anchor, pos - anchor, dist, len) then
+      if not EmitSequence(e, src + anchor, pos - anchor, dist, len) then
         Exit(-1);
       Inc(pos, len);
       anchor := pos;
     end;
   end;
-  if not EmitSequence(op, oend, src + anchor, n - anchor, 0, 0) then
-    Exit(-1);
-  Result := op - dst;
+  Result := EmitFinish(e, src + anchor, n - anchor);
+end;
+
+function CompressHC(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
+  level: Integer): SizeInt;
+var
+  e: TEmit;
+  s: THcState;
+  scratch: PByte;
+  i: Integer;
+begin
+  scratch := GetMem(n + SCRATCH_SLACK);
+  s.head := GetMem(SizeOf(Int32) shl HC_HASHLOG);
+  s.chain := GetMem(SizeOf(UInt16) * HC_CHAINSIZE);
+  try
+    for i := 0 to (1 shl HC_HASHLOG) - 1 do
+      s.head[i] := -1;
+    EmitInit(e, dst, cap, scratch, src + n);
+    Result := CompressHCCore(src, n, e, s, level);
+  finally
+    FreeMem(s.chain);
+    FreeMem(s.head);
+    FreeMem(scratch);
+  end;
 end;
 
 function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
   level: Integer): SizeInt;
 begin
+  if cap < HEADER_SIZE then
+    Exit(-1);
   if level < 1 then
     level := 1;
   if level > SYLZ_MAXLEVEL then
@@ -374,203 +474,212 @@ end;
 
 { ── decoder ──────────────────────────────────────────────────────────────── }
 
-{ Exact, fully checked decoding from (ip, op) to the end of the block. Used
-  for the block tail and for any sequence that doesn't fit the fast loop's
-  margins. Kept out of line: its Move call would otherwise force the fast
-  loop's variables out of registers. }
-function DecodeSafe(ip, iend, op, oend, dst: PByte): SizeInt;
+{ Reads a 255-run extension at p, not reading at or past pend. Returns
+  false if it runs off the end. }
+function GetExt(var p: PByte; pend: PByte; var v: SizeInt): Boolean; inline;
 var
-  m, cpyEnd: PByte;
-  token: Byte;
-  b: Byte;
+  b: SizeInt;
+begin
+  repeat
+    if p >= pend then
+      Exit(False);
+    b := p^;
+    Inc(p);
+    Inc(v, b);
+  until b <> 255;
+  Result := True;
+end;
+
+{ Exact, fully checked decoding from the given stream positions to the end
+  of the block. Handles the block tail and any sequence that doesn't fit
+  the fast loop's margins. Kept out of line: its Move calls would force
+  the fast loop's variables out of registers. }
+function DecodeSafe(ctrl, cend, lit, lend, op, oend, dst: PByte): SizeInt;
+var
+  m: PByte;
+  t: Byte;
   ll, ml, off: SizeInt;
 begin
   Result := -1;
-  while True do
+  while ctrl < cend do
   begin
-    if ip >= iend then
+    if cend - ctrl < 3 then
       Exit;
-    token := ip^;
-    Inc(ip);
-
-    { literals }
-    ll := token shr 4;
-    if ll = 15 then
-      repeat
-        if ip >= iend then
-          Exit;
-        b := ip^;
-        Inc(ip);
-        Inc(ll, b);
-      until b <> 255;
-    if (ll > iend - ip) or (ll > oend - op) then
+    t := ctrl[0];
+    off := SizeInt(ctrl[1] or (UInt32(ctrl[2]) shl 8)) + 1;
+    Inc(ctrl, 3);
+    ll := t shr 5;
+    ml := t and 31;
+    if (ll = LIT_FIELD) and not GetExt(ctrl, cend, ll) then
       Exit;
-    if (ll <= 16) and (iend - ip >= 16) and (oend - op >= 16) then
-      Copy16(op, ip)
-    else
-      Move(ip^, op^, ll);
+    if (ml = ML_FIELD) and not GetExt(ctrl, cend, ml) then
+      Exit;
+    Inc(ml, SYLZ_MINMATCH);
+    if (ll > lend - lit) or (ll > oend - op) then
+      Exit;
+    Move(lit^, op^, ll);
     Inc(op, ll);
-    Inc(ip, ll);
-    if ip = iend then
-      Break;
-
-    { match }
-    if iend - ip < 2 then
-      Exit;
-    off := ip[0] or (SizeInt(ip[1]) shl 8);
-    Inc(ip, 2);
-    if (off = 0) or (off > op - dst) then
-      Exit;
-    ml := token and 15;
-    if ml = 15 then
-      repeat
-        if ip >= iend then
-          Exit;
-        b := ip^;
-        Inc(ip);
-        Inc(ml, b);
-      until b <> 255;
-    Inc(ml, SYLZ_MINMATCH);
-    if ml > oend - op then
+    Inc(lit, ll);
+    if (off > op - dst) or (ml > oend - op) then
       Exit;
     m := op - off;
-    cpyEnd := op + ml;
-    if (off >= 8) and (oend - cpyEnd >= 8) then
+    if off >= ml then
     begin
-      { 8-byte steps may overshoot cpyEnd by up to 7 bytes: still in dst }
-      repeat
-        Copy8(op, m);
-        Inc(op, 8);
-        Inc(m, 8);
-      until op >= cpyEnd;
-      op := cpyEnd;
+      Move(m^, op^, ml);
+      Inc(op, ml);
     end
     else
-    begin
-      while op < cpyEnd do
+      while ml > 0 do
       begin
-        op^ := m^;
-        Inc(op);
-        Inc(m);
-      end;
-    end;
-  end;
-  if op <> oend then
-    Exit;
-  Result := oend - dst;
-end;
-
-const
-  { a sequence starts in the fast loop only with this much room left on
-    both sides; every fast copy (literals, matches, their overshoot) then
-    stays inside the buffers without a per-copy check }
-  FAST_MARGIN = 32;
-  { smallest multiple of off that is >= 8, for off in 1..7 }
-  PERIOD_STRIDE: array[1..7] of Byte = (8, 8, 9, 8, 10, 12, 14);
-
-{ The fast loop is register-starved under FPC (14 GPRs, and its allocator
-  spills the hottest variable first), so it keeps the live set small: no
-  saved sequence start, and `off` doubles as the scratch byte for length
-  extensions while it holds no offset. }
-function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
-var
-  ip, iend, op, oend, m: PByte;
-  token, off: SizeUInt;
-  ll, ml: SizeInt;   { signed: the copy loops count them down past zero }
-begin
-  ip := src;
-  iend := src + n;
-  op := dst;
-  oend := dst + dstLen;
-  while (iend - ip >= FAST_MARGIN) and (oend - op >= FAST_MARGIN) do
-  begin
-    token := ip^;
-    Inc(ip);
-
-    { literals }
-    ll := token shr 4;
-    if ll <> 15 then
-    begin
-      Copy16(op, ip);
-      Inc(op, ll);
-      Inc(ip, ll);
-    end
-    else
-    begin
-      { read the extension through m so that giving up leaves ip, op at
-        the token: nothing has been written yet }
-      m := ip;
-      repeat
-        if m >= iend - FAST_MARGIN div 2 then
-        begin
-          ll := -1;   { extension runs into the margin }
-          Break;
-        end;
-        off := m^;
-        Inc(m);
-        Inc(ll, off);
-      until off <> 255;
-      if (ll < 0) or (ll > iend - m - 16) or (ll > oend - op - FAST_MARGIN) then
-      begin
-        Dec(ip);      { back to the token: DecodeSafe redoes this sequence }
-        Break;
-      end;
-      ip := m;
-      { count down; the last step overshoots by -ll bytes, taken back after }
-      repeat
-        Copy16(op, ip);
-        Inc(op, 16);
-        Inc(ip, 16);
-        Dec(ll, 16);
-      until ll <= 0;
-      Inc(op, ll);
-      Inc(ip, ll);
-    end;
-
-    { match; at least 13 input bytes remain here }
-    off := PUInt16(ip)^;
-    Inc(ip, 2);
-    if (off = 0) or (SizeInt(off) > op - dst) then
-      Exit(-1);
-    m := op - off;
-    ml := token and 15;
-    if ml = 15 then
-      repeat
-        if ip >= iend then
-          Exit(-1);
-        off := ip^;
-        Inc(ip);
-        Inc(ml, off);
-      until off <> 255;
-    Inc(ml, SYLZ_MINMATCH);
-    if ml > oend - op - 16 then
-    begin
-      { only near the end of the output: exact copy, no overshoot }
-      if ml > oend - op then
-        Exit(-1);
-      repeat
         op^ := m^;
         Inc(op);
         Inc(m);
         Dec(ml);
-      until ml = 0;
-      Continue;
-    end;
-    off := op - m;
-    if off >= 16 then
+      end;
+  end;
+  { the rest of the literal stream is the block's tail }
+  if lend - lit <> oend - op then
+    Exit;
+  Move(lit^, op^, lend - lit);
+  Result := oend - dst;
+end;
+
+const
+  { A sequence starts in the fast loop only with this much room left. The
+    common sequence (literal and match fields not extended) copies 8
+    literal bytes and up to 48 match bytes unconditionally, so it never
+    needs a bounds check; extended ones are checked one by one. }
+  CTRL_MARGIN = 3;
+  LIT_MARGIN  = 16;
+  OUT_MARGIN  = 64;
+  { smallest multiple of off that is >= 8, for off in 1..7 }
+  PERIOD_STRIDE: array[1..7] of Byte = (8, 8, 9, 8, 10, 12, 14);
+
+{ The fast loop is register-starved under FPC: 14 GPRs, and when they run
+  out its allocator may spill exactly the pointer on the critical path.
+  So the values used only in comparisons (the fast limits and dst) live in
+  a record, which FPC never keeps in registers: a compare against an L1
+  stack slot is cheap and off the dependency chain, and the registers go
+  to ctrl, lit, op and the sequence fields. }
+type
+  TDecodeLimits = record
+    cfast, lfast, ofast, dst: PByte;
+  end;
+
+function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+var
+  lim: TDecodeLimits;
+  ctrl, lit, op, m: PByte;
+  t, off: SizeUInt;
+  ll, ml: SizeInt;   { signed: the copy loops count them down past zero }
+begin
+  if n < HEADER_SIZE then
+    Exit(-1);
+  ll := PUInt32(src)^;
+  if ll > n - HEADER_SIZE then
+    Exit(-1);
+  ctrl := src + HEADER_SIZE;
+  lit := ctrl + ll;
+  lim.cfast := lit - CTRL_MARGIN;
+  lim.lfast := src + n - LIT_MARGIN;
+  lim.ofast := dst + dstLen - OUT_MARGIN;
+  lim.dst := dst;
+  op := dst;
+
+  while (ctrl <= lim.cfast) and (lit <= lim.lfast) and (op <= lim.ofast) do
+  begin
+    t := ctrl[0];
+    off := SizeUInt(PUInt16(ctrl + 1)^) + 1;
+    Inc(ctrl, 3);
+
+    if (t < LIT_FIELD shl 5) and ((t and 31) <> ML_FIELD) then
+    begin
+      { common case: both fields inline }
+      ll := t shr 5;
+      ml := (t and 31) + SYLZ_MINMATCH;
+      Copy8(op, lit);
+      Inc(op, ll);
+      Inc(lit, ll);
+    end
+    else
+    begin
+      { extended field(s): read them through m so that giving up leaves
+        everything at the token, nothing written yet }
+      { (written out instead of calling GetExt: passing ll/ml/m by var,
+        even to an inline function, would pin them to the stack) }
+      ll := t shr 5;
+      ml := t and 31;
+      m := ctrl;
+      if ll = LIT_FIELD then
+        repeat
+          if m >= lim.cfast + CTRL_MARGIN then
+          begin
+            ll := -1;
+            Break;
+          end;
+          Inc(ll, m^);
+          Inc(m);
+        until m[-1] <> 255;
+      if (ml = ML_FIELD) and (ll >= 0) then
+        repeat
+          if m >= lim.cfast + CTRL_MARGIN then
+          begin
+            ll := -1;
+            Break;
+          end;
+          Inc(ml, m^);
+          Inc(m);
+        until m[-1] <> 255;
+      Inc(ml, SYLZ_MINMATCH);
+      if (ll < 0) or (ll > lim.lfast - lit) or (ll + ml > lim.ofast - op + 16) then
+      begin
+        Dec(ctrl, 3);   { DecodeSafe redoes this sequence exactly }
+        Break;
+      end;
+      ctrl := m;
+      { count down; the last step overshoots by -ll bytes, taken back after }
       repeat
-        Copy16(op, m);
+        Copy16(op, lit);
         Inc(op, 16);
-        Inc(m, 16);
-        Dec(ml, 16);
-      until ml <= 0
+        Inc(lit, 16);
+        Dec(ll, 16);
+      until ll <= 0;
+      Inc(op, ll);
+      Inc(lit, ll);
+    end;
+
+    { match }
+    if SizeInt(off) > op - lim.dst then
+      Exit(-1);
+    m := op - off;
+    if off >= 16 then
+    begin
+      Copy16(op, m);
+      Copy16(op + 16, m + 16);
+      if ml > 32 then
+      begin
+        Inc(op, 32);
+        Inc(m, 32);
+        Dec(ml, 32);
+        repeat
+          Copy16(op, m);
+          Inc(op, 16);
+          Inc(m, 16);
+          Dec(ml, 16);
+        until ml <= 0;
+      end;
+      Inc(op, ml);   { ml <= 32: a single step; else ml <= 0, the overshoot }
+    end
     else if off >= 8 then
+    begin
       repeat
         Copy8(op, m);
         Inc(op, 8);
         Inc(m, 8);
         Dec(ml, 8);
-      until ml <= 0
+      until ml <= 0;
+      Inc(op, ml);
+    end
     else
     begin
       { off < 8: the first 8 bytes byte by byte. They repeat with period
@@ -588,10 +697,11 @@ begin
         Inc(m, 8);
         Dec(ml, 8);
       end;
+      Inc(op, ml);
     end;
-    Inc(op, ml);   { ml <= 0: undo the overshoot }
   end;
-  Result := DecodeSafe(ip, iend, op, oend, dst);
+  Result := DecodeSafe(ctrl, lim.cfast + CTRL_MARGIN, lit, lim.lfast + LIT_MARGIN,
+    op, lim.ofast + OUT_MARGIN, dst);
 end;
 
 end.
