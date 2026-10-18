@@ -6,7 +6,9 @@
 
   Each file is one block. Speeds are the best of the repeated runs, in
   MB/s with MB = 10^6 bytes (as lzbench), measured on the input size.
-  SYLZ_DUMP=PREFIX writes each compressed block to PREFIX.LEVEL. }
+  Compression reuses one TSylzCtx across runs, as a long-lived caller would.
+  SYLZ_DUMP=PREFIX writes each compressed block to PREFIX.LEVEL;
+  SYLZ_NOASM=1 uses the Pascal code paths only. }
 program sylzbench;
 
 {$mode objfpc}{$H+}
@@ -64,7 +66,9 @@ var
   n, csize, dsize: SizeInt;
   li, level: Integer;
   t0, t1, best, total: UInt64;
+  ctx: TSylzCtx;
 begin
+  SylzCtxInit(ctx);
   n := LoadFile(path, src);
   SetLength(cbuf, SylzBound(n) + 1);
   SetLength(dbuf, n + 1);
@@ -76,7 +80,7 @@ begin
     total := 0;
     repeat
       t0 := NowNs;
-      csize := SylzCompress(@src[0], n, @cbuf[0], Length(cbuf), level);
+      csize := SylzCompressCtx(ctx, @src[0], n, @cbuf[0], Length(cbuf), level);
       t1 := NowNs;
       if t1 - t0 < best then
         best := t1 - t0;
@@ -116,6 +120,7 @@ begin
     WriteLn(Format('  %9.2f MB/s  %12d  %6.2f  %s',
       [Speed(n, best), csize, csize * 100.0 / Max(n, 1), ExtractFileName(path)]));
   end;
+  SylzCtxFree(ctx);
 end;
 
 var
@@ -125,6 +130,8 @@ var
   parts: TStringArray;
 begin
   levels := [1, 2, 4, 6, 9, 12];
+  if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
+    SylzUseAsm := False;
   minTime := 1.0;
   argi := 1;
   while (argi <= ParamCount) and (Copy(ParamStr(argi), 1, 1) = '-') do

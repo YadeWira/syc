@@ -67,6 +67,27 @@ references in the routine).
   (127 vs 104 references) and ran at 226 vs 273 MB/s.
 - -O4, -OoUSERBP and -OoREGVAR made no difference to these loops.
 
+## x86_64 assembler
+
+`src/sylz.pas` has two assembler routines, used on x86_64 unless built
+with `-dSYLZ_PUREPASCAL`; `SylzUseAsm := False` (or `SYLZ_NOASM=1` for the
+bench) switches to the Pascal paths at run time.
+
+- `DecodeFastX64`: the decoder's fast loop. Same results as the Pascal
+  one; adds a counted mode: past the first 64 KiB of output no offset can
+  be out of range, and k = min(ctrl room / 4, literal room / 8, output
+  room / 64) common sequences fit the margins, so the loop only counts
+  down k.
+- `CompressFastX64`: level 1, same algorithm as `CompressFastCore` and the
+  same output byte for byte. Used only when `cap >= SylzBound(n)`, which
+  guarantees every sequence fits.
+
+Both handle SysV (Linux) and Microsoft x64 (Win64: argument in rcx, rsi
+and rdi callee-saved). Tested: the fuzzer alternates the paths and checks
+the two compressors agree byte for byte; silesia.tar level 1 is identical
+from both; Win64 build on the win10 VM roundtrips Silesia files with
+both paths and gives the same sizes.
+
 ## Measurements
 
 silesia.tar (211,957,760 bytes), one block, single thread pinned with
@@ -88,6 +109,20 @@ vary by up to ~10%.
 | **sylz v1 -1** | 269 MB/s | 2347 MB/s | 44.69 |
 | **sylz v1 -2** | 78 MB/s | 2257 MB/s | 41.05 |
 | **sylz v1 -9** | 22.6 MB/s | 2493 MB/s | 36.88 |
+
+2026-10-17 22:30, x86_64 assembler (same machine and core):
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| **sylz -1, asm** | 402 MB/s | 2930 MB/s | 44.62 |
+| sylz -1, Pascal | 262 MB/s | 2303 MB/s | 44.62 |
+| **sylz -9, asm decoder** | 22.5 MB/s | 3150 MB/s | 36.88 |
+| sylz -9, Pascal | 22.5 MB/s | 2456 MB/s | 36.88 |
+
+Decoder asm steps: plain port +25% (2950 / 3100 MB/s at -1 / -9), counted
+mode +2-3% more. At ~15 cycles per sequence for ~25 instructions, the
+rest is stalls (memory, mispredicted extension and long-match branches);
+`perf` is not available to tell which (perf_event_paranoid = 3).
 
 Fast-level hash table size (sylz v1 -1): 2^12 entries 281 MB/s, 47.70%;
 2^13 264 MB/s, 45.78%; 2^14 236 MB/s, 44.69% (chosen); 2^15 207 MB/s,

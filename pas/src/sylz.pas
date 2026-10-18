@@ -35,6 +35,22 @@ const
   SYLZ_MAXDIST  = 65536;
   SYLZ_MAXLEVEL = 12;
 
+type
+  { Reusable compression context: the literal scratch buffer and the match
+    finder tables, allocated on first use and kept between calls. Reusing
+    one saves the allocation and the page faults of a fresh scratch buffer
+    the size of the input on every call. One context per thread. }
+  TSylzCtx = record
+    scratch: PByte;
+    scratchSize: SizeInt;
+    table: PUInt32;      { level 1 hash table }
+    head: PInt32;        { levels 2+: hash heads }
+    chain: PUInt16;      { levels 2+: chain deltas }
+  end;
+
+procedure SylzCtxInit(out ctx: TSylzCtx);
+procedure SylzCtxFree(var ctx: TSylzCtx);
+
 { Worst-case compressed size of n input bytes. }
 function SylzBound(n: SizeInt): SizeInt;
 
@@ -44,12 +60,27 @@ function SylzBound(n: SizeInt): SizeInt;
 function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
   level: Integer): SizeInt;
 
+{ SylzCompress with a caller-kept context; same output. }
+function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer): SizeInt;
+
 { Decompresses src[0..n) into exactly dstLen bytes at dst.
   Safe on corrupt input: never reads or writes out of bounds.
   Returns dstLen, or -1 on corrupt input. }
 function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
 
+var
+  { Use the assembler fast paths where there are any (x86_64, unless built
+    with -dSYLZ_PUREPASCAL). Both paths produce the same results; tests
+    turn this off to exercise the Pascal one. }
+  SylzUseAsm: Boolean = True;
+
 implementation
+
+{$if defined(CPUX86_64) and not defined(SYLZ_PUREPASCAL)}
+{$define SYLZ_ASM_X64}
+{$asmmode intel}
+{$endif}
 
 const
   HEADER_SIZE  = 4;
@@ -233,7 +264,7 @@ function CompressFastCore(src: PByte; n: SizeInt; var e: TEmit; table: PUInt32):
 var
   ip, anchor, iend, mflimit, ref, fwd: PByte;
   h, fwdH: UInt32;
-  len, step, probes: SizeInt;
+  len, probes: SizeInt;
 begin
   anchor := src;
   iend := src + n;
@@ -247,13 +278,11 @@ begin
     begin
       { find a match; the probe step grows with the number of misses }
       fwd := ip;
-      step := 1;
       probes := 1 shl SKIP_STRENGTH;
       repeat
         h := fwdH;
         ip := fwd;
-        Inc(fwd, step);
-        step := probes shr SKIP_STRENGTH;
+        Inc(fwd, probes shr SKIP_STRENGTH);
         Inc(probes);
         if fwd > mflimit then
           Break;
@@ -295,21 +324,295 @@ begin
   Result := EmitFinish(e, anchor, iend - anchor);
 end;
 
-function CompressFast(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+{$ifdef SYLZ_ASM_X64}
+type
+  { In/out state of the assembler fast compressor; fixed field order. }
+  TFastEncState = record
+    src, iend, mflimit: PByte;   {  0,  8, 16: in }
+    table: PUInt32;              { 24: in }
+    ctrl, lit: PByte;            { 32, 40: in/out (control and literal write pointers) }
+    anchor: PByte;               { 48: out (start of the tail literals) }
+  end;
+  PFastEncState = ^TFastEncState;
+
+{ CompressFastCore in x86_64 assembler, same algorithm and the same output
+  byte for byte (tests check it). Only used when the output buffer holds
+  SylzBound(n): that bound guarantees every sequence fits, so it skips the
+  capacity checks of EmitSequence.
+  Registers: r8 ip, r9 anchor, r10 src, r11 table, r12 mflimit, r13 iend,
+  r14 control write pointer, r15 literal write pointer, rbx fwd, rbp probe
+  count, esi hash of ip, edi hash of fwd, rax match candidate, rcx/rdx
+  scratch. [rsp] holds the 5-byte hash multiplier, [rsp+8] the state. }
+procedure CompressFastX64(st: PFastEncState); assembler; nostackframe;
+asm
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  push rax                        { [rsp+8]: state }
+  mov rcx, 889523592379
+  push rcx                        { [rsp]: hash multiplier }
+  mov r10, [rax]
+  mov r13, [rax + 8]
+  mov r12, [rax + 16]
+  mov r11, [rax + 24]
+  mov r14, [rax + 32]
+  mov r15, [rax + 40]
+  mov r9, r10                     { anchor = src }
+  lea r8, [r10 + 1]               { ip = src + 1 }
+  mov rdx, [r8]
+  shl rdx, 24
+  imul rdx, [rsp]
+  shr rdx, 64 - FAST_HASHLOG
+  mov edi, edx                    { fwdH = hash(ip) }
+
+@search:
+  mov rbx, r8                     { fwd = ip }
+  mov ebp, 1 shl SKIP_STRENGTH    { probes; step = probes shr SKIP_STRENGTH }
+@probe:
+  mov esi, edi                    { h = fwdH }
+  mov r8, rbx                     { ip = fwd }
+  mov rdx, rbp
+  shr rdx, SKIP_STRENGTH
+  add rbx, rdx                    { fwd += step }
+  add rbp, 1
+  cmp rbx, r12
+  ja @last
+  mov eax, [r11 + rsi * 4]
+  add rax, r10                    { ref = src + table[h] }
+  mov rdx, [rbx]
+  shl rdx, 24
+  imul rdx, [rsp]
+  shr rdx, 64 - FAST_HASHLOG
+  mov edi, edx                    { fwdH = hash(fwd) }
+  mov rdx, r8
+  sub rdx, r10
+  mov [r11 + rsi * 4], edx        { table[h] = ip - src }
+  mov rdx, r8
+  sub rdx, rax
+  cmp rdx, SYLZ_MAXDIST
+  ja @probe
+  mov edx, [rax]
+  cmp edx, [r8]
+  jne @probe
+
+@back:
+  { extend the match backwards over the pending literals }
+  cmp r8, r9
+  jbe @emit
+  cmp rax, r10
+  jbe @emit
+  movzx edx, byte ptr [r8 - 1]
+  cmp dl, [rax - 1]
+  jne @emit
+  sub r8, 1
+  sub rax, 1
+  jmp @back
+
+@emit:
+  { match end -> rcx }
+  lea rcx, [r8 + SYLZ_MINMATCH]
+  lea rdx, [rax + SYLZ_MINMATCH]
+@cm8:
+  lea rsi, [rcx + 8]
+  cmp rsi, r13
+  ja @cmTail
+  mov rsi, [rcx]
+  xor rsi, [rdx]
+  jnz @cmDiff
+  add rcx, 8
+  add rdx, 8
+  jmp @cm8
+@cmDiff:
+  bsf rsi, rsi
+  shr esi, 3
+  add rcx, rsi
+  jmp @cmDone
+@cmTail:
+  cmp rcx, r13
+  jae @cmDone
+  movzx esi, byte ptr [rcx]
+  cmp sil, [rdx]
+  jne @cmDone
+  add rcx, 1
+  add rdx, 1
+  jmp @cmTail
+@cmDone:
+  { rbx = literal length, rbp = match length - MINMATCH }
+  mov rbx, r8
+  sub rbx, r9
+  mov rbp, rcx
+  sub rbp, r8
+  sub rbp, SYLZ_MINMATCH
+  mov rdx, r8
+  sub rdx, rax
+  sub rdx, 1
+  mov [r14 + 1], dx               { offset = distance - 1 }
+  mov esi, LIT_FIELD
+  cmp rbx, LIT_FIELD
+  cmovb esi, ebx
+  shl esi, 5
+  mov edi, ML_FIELD
+  cmp rbp, ML_FIELD
+  cmovb edi, ebp
+  or esi, edi
+  mov [r14], sil                  { token }
+  add r14, 3
+  cmp rbx, LIT_FIELD
+  jb @noLitExt
+  mov rdx, rbx
+  sub rdx, LIT_FIELD
+@litExt:
+  cmp rdx, 255
+  jb @litExtEnd
+  mov byte ptr [r14], 255
+  add r14, 1
+  sub rdx, 255
+  jmp @litExt
+@litExtEnd:
+  mov [r14], dl
+  add r14, 1
+@noLitExt:
+  cmp rbp, ML_FIELD
+  jb @noMlExt
+  mov rdx, rbp
+  sub rdx, ML_FIELD
+@mlExt:
+  cmp rdx, 255
+  jb @mlExtEnd
+  mov byte ptr [r14], 255
+  add r14, 1
+  sub rdx, 255
+  jmp @mlExt
+@mlExtEnd:
+  mov [r14], dl
+  add r14, 1
+@noMlExt:
+  { literals to the scratch stream: 16-byte steps when the reads stay
+    inside the input, else byte by byte }
+  test rbx, rbx
+  jz @litDone
+  lea rdx, [r9 + rbx + 16]
+  cmp rdx, r13
+  ja @litBytes
+  mov rsi, r9
+  mov rdi, r15
+  mov rdx, rbx
+@lit16:
+  movdqu xmm0, [rsi]
+  movdqu [rdi], xmm0
+  add rsi, 16
+  add rdi, 16
+  sub rdx, 16
+  jg @lit16
+  jmp @litDone
+@litBytes:
+  xor edx, edx
+@litByte:
+  movzx esi, byte ptr [r9 + rdx]
+  mov [r15 + rdx], sil
+  add rdx, 1
+  cmp rdx, rbx
+  jb @litByte
+@litDone:
+  add r15, rbx
+  mov r8, rcx                     { ip = match end }
+  mov r9, rcx                     { anchor = ip }
+  cmp r8, r12
+  ja @last
+  { table[hash(ip - 2)] = ip - 2 - src }
+  mov rdx, [r8 - 2]
+  shl rdx, 24
+  imul rdx, [rsp]
+  shr rdx, 64 - FAST_HASHLOG
+  lea rcx, [r8 - 2]
+  sub rcx, r10
+  mov [r11 + rdx * 4], ecx
+  { a match right here needs no literals }
+  mov rdx, [r8]
+  shl rdx, 24
+  imul rdx, [rsp]
+  shr rdx, 64 - FAST_HASHLOG
+  mov eax, [r11 + rdx * 4]
+  add rax, r10
+  mov rcx, r8
+  sub rcx, r10
+  mov [r11 + rdx * 4], ecx
+  mov rcx, r8
+  sub rcx, rax
+  cmp rcx, SYLZ_MAXDIST
+  ja @next
+  mov ecx, [rax]
+  cmp ecx, [r8]
+  je @emit
+@next:
+  add r8, 1
+  mov rdx, [r8]
+  shl rdx, 24
+  imul rdx, [rsp]
+  shr rdx, 64 - FAST_HASHLOG
+  mov edi, edx
+  jmp @search
+
+@last:
+  pop rcx                         { multiplier }
+  pop rax                         { state }
+  mov [rax + 32], r14
+  mov [rax + 40], r15
+  mov [rax + 48], r9
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+end;
+{$endif}
+
+function CompressFast(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt): SizeInt;
 var
   e: TEmit;
-  scratch: PByte;
   table: PUInt32;
+{$ifdef SYLZ_ASM_X64}
+  st: TFastEncState;
+{$endif}
 begin
-  scratch := GetMem(n + SCRATCH_SLACK);
-  table := GetMem(SizeOf(UInt32) shl FAST_HASHLOG);
-  try
+  if ctx.table = nil then
+    ctx.table := GetMem(SizeOf(UInt32) shl FAST_HASHLOG);
+  table := ctx.table;
+  begin
     FillChar(table^, SizeOf(UInt32) shl FAST_HASHLOG, 0);   { position 0 }
-    EmitInit(e, dst, cap, scratch, src + n);
+    EmitInit(e, dst, cap, ctx.scratch, src + n);
+{$ifdef SYLZ_ASM_X64}
+    if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+    begin
+      st.src := src;
+      st.iend := src + n;
+      st.mflimit := src + n - SEARCH_TAIL;
+      st.table := table;
+      st.ctrl := e.ctrl;
+      st.lit := e.lit;
+      CompressFastX64(@st);
+      e.ctrl := st.ctrl;
+      e.lit := st.lit;
+      Exit(EmitFinish(e, st.anchor, src + n - st.anchor));
+    end;
+{$endif}
     Result := CompressFastCore(src, n, e, table);
-  finally
-    FreeMem(table);
-    FreeMem(scratch);
   end;
 end;
 
@@ -434,31 +737,41 @@ begin
   Result := EmitFinish(e, src + anchor, n - anchor);
 end;
 
-function CompressHC(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
-  level: Integer): SizeInt;
+function CompressHC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer): SizeInt;
 var
   e: TEmit;
   s: THcState;
-  scratch: PByte;
   i: Integer;
 begin
-  scratch := GetMem(n + SCRATCH_SLACK);
-  s.head := GetMem(SizeOf(Int32) shl HC_HASHLOG);
-  s.chain := GetMem(SizeOf(UInt16) * HC_CHAINSIZE);
-  try
-    for i := 0 to (1 shl HC_HASHLOG) - 1 do
-      s.head[i] := -1;
-    EmitInit(e, dst, cap, scratch, src + n);
-    Result := CompressHCCore(src, n, e, s, level);
-  finally
-    FreeMem(s.chain);
-    FreeMem(s.head);
-    FreeMem(scratch);
-  end;
+  if ctx.head = nil then
+    ctx.head := GetMem(SizeOf(Int32) shl HC_HASHLOG);
+  if ctx.chain = nil then
+    ctx.chain := GetMem(SizeOf(UInt16) * HC_CHAINSIZE);
+  s.head := ctx.head;
+  s.chain := ctx.chain;
+  for i := 0 to (1 shl HC_HASHLOG) - 1 do
+    s.head[i] := -1;
+  EmitInit(e, dst, cap, ctx.scratch, src + n);
+  Result := CompressHCCore(src, n, e, s, level);
 end;
 
-function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
-  level: Integer): SizeInt;
+procedure SylzCtxInit(out ctx: TSylzCtx);
+begin
+  FillChar(ctx, SizeOf(ctx), 0);
+end;
+
+procedure SylzCtxFree(var ctx: TSylzCtx);
+begin
+  FreeMem(ctx.scratch);
+  FreeMem(ctx.table);
+  FreeMem(ctx.head);
+  FreeMem(ctx.chain);
+  SylzCtxInit(ctx);
+end;
+
+function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer): SizeInt;
 begin
   if cap < HEADER_SIZE then
     Exit(-1);
@@ -466,10 +779,29 @@ begin
     level := 1;
   if level > SYLZ_MAXLEVEL then
     level := SYLZ_MAXLEVEL;
+  if ctx.scratchSize < n + SCRATCH_SLACK then
+  begin
+    FreeMem(ctx.scratch);
+    ctx.scratchSize := n + SCRATCH_SLACK;
+    ctx.scratch := GetMem(ctx.scratchSize);
+  end;
   if level = 1 then
-    Result := CompressFast(src, n, dst, cap)
+    Result := CompressFast(ctx, src, n, dst, cap)
   else
-    Result := CompressHC(src, n, dst, cap, level);
+    Result := CompressHC(ctx, src, n, dst, cap, level);
+end;
+
+function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
+  level: Integer): SizeInt;
+var
+  ctx: TSylzCtx;
+begin
+  SylzCtxInit(ctx);
+  try
+    Result := SylzCompressCtx(ctx, src, n, dst, cap, level);
+  finally
+    SylzCtxFree(ctx);
+  end;
 end;
 
 { ── decoder ──────────────────────────────────────────────────────────────── }
@@ -566,7 +898,7 @@ type
     cfast, lfast, ofast, dst: PByte;
   end;
 
-function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+function DecodePas(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
 var
   lim: TDecodeLimits;
   ctrl, lit, op, m: PByte;
@@ -702,6 +1034,341 @@ begin
   end;
   Result := DecodeSafe(ctrl, lim.cfast + CTRL_MARGIN, lit, lim.lfast + LIT_MARGIN,
     op, lim.ofast + OUT_MARGIN, dst);
+end;
+
+{$ifdef SYLZ_ASM_X64}
+
+type
+  { In/out state of the assembler fast loop. Field order is fixed: the
+    assembler addresses the fields by these offsets. }
+  TDecodeState = record
+    ctrl, lit, op: PByte;              {  0,  8, 16: in/out }
+    cfast, lfast, ofast, dst: PByte;   { 24, 32, 40, 48: in }
+    status: SizeInt;                   { 56: out, 0 = stopped at a margin, -1 = corrupt }
+  end;
+  PDecodeState = ^TDecodeState;
+
+{ The fast loop of DecodePas in x86_64 assembler, same results: decodes
+  while all three streams are inside their margins, and stops at the token
+  of the first sequence it can't do with unchecked wide copies, leaving it
+  to DecodeSafe.
+
+  Two modes. Checked: the loop of DecodePas, three margin compares and an
+  offset check per sequence. Counted: once the output is past the first
+  SYLZ_MAXDIST bytes no offset can reach before its start, and a common
+  sequence (no extension) uses 3 control bytes, at most 6 literals and at
+  most 40 output bytes, so k = min(ctrl room / 4, literal room / 8,
+  output room / 64) of them fit the margins: the loop then only counts
+  down k. Any extended sequence checks itself and forces a recount.
+
+  Registers: r8 ctrl, r9 lit, r10 op, r11 cfast, r12 lfast, r13 ofast,
+  r14 dst, r15 k, eax token, rcx offset, rbx literal length, rbp match
+  length, rsi match source, rdx/rdi scratch, xmm0/xmm1 16-byte copies
+  (SSE2 is baseline on x86_64). The state pointer is kept on the stack. }
+procedure DecodeFastX64(st: PDecodeState); assembler; nostackframe;
+asm
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx            { Win64: first argument in rcx; rsi/rdi are callee-saved }
+{$else}
+  mov rax, rdi            { SysV: first argument in rdi }
+{$endif}
+  push rax                { the state pointer, popped at @done }
+  mov r8, [rax]
+  mov r9, [rax + 8]
+  mov r10, [rax + 16]
+  mov r11, [rax + 24]
+  mov r12, [rax + 32]
+  mov r13, [rax + 40]
+  mov r14, [rax + 48]
+  mov qword ptr [rax + 56], 0
+
+@recount:
+  { counted mode needs op - dst >= SYLZ_MAXDIST and k > 0 }
+  mov rdx, r10
+  sub rdx, r14
+  cmp rdx, 65536
+  jb @checked
+  cmp r8, r11
+  ja @done
+  cmp r9, r12
+  ja @done
+  cmp r10, r13
+  ja @done
+  mov r15, r11
+  sub r15, r8
+  shr r15, 2
+  mov rdx, r12
+  sub rdx, r9
+  shr rdx, 3
+  cmp rdx, r15
+  cmovb r15, rdx
+  mov rdx, r13
+  sub rdx, r10
+  shr rdx, 6
+  cmp rdx, r15
+  cmovb r15, rdx
+  test r15, r15
+  jz @checked
+
+@counted:
+  movzx eax, byte ptr [r8]
+  movzx ecx, word ptr [r8 + 1]
+  add rcx, 1              { offset = stored + 1 }
+  add r8, 3
+  cmp eax, $E0
+  jae @ext                { literal field extended }
+  mov ebp, eax
+  and ebp, 31
+  cmp ebp, 31
+  je @ext                 { match field extended }
+  add rbp, 4              { match length }
+  shr eax, 5              { literal length, 0..6 }
+  mov rdx, [r9]
+  mov [r10], rdx          { 8 literal bytes, unconditionally }
+  add r10, rax
+  add r9, rax
+  jmp @match
+
+@checked:
+  mov r15, 1              { one sequence, then recount }
+  cmp r8, r11
+  ja @done
+  cmp r9, r12
+  ja @done
+  cmp r10, r13
+  ja @done
+  movzx eax, byte ptr [r8]
+  movzx ecx, word ptr [r8 + 1]
+  add rcx, 1
+  add r8, 3
+  cmp eax, $E0
+  jae @ext
+  mov ebp, eax
+  and ebp, 31
+  cmp ebp, 31
+  je @ext
+  add rbp, 4
+  shr eax, 5
+  mov rdx, [r9]
+  mov [r10], rdx
+  add r10, rax
+  add r9, rax
+  mov rdx, r10
+  sub rdx, r14
+  cmp rcx, rdx
+  ja @corrupt             { offset reaches before the start of the output }
+
+@match:
+  { copy the match, then continue counting down or recount }
+  mov rsi, r10
+  sub rsi, rcx
+  cmp rcx, 16
+  jb @short
+  movdqu xmm0, [rsi]
+  movdqu [r10], xmm0
+  movdqu xmm1, [rsi + 16]
+  movdqu [r10 + 16], xmm1
+  cmp rbp, 32
+  ja @long
+  add r10, rbp
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+@long:
+  add r10, 32
+  add rsi, 32
+  sub rbp, 32
+@long16:
+  movdqu xmm0, [rsi]
+  movdqu [r10], xmm0
+  add r10, 16
+  add rsi, 16
+  sub rbp, 16
+  jg @long16
+  add r10, rbp            { rbp <= 0: take back the overshoot }
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+
+@short:
+  cmp rcx, 8
+  jb @tiny
+@short8:
+  mov rdx, [rsi]
+  mov [r10], rdx
+  add r10, 8
+  add rsi, 8
+  sub rbp, 8
+  jg @short8
+  add r10, rbp
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+
+@tiny:
+  { offset < 8: 8 bytes one at a time, then 8-byte steps from the nearest
+    multiple of the offset that is >= 8: 8,8,9,8,10,12,14 for 1..7, packed
+    one per byte }
+  movzx edx, byte ptr [rsi]
+  mov [r10], dl
+  movzx edx, byte ptr [rsi + 1]
+  mov [r10 + 1], dl
+  movzx edx, byte ptr [rsi + 2]
+  mov [r10 + 2], dl
+  movzx edx, byte ptr [rsi + 3]
+  mov [r10 + 3], dl
+  movzx edx, byte ptr [rsi + 4]
+  mov [r10 + 4], dl
+  movzx edx, byte ptr [rsi + 5]
+  mov [r10 + 5], dl
+  movzx edx, byte ptr [rsi + 6]
+  mov [r10 + 6], dl
+  movzx edx, byte ptr [rsi + 7]
+  mov [r10 + 7], dl
+  add r10, 8
+  mov rdx, $000E0C0A08090808
+  lea ecx, [rcx * 8 - 8]
+  shr rdx, cl
+  movzx edx, dl
+  mov rsi, r10
+  sub rsi, rdx
+  sub rbp, 8
+  jle @tinyDone
+@tiny8:
+  mov rdx, [rsi]
+  mov [r10], rdx
+  add r10, 8
+  add rsi, 8
+  sub rbp, 8
+  jg @tiny8
+@tinyDone:
+  add r10, rbp
+  sub r15, 1
+  jnz @counted
+  jmp @recount
+
+@ext:
+  { extended field(s), from either mode: read the extension through rsi
+    so that giving up leaves ctrl at the token, nothing written yet }
+  mov ebx, eax
+  shr ebx, 5
+  mov ebp, eax
+  and ebp, 31
+  mov rsi, r8
+  lea rdi, [r11 + 3]      { end of the control stream }
+  cmp ebx, 7
+  jne @mlExt
+@llExtLoop:
+  cmp rsi, rdi
+  jae @bail
+  movzx edx, byte ptr [rsi]
+  add rsi, 1
+  add rbx, rdx
+  cmp edx, 255
+  je @llExtLoop
+@mlExt:
+  cmp ebp, 31
+  jne @extDone
+@mlExtLoop:
+  cmp rsi, rdi
+  jae @bail
+  movzx edx, byte ptr [rsi]
+  add rsi, 1
+  add rbp, rdx
+  cmp edx, 255
+  je @mlExtLoop
+@extDone:
+  add rbp, 4
+  mov rdx, r12
+  sub rdx, r9
+  cmp rbx, rdx
+  ja @bail                { literals would read past the literal margin }
+  lea rax, [rbx + rbp]
+  mov rdx, r13
+  sub rdx, r10
+  add rdx, 16
+  cmp rax, rdx
+  ja @bail                { literals + match would write past the output margin }
+  mov r8, rsi
+@lit16:
+  movdqu xmm0, [r9]
+  movdqu [r10], xmm0
+  add r9, 16
+  add r10, 16
+  sub rbx, 16
+  jg @lit16
+  add r9, rbx
+  add r10, rbx
+  mov rdx, r10
+  sub rdx, r14
+  cmp rcx, rdx
+  ja @corrupt
+  mov r15, 1              { the counted budget no longer holds: recount }
+  jmp @match
+
+@bail:
+  sub r8, 3               { back to the token: DecodeSafe redoes this sequence }
+  jmp @done
+@corrupt:
+  mov rax, [rsp]
+  mov qword ptr [rax + 56], -1
+@done:
+  pop rax
+  mov [rax], r8
+  mov [rax + 8], r9
+  mov [rax + 16], r10
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+end;
+
+function DecodeAsm(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+var
+  st: TDecodeState;
+  ctrlLen: SizeInt;
+begin
+  if n < HEADER_SIZE then
+    Exit(-1);
+  ctrlLen := PUInt32(src)^;
+  if ctrlLen > n - HEADER_SIZE then
+    Exit(-1);
+  st.ctrl := src + HEADER_SIZE;
+  st.lit := st.ctrl + ctrlLen;
+  st.op := dst;
+  st.cfast := st.lit - CTRL_MARGIN;
+  st.lfast := src + n - LIT_MARGIN;
+  st.ofast := dst + dstLen - OUT_MARGIN;
+  st.dst := dst;
+  DecodeFastX64(@st);
+  if st.status < 0 then
+    Exit(-1);
+  Result := DecodeSafe(st.ctrl, st.cfast + CTRL_MARGIN, st.lit, st.lfast + LIT_MARGIN,
+    st.op, st.ofast + OUT_MARGIN, dst);
+end;
+{$endif}
+
+function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+begin
+{$ifdef SYLZ_ASM_X64}
+  if SylzUseAsm then
+    Exit(DecodeAsm(src, n, dst, dstLen));
+{$endif}
+  Result := DecodePas(src, n, dst, dstLen);
 end;
 
 end.

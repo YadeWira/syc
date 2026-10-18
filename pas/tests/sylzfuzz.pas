@@ -4,7 +4,9 @@
 
   Every buffer handed to the decoder sits flush against a PROT_NONE guard
   page, so a read past the compressed input or a write past the output
-  faults immediately instead of going unnoticed. }
+  faults immediately instead of going unnoticed. Cases alternate between
+  the assembler and the Pascal code paths (SylzUseAsm), and every
+  compressed block is also produced by the other path and compared. }
 program sylzfuzz;
 
 {$mode objfpc}{$H+}
@@ -161,7 +163,7 @@ end;
 procedure OneCase;
 var
   n, level, csize, r, i, flips, cut: SizeInt;
-  input, comp, outp, bad: TGuarded;
+  input, comp, outp, bad, other: TGuarded;
 begin
   case RandBelow(4) of
     0: n := RandBelow(64);
@@ -178,6 +180,15 @@ begin
   csize := SylzCompress(input.p, n, comp.p, SylzBound(n), level);
   if csize < 0 then
     Fail('compress returned -1 with a SylzBound buffer', n, level);
+
+  { the assembler and Pascal compressors must agree byte for byte }
+  other := GuardedAlloc(SylzBound(n));
+  SylzUseAsm := not SylzUseAsm;
+  r := SylzCompress(input.p, n, other.p, SylzBound(n), level);
+  SylzUseAsm := not SylzUseAsm;
+  if (r <> csize) or (CompareByte(comp.p^, other.p^, csize) <> 0) then
+    Fail('assembler and Pascal compressors disagree', n, level);
+  GuardedFree(other);
 
   { decode from a buffer of exactly csize bytes, into exactly n bytes }
   bad := GuardedAlloc(csize);
@@ -242,6 +253,9 @@ begin
   for i := first to ParamCount do
     LoadSample(ParamStr(i));
   for k := 1 to iters do
+  begin
+    SylzUseAsm := Odd(k);   { alternate the assembler and Pascal decoders }
     OneCase;
+  end;
   WriteLn('ok: ', roundtrips, ' roundtrips, ', corrupt, ' corrupt/truncated decodes');
 end.
