@@ -35,14 +35,19 @@ silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz):
 | lz4 1.10.0 | 544 MB/s | 3302 MB/s | 47.59% |
 | misa77 0.6.0 --1 | 284 MB/s | 3995 MB/s | 46.74% |
 | misa77 0.6.0 -0 | 171 MB/s | 3962 MB/s | 44.60% |
+| zxc 0.15.0 -4 † | 117 MB/s | 3414 MB/s | 43.43% |
+| zxc 0.15.0 -5 † | 71.3 MB/s | 3407 MB/s | 40.83% |
 | lizard 2.1 -10 | 436 MB/s | 2960 MB/s | 48.78% |
 | zstd 1.5.7 --fast=1 | 392 MB/s | 1402 MB/s | 41.01% |
 | **sylz -1** | **423 MB/s** | **3178 MB/s** | **44.18%** |
 | lz4hc 1.10.0 -9 | 28.2 MB/s | 3230 MB/s | 36.75% |
 | misa77 0.6.0 -3 | 11.3 MB/s | 3785 MB/s | 37.76% |
+| zxc 0.15.0 -6 † | 9.42 MB/s | 2755 MB/s | 36.28% |
 | **sylz -9** | 21.9 MB/s | 3229 MB/s | 36.60% |
 
-Competitors measured with lzbench 2.4.1 (GCC 14.2) on the same core. How,
+Competitors measured with lzbench 2.4.1 (GCC 14.2) on the same core
+(† measured a session later, under more load: lz4 read 3080 MB/s in that
+run). How,
 and more numbers: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
 The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 

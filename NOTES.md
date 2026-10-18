@@ -4,8 +4,40 @@ Rewrite of syc in Free Pascal, keeping "tuned for modest hardware": bounded
 memory, good on 1–4 cores, no AVX2 requirement (SSE2 baseline), 32-bit
 targets supported. Algorithms first, written from scratch.
 
-Competitors: misa77, lz5-ex, lizard (fast LZ); zstd, lz6 (LZ + entropy);
-ultra-fast-lzma2 (high ratio).
+Competitors: misa77, lz5-ex, lizard, zxc (fast LZ); zstd, lz6 (LZ +
+entropy); ultra-fast-lzma2 (high ratio).
+
+### zxc (added 2026-10-18)
+
+github.com/hellobertrand/zxc, BSD-3-Clause, C. Write-once/read-many like
+sylz. Two block formats: GHI for the fast levels, one packed 32-bit word
+per sequence (8-bit literals, 8-bit match - 5, 16-bit offset) with
+extensions only past 255, so almost no escape branch; GLO for the others,
+four streams (literals, 4/4-bit tokens, offsets 8- or 16-bit per block,
+prefix-varint extras). 32-byte copies, a 4x unrolled decoder, offset
+checks dropped past the first 64 KiB. Levels 6-7: price-based optimal
+parse and Huffman literals in a SIMD-decodable layout (PivCo).
+
+silesia.tar, same core (lzbench 2.4.1, no -march=native), load ~5:
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| zxc -1 | 522 MB/s | 3936 MB/s | 61.76 |
+| zxc -2 | 364 MB/s | 3894 MB/s | 53.86 |
+| zxc -3 | 160 MB/s | 3422 MB/s | 46.65 |
+| zxc -4 | 117 MB/s | 3414 MB/s | 43.43 |
+| zxc -5 | 71.3 MB/s | 3407 MB/s | 40.83 |
+| zxc -6 | 9.42 MB/s | 2755 MB/s | 36.28 |
+| zxc -7 | 6.30 MB/s | 1856 MB/s | 33.09 |
+| lz4 (same run) | 515 MB/s | 3080 MB/s | 47.59 |
+| sylz -1 (same load) | 383 MB/s | 3103 MB/s | 44.18 |
+| sylz -2 | 73.4 MB/s | 2892 MB/s | 40.75 |
+| sylz -9 | 21.2 MB/s | 3333 MB/s | 36.60 |
+
+zxc leads around 40-46% (sylz -2 vs zxc -5: -18% decode at the same
+ratio); sylz leads around 36% (sylz -9 vs zxc -6: +21% decode). sylz
+compresses 3.3x faster than zxc -4 at a similar ratio. zxc -7's 33%
+has no sylz counterpart.
 
 ## Layout
 
