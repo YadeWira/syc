@@ -565,10 +565,12 @@ type
   byte for byte (tests check it). Only used when the output buffer holds
   SylzBound(n): that bound guarantees every sequence fits, so it skips the
   capacity checks of EmitSequence.
-  Registers: r8 ip, r9 anchor, r10 src, r11 table (u16 entries), r12 mflimit, r13 iend,
+  Registers: r8 ip, r9 anchor, r10 src, r11 table (u16 entries), r13 iend,
   r14 control write pointer, r15 literal write pointer, rbx fwd, rbp probe
-  count, esi hash of ip, edi hash of fwd, rax match candidate, rcx/rdx
-  scratch. [rsp] holds the 5-byte hash multiplier, [rsp+8] the state. }
+  count, esi hash of ip, edi hash of fwd, rax match candidate, cl the hash
+  shift (set once: no reload per hash), r12/rdx scratch. The stack holds
+  mflimit [rsp] (compared from memory, freeing r12), the hash shift, the
+  exact-code map, the hash multiplier and the state. }
 procedure CompressFastX64(st: PFastEncState); assembler; nostackframe;
 asm
   push rbx
@@ -584,14 +586,15 @@ asm
 {$else}
   mov rax, rdi
 {$endif}
-  push rax                        { [rsp+24]: state }
+  push rax                        { [rsp+32]: state }
   mov rcx, 889523592379
-  push rcx                        { [rsp+16]: hash multiplier }
-  push qword ptr [rax + 56]       { [rsp+8]: exact code map }
-  push qword ptr [rax + 64]       { [rsp]: hash shift (rcx is free at every hash) }
+  push rcx                        { [rsp+24]: hash multiplier }
+  push qword ptr [rax + 56]       { [rsp+16]: exact code map }
+  push qword ptr [rax + 64]       { [rsp+8]: hash shift }
+  push qword ptr [rax + 16]       { [rsp]: mflimit }
+  mov rcx, [rsp + 8]              { cl = hash shift, for the whole routine }
   mov r10, [rax]
   mov r13, [rax + 8]
-  mov r12, [rax + 16]
   mov r11, [rax + 24]
   mov r14, [rax + 32]
   mov r15, [rax + 40]
@@ -599,8 +602,7 @@ asm
   lea r8, [r10 + 1]               { ip = src + 1 }
   mov rdx, [r8]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
-  imul rdx, [rsp + 16]
-  mov ecx, [rsp]
+  imul rdx, [rsp + 24]
   shr rdx, cl
   mov edi, edx                    { fwdH = hash(ip) }
 
@@ -614,13 +616,12 @@ asm
   shr rdx, SKIP_STRENGTH
   add rbx, rdx                    { fwd += step }
   add rbp, 1
-  cmp rbx, r12
+  cmp rbx, [rsp]
   ja @last
   movzx eax, word ptr [r11 + rsi * 2]   { low 16 bits of the candidate's position }
   mov rdx, [rbx]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
-  imul rdx, [rsp + 16]
-  mov ecx, [rsp]
+  imul rdx, [rsp + 24]
   shr rdx, cl
   mov edi, edx                    { fwdH = hash(fwd) }
   mov rdx, r8
@@ -628,9 +629,9 @@ asm
   mov [r11 + rsi * 2], dx         { table[h] = pos (low 16 bits) }
   sub edx, eax
   and edx, $FFFF                  { distance mod 2^16 ... }
-  mov ecx, 65536
+  mov r12d, 65536
   test edx, edx
-  cmovz edx, ecx                  { ... with 0 meaning 65536 }
+  cmovz edx, r12d                 { ... with 0 meaning 65536 }
   mov rax, r8
   sub rax, rdx                    { ref = ip - distance }
   cmp rax, r10
@@ -653,38 +654,38 @@ asm
   jmp @back
 
 @emit:
-  { match end -> rcx }
-  lea rcx, [r8 + SYLZ_MINMATCH]
+  { match end -> r12 }
+  lea r12, [r8 + SYLZ_MINMATCH]
   lea rdx, [rax + SYLZ_MINMATCH]
 @cm8:
-  lea rsi, [rcx + 8]
+  lea rsi, [r12 + 8]
   cmp rsi, r13
   ja @cmTail
-  mov rsi, [rcx]
+  mov rsi, [r12]
   xor rsi, [rdx]
   jnz @cmDiff
-  add rcx, 8
+  add r12, 8
   add rdx, 8
   jmp @cm8
 @cmDiff:
   bsf rsi, rsi
   shr esi, 3
-  add rcx, rsi
+  add r12, rsi
   jmp @cmDone
 @cmTail:
-  cmp rcx, r13
+  cmp r12, r13
   jae @cmDone
-  movzx esi, byte ptr [rcx]
+  movzx esi, byte ptr [r12]
   cmp sil, [rdx]
   jne @cmDone
-  add rcx, 1
+  add r12, 1
   add rdx, 1
   jmp @cmTail
 @cmDone:
   { rbx = literal length, rbp = match length - MINMATCH }
   mov rbx, r8
   sub rbx, r9
-  mov rbp, rcx
+  mov rbp, r12
   sub rbp, r8
   sub rbp, SYLZ_MINMATCH
   mov rdx, r8
@@ -699,7 +700,7 @@ asm
   ja @tokEscMatch
   imul esi, ebx, EXACT_M + 1
   add esi, ebp
-  mov rdx, [rsp + 8]
+  mov rdx, [rsp + 16]
   movzx esi, byte ptr [rdx + rsi]
   cmp esi, 255
   je @tokEscMatch
@@ -774,52 +775,50 @@ asm
   jb @litByte
 @litDone:
   add r15, rbx
-  mov r8, rcx                     { ip = match end }
-  mov r9, rcx                     { anchor = ip }
-  cmp r8, r12
+  mov r8, r12                     { ip = match end }
+  mov r9, r12                     { anchor = ip }
+  cmp r8, [rsp]
   ja @last
   { table[hash(ip - 2)] = ip - 2 - src }
   mov rdx, [r8 - 2]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
-  imul rdx, [rsp + 16]
-  mov ecx, [rsp]
+  imul rdx, [rsp + 24]
   shr rdx, cl
-  lea rcx, [r8 - 2]
-  sub rcx, r10
-  mov [r11 + rdx * 2], cx
+  lea r12, [r8 - 2]
+  sub r12, r10
+  mov [r11 + rdx * 2], r12w
   { a match right here needs no literals }
   mov rdx, [r8]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
-  imul rdx, [rsp + 16]
-  mov ecx, [rsp]
+  imul rdx, [rsp + 24]
   shr rdx, cl
   movzx eax, word ptr [r11 + rdx * 2]
-  mov rcx, r8
-  sub rcx, r10
-  mov [r11 + rdx * 2], cx
-  sub ecx, eax
-  and ecx, $FFFF
+  mov r12, r8
+  sub r12, r10
+  mov [r11 + rdx * 2], r12w
+  sub r12d, eax
+  and r12d, $FFFF
   mov edx, 65536
-  test ecx, ecx
-  cmovz ecx, edx
+  test r12d, r12d
+  cmovz r12d, edx
   mov rax, r8
-  sub rax, rcx
+  sub rax, r12
   cmp rax, r10
   jb @next
-  mov ecx, [rax]
-  cmp ecx, [r8]
+  mov r12d, [rax]
+  cmp r12d, [r8]
   je @emit
 @next:
   add r8, 1
   mov rdx, [r8]
   shl rdx, 64 - 8 * FAST_HASH_BYTES
-  imul rdx, [rsp + 16]
-  mov ecx, [rsp]
+  imul rdx, [rsp + 24]
   shr rdx, cl
   mov edi, edx
   jmp @search
 
 @last:
+  pop rcx                         { mflimit }
   pop rcx                         { hash shift }
   pop rcx                         { exact code map }
   pop rcx                         { multiplier }

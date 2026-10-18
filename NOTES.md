@@ -469,6 +469,21 @@ length loop (~10%). A software prefetch of the next probe's candidate
 instructions cost more than the latency they hide, which the out-of-order
 core already overlaps.
 
+The new fast parses need more escape tokens (silesia 14.9% at level 0,
+12.6% at level 1; mixed 19.2% / 17.6%) than the token table was trained
+on. A table retrained on them would cut that by 0.1-0.3 points, and a
+larger fixed-copy region (literals <= 31, match <= 64) by at most 1.6:
+those sequences have literal runs or matches long enough to need copy
+loops whatever the table. Not worth a format change.
+
+Register tweak in the fast compressor: mflimit compared from memory
+(once per probe) frees r12 as scratch, so rcx keeps the hash shift for
+the whole routine instead of a reload before each of the five hashes:
+3% fewer instructions, cycles per silesia.tar compression -2.6% at level
+0, -0.4% at 1, +0.3% at 2 (perf; wall clock is within noise). The rest
+of the time is the inherently unpredictable "is the candidate a match"
+branch (~16 M misses per compression) and the candidate loads.
+
 Tried at the same time and dropped (Pascal compressor, relative): a
 repeat-offset candidate when the hash misses (-0.1 to -0.3 points, -1
 to -10% speed), inserting ip-1 or the start of long matches too (~0 /
