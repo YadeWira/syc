@@ -97,6 +97,15 @@ type
     table: PUInt32;      { level 1 hash table }
     head: PInt32;        { levels 2+: hash heads }
     chain: PUInt16;      { levels 2+: chain deltas }
+    opt: PByte;          { optimal parser: nodes, candidates, path }
+  end;
+
+  { Optimal parser settings (EXPERIMENT: exposed for calibration). }
+  TSylzOptParams = record
+    attempts: Integer;          { hash chain depth }
+    sufficient: Integer;        { a match at least this long is taken as is }
+    pSeq, pEsc, pShort: Single; { decode-time penalties, in bytes: per
+                                  sequence, per escape token, per offset < 16 }
   end;
 
 procedure SylzCtxInit(out ctx: TSylzCtx);
@@ -125,6 +134,10 @@ var
     with -dSYLZ_PUREPASCAL). Both paths produce the same results; tests
     turn this off to exercise the Pascal one. }
   SylzUseAsm: Boolean = True;
+
+  { EXPERIMENT: when set, levels >= 2 use the optimal parser with these }
+  SylzOptOverride: Boolean = False;
+  SylzOptExp: TSylzOptParams = (attempts: 64; sufficient: 128; pSeq: 1.0; pEsc: 2.0; pShort: 1.0);
 
 implementation
 
@@ -867,6 +880,259 @@ begin
   Result := CompressHCCore(src, n, e, s, level);
 end;
 
+{ ── optimal parser ──────────────────────────────────────────────────────── }
+
+{ A forward dynamic program over windows of OPT_WINDOW positions: node i is
+  the cheapest way found to encode up to window position i, with its
+  pending literal count. Each position offers one literal and, for every
+  match candidate, every match length up to the candidate's (each length
+  priced with the nearest candidate that reaches it). The price is in
+  bytes plus decode-time penalties (TSylzOptParams), so the parse can
+  trade a byte for fewer, cheaper sequences. A match of `sufficient`
+  bytes or more is taken as is, which keeps repetitive data linear. }
+
+const
+  OPT_WINDOW  = 4096;
+  OPT_MAXCAND = 64;
+
+type
+  TOptNode = record
+    cost: Single;
+    ll: Int32;      { pending literals at this node }
+    ml: Int32;      { 0: reached by a literal, else by a match of ml bytes }
+    dist: Int32;
+  end;
+  POptNode = ^TOptNode;
+
+const
+  OPT_NODES_BYTES = (OPT_WINDOW + 1) * SizeOf(TOptNode);
+  OPT_CANDS_BYTES = OPT_MAXCAND * 2 * SizeOf(Int32);
+  OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
+
+{ Every match at pos longer than the previous one found, nearest first;
+  cands holds (length, distance) pairs. Returns how many. }
+function HcFindAll(var s: THcState; pos: SizeInt; matchlimit: PByte;
+  cands: PInt32): Integer;
+var
+  ip, ref: PByte;
+  cand, delta, len, best: SizeInt;
+  tries: Integer;
+  first: UInt32;
+begin
+  Result := 0;
+  HcInsertUpTo(s, pos);
+  ip := s.src + pos;
+  first := Read32(ip);
+  best := SYLZ_MINMATCH - 1;
+  cand := s.head[Hash4(first, HC_HASHLOG)];
+  if (cand < 0) or (cand >= pos) then
+    Exit;
+  tries := s.attempts;
+  while (tries > 0) and (pos - cand <= HC_MAXDIST) do
+  begin
+    ref := s.src + cand;
+    if (ref[best] = ip[best]) and (Read32(ref) = first) then
+    begin
+      len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, matchlimit);
+      if len > best then
+      begin
+        best := len;
+        cands[2 * Result] := Int32(len);
+        cands[2 * Result + 1] := Int32(pos - cand);
+        Inc(Result);
+        if (Result = OPT_MAXCAND) or (ip + len >= matchlimit) then
+          Break;
+      end;
+    end;
+    Dec(tries);
+    delta := s.chain[cand and HC_CHAINMASK];
+    if delta = 0 then
+      Break;
+    Dec(cand, delta);
+  end;
+end;
+
+function ExtBytes(v: SizeInt): SizeInt; inline;
+begin
+  Result := v div 255 + 1;
+end;
+
+{ Prices, in bytes plus decode penalties, split the way EmitSequence
+  encodes. A run of ll pending literals is priced as it grows (a literal
+  byte each, plus the literal extension and the escape penalty once the run
+  passes EXACT_LL), so a node's price already covers its pending literals
+  and comparing nodes with different runs is fair. Charging the literal
+  extension to the match that ends a run instead made a match after a long
+  run look prohibitive, and the parse then never ended a run. }
+function LitRunCost(ll: SizeInt; const p: TSylzOptParams): Single; inline;
+begin
+  if ll <= EXACT_LL then
+    Result := ll
+  else
+    Result := ll + ExtBytes(ll) + p.pEsc;
+end;
+
+{ The match's share of a sequence: ll is the pending run, already priced. }
+function MatchCost(ll, ml, dist: SizeInt; const p: TSylzOptParams): Single; inline;
+var
+  m: SizeInt;
+begin
+  m := ml - SYLZ_MINMATCH;
+  if ll <= EXACT_LL then
+  begin
+    if (m <= EXACT_M) and (ExactCode[ll, m] <> 255) then
+      Result := 3 + p.pSeq
+    else
+      Result := 3 + ExtBytes(m) + p.pSeq + p.pEsc;   { ESC_ML }
+  end
+  else if m <= EXACT_M then
+    Result := 3 + p.pSeq                             { ESC_LL, paid by the run }
+  else
+    Result := 3 + ExtBytes(m) + p.pSeq;              { ESC_BOTH }
+  if dist < 16 then
+    Result := Result + p.pShort;
+end;
+
+function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
+  work: PByte; const p: TSylzOptParams): SizeInt;
+var
+  nodes: POptNode;
+  cands, path: PInt32;
+  iend: PByte;
+  limit, anchor, start, w, i, j, k, c, ml, len, dist, prevLen, npath, t,
+    pos, forcedLen, forcedDist: SizeInt;
+  cost, tc: Single;
+  forced: Boolean;
+begin
+  nodes := POptNode(work);
+  cands := PInt32(work + OPT_NODES_BYTES);
+  path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
+  iend := src + n;
+  anchor := 0;
+  if n >= SEARCH_TAIL + 1 then
+  begin
+    s.src := src;
+    s.nextToInsert := 0;
+    s.attempts := p.attempts;
+    limit := n - SEARCH_TAIL;
+    start := 0;
+    while start < limit do
+    begin
+      w := OPT_WINDOW;
+      if start + w > limit then
+        w := limit - start;
+      nodes[0].cost := LitRunCost(start - anchor, p);
+      nodes[0].ll := Int32(start - anchor);
+      nodes[0].ml := 0;
+      for i := 1 to w do
+        nodes[i].cost := 1e30;
+      forced := False;
+      forcedLen := 0;
+      forcedDist := 0;
+      i := 0;
+      while i < w do
+      begin
+        cost := nodes[i].cost;
+        tc := cost - LitRunCost(nodes[i].ll, p) + LitRunCost(nodes[i].ll + 1, p);
+        if tc < nodes[i + 1].cost then
+        begin
+          nodes[i + 1].cost := tc;
+          nodes[i + 1].ll := nodes[i].ll + 1;
+          nodes[i + 1].ml := 0;
+        end;
+        k := HcFindAll(s, start + i, iend, cands);
+        if k > 0 then
+        begin
+          if cands[2 * (k - 1)] >= p.sufficient then
+          begin
+            forced := True;
+            forcedLen := cands[2 * (k - 1)];
+            forcedDist := cands[2 * (k - 1) + 1];
+            w := i;
+            Break;
+          end;
+          prevLen := SYLZ_MINMATCH - 1;
+          for c := 0 to k - 1 do
+          begin
+            len := cands[2 * c];
+            dist := cands[2 * c + 1];
+            for ml := prevLen + 1 to len do
+            begin
+              j := i + ml;
+              if j > w then
+                Break;
+              tc := cost + MatchCost(nodes[i].ll, ml, dist, p);
+              if tc < nodes[j].cost then
+              begin
+                nodes[j].cost := tc;
+                nodes[j].ll := 0;
+                nodes[j].ml := Int32(ml);
+                nodes[j].dist := Int32(dist);
+              end;
+            end;
+            prevLen := len;
+          end;
+        end;
+        Inc(i);
+      end;
+
+      { the cheapest path to node w, back to front }
+      npath := 0;
+      j := w;
+      while j > 0 do
+        if nodes[j].ml = 0 then
+          Dec(j)
+        else
+        begin
+          path[3 * npath] := Int32(j - nodes[j].ml);
+          path[3 * npath + 1] := nodes[j].ml;
+          path[3 * npath + 2] := nodes[j].dist;
+          Inc(npath);
+          Dec(j, nodes[j].ml);
+        end;
+      for t := npath - 1 downto 0 do
+      begin
+        pos := start + path[3 * t];
+        if not EmitSequence(e, src + anchor, pos - anchor, path[3 * t + 2], path[3 * t + 1]) then
+          Exit(-1);
+        anchor := pos + path[3 * t + 1];
+      end;
+      if forced then
+      begin
+        pos := start + w;
+        if not EmitSequence(e, src + anchor, pos - anchor, forcedDist, forcedLen) then
+          Exit(-1);
+        anchor := pos + forcedLen;
+        start := anchor;
+      end
+      else
+        start := start + w;
+    end;
+  end;
+  Result := EmitFinish(e, src + anchor, n - anchor);
+end;
+
+function CompressOpt(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; const p: TSylzOptParams): SizeInt;
+var
+  e: TEmit;
+  s: THcState;
+  i: Integer;
+begin
+  if ctx.head = nil then
+    ctx.head := GetMem(SizeOf(Int32) shl HC_HASHLOG);
+  if ctx.chain = nil then
+    ctx.chain := GetMem(SizeOf(UInt16) * HC_CHAINSIZE);
+  if ctx.opt = nil then
+    ctx.opt := GetMem(OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
+  s.head := ctx.head;
+  s.chain := ctx.chain;
+  for i := 0 to (1 shl HC_HASHLOG) - 1 do
+    s.head[i] := -1;
+  EmitInit(e, dst, cap, ctx.scratch, src + n);
+  Result := CompressOptCore(src, n, e, s, ctx.opt, p);
+end;
+
 procedure SylzCtxInit(out ctx: TSylzCtx);
 begin
   FillChar(ctx, SizeOf(ctx), 0);
@@ -878,6 +1144,7 @@ begin
   FreeMem(ctx.table);
   FreeMem(ctx.head);
   FreeMem(ctx.chain);
+  FreeMem(ctx.opt);
   SylzCtxInit(ctx);
 end;
 
@@ -898,6 +1165,8 @@ begin
   end;
   if level = 1 then
     Result := CompressFast(ctx, src, n, dst, cap)
+  else if SylzOptOverride then
+    Result := CompressOpt(ctx, src, n, dst, cap, SylzOptExp)
   else
     Result := CompressHC(ctx, src, n, dst, cap, level);
 end;

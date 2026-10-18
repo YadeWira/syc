@@ -132,6 +132,17 @@ begin
   levels := [1, 2, 4, 6, 9, 12];
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
     SylzUseAsm := False;
+  { EXPERIMENT: SYLZ_OPT=attempts,sufficient,pSeq,pEsc,pShort }
+  if GetEnvironmentVariable('SYLZ_OPT') <> '' then
+  begin
+    parts := GetEnvironmentVariable('SYLZ_OPT').Split([',']);
+    SylzOptOverride := True;
+    SylzOptExp.attempts := StrToInt(parts[0]);
+    SylzOptExp.sufficient := StrToInt(parts[1]);
+    SylzOptExp.pSeq := StrToFloat(parts[2]);
+    SylzOptExp.pEsc := StrToFloat(parts[3]);
+    SylzOptExp.pShort := StrToFloat(parts[4]);
+  end;
   minTime := 1.0;
   argi := 1;
   while (argi <= ParamCount) and (Copy(ParamStr(argi), 1, 1) = '-') do
