@@ -55,9 +55,10 @@ interface
 const
   SYLZ_MINMATCH = 4;
   SYLZ_MAXDIST  = 65536;
-  { Levels 0..10: 0-2 are the fast single-hash levels (a bigger table each
-    step: slower compression, better ratio); 3-8 use hash chains with lazy
-    matching; 9 and 10 a decode-aware optimal parser. 1 is the default. }
+  { Levels 0..10: 0-1 are the fast single-hash levels (1 has the bigger
+    table); 2-3 use two hash tables (2 greedy, 3 lazy); 4-8 hash chains
+    with lazy matching; 9 and 10 a decode-aware optimal parser. 1 is the
+    default. }
   SYLZ_MINLEVEL = 0;
   SYLZ_MAXLEVEL = 10;
   SYLZ_DEFLEVEL = 1;
@@ -111,9 +112,9 @@ type
   TSylzCtx = record
     scratch: PByte;
     scratchSize: SizeInt;
-    table: PUInt16;      { fast-level hash table (low 16 bits of positions) }
-    head: PInt32;        { levels 2+: hash heads }
-    chain: PUInt16;      { levels 2+: chain deltas }
+    table: PUInt16;      { levels 0-3: hash tables (low 16 bits of positions) }
+    head: PInt32;        { levels 4+: hash heads }
+    chain: PUInt16;      { levels 4+: chain deltas }
     opt: PByte;          { optimal parser: nodes, candidates, path }
     flags: Integer;      { of the current call }
   end;
@@ -137,8 +138,9 @@ procedure SylzDCtxFree(var dctx: TSylzDCtx);
 function SylzBound(n: SizeInt): SizeInt;
 
 { Compresses src[0..n) into dst (capacity cap, at least SylzBound(n)).
-  level 0..2 = fast greedy, 3..8 = hash chains with lazy matching,
-  9..SYLZ_MAXLEVEL = optimal parsing (see SYLZ_MINLEVEL).
+  level 0..1 = fast greedy, 2..3 = two hash tables (2 greedy, 3 lazy),
+  4..8 = hash chains with lazy matching, 9..SYLZ_MAXLEVEL = optimal
+  parsing (see SYLZ_MINLEVEL).
   Returns the compressed size, or -1 if cap is too small. }
 function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
   level: Integer): SizeInt;
@@ -194,7 +196,6 @@ const
   ESC_LL       = 226;   { + match - 4: literals extended, match exact }
   ESC_BOTH     = 255;
   SEARCH_TAIL  = 12;    { no match search within this many bytes of the end }
-  FAST_MAXLOG  = 16;    { largest fast-level hash table, 2^16 entries }
   { The fast levels hash 6 bytes (64-bit targets): against 5, fewer and
     longer matches, so 6% fewer decode cycles (silesia.tar), and faster
     compression; the ratio lost is won back by the table size per level. }
@@ -204,9 +205,18 @@ const
   HC_MAXDIST   = 65535; { chain deltas are UInt16 }
   HC_CHAINSIZE = 1 shl 16;
   HC_CHAINMASK = HC_CHAINSIZE - 1;
-  { hash chain depth of the lazy levels 3..8 }
-  HC_ATTEMPTS: array[3..8] of Integer = (2, 4, 8, 16, 64, 256);
-  SCRATCH_SLACK = 16;   { literal scratch overshoot room for Copy16 }
+  { hash chain depth of the lazy levels 4..8 }
+  HC_ATTEMPTS: array[4..8] of Integer = (4, 8, 16, 64, 256);
+  { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
+    on 4; 2^15 entries each at level 2, 2^16 at level 3 }
+  MID_MAXLOG   = 16;
+  MID_SKIP     = 9;     { probe step 1 + (literals so far) shr MID_SKIP }
+  MID_LAZY_ENOUGH = 32; { level 3 stops looking one byte later at this length }
+  MID_NEXT_BELOW = 8;   { level 2 looks one byte later below this length }
+  SCRATCH_SLACK = 16;
+  { TSylzCtx.table: 2^17 entries, the two tables of level 3 (the fast
+    levels use at most 2^15) }
+  CTX_TABLELOG = MID_MAXLOG + 1;   { literal scratch overshoot room for Copy16 }
 
 function SylzBound(n: SizeInt): SizeInt;
 begin
@@ -255,12 +265,10 @@ end;
 { hash table size of each fast level }
 function FastHashLog(level: Integer): Integer;
 begin
-  case level of
-    0: Result := 13;
-    1: Result := 15;
+  if level = 0 then
+    Result := 13
   else
-    Result := 16;   { level 2 }
-  end;
+    Result := 15;   { level 1 }
 end;
 
 { Length of the common prefix of a and b, not reading at or past limit
@@ -460,7 +468,7 @@ begin
   Result := HEADER_SIZE + ctrlLen + litTotal;
 end;
 
-{ ── level 1: greedy, single hash table, accelerating skip ────────────────── }
+{ ── levels 0-1: greedy, single hash table, accelerating skip ────────────── }
 
 { The hot loops take raw, preallocated buffers and leave allocation to a
   wrapper: a try/finally or a managed local (dynamic array) gives a routine
@@ -850,7 +858,7 @@ var
 {$endif}
 begin
   if ctx.table = nil then
-    ctx.table := GetMem(SizeOf(UInt16) shl FAST_MAXLOG);
+    ctx.table := GetMem(SizeOf(UInt16) shl CTX_TABLELOG);
   table := ctx.table;
   hashLog := FastHashLog(level);
   begin
@@ -877,7 +885,152 @@ begin
   end;
 end;
 
-{ ── levels 2+: hash chains, lazy matching ────────────────────────────────── }
+{ ── levels 2-3: two hash tables ────────────────────────────────────────── }
+
+{ After LZ4's "mid" parser (lz4hc levels 1-2): a table keyed on 6 bytes,
+  tried first, finds the long matches; one keyed on 4 bytes the short
+  ones. Both keep the low 16 bits of a position (FastDist). Only a few
+  positions of each match are inserted (its second and third, and the two
+  before its end), and the probe step grows with the literals since the
+  last match. Level 2 is greedy, with one look at the next byte's long
+  candidate after a match shorter than MID_NEXT_BELOW; level 3 has tables
+  twice as big and looks one byte later in both while that gives a longer
+  match (lazy). Against hash chains, which insert and search every
+  position and were bound by the latency of their head table: silesia.tar
+  level 3 39.99% at 139 MB/s in Pascal, where 2-attempt hash chains made
+  40.75% at 71 MB/s. }
+
+function MidHashLong(p: PByte; hashLog: Integer): UInt32; inline;
+begin
+{$ifdef CPU64}
+  Result := UInt32((Read64(p) shl 16) * UInt64(889523592379) shr (64 - hashLog));
+{$else}
+  Result := Hash4(Read32(p) + UInt32(Read32(p + 2) * UInt32(2246822519)), hashLog);
+{$endif}
+end;
+
+function MidHashShort(p: PByte; hashLog: Integer): UInt32; inline;
+begin
+  Result := Hash4(Read32(p), hashLog);
+end;
+
+{ Looks up and replaces table[h] with pos: the candidate's distance if its
+  first 4 bytes match, else 0. }
+function MidCand(table: PUInt16; h: UInt32; src: PByte; pos: SizeInt): SizeInt; inline;
+begin
+  Result := FastDist(pos, table[h]);
+  table[h] := UInt16(pos);
+  if (Result > pos) or (Read32(src + pos - Result) <> Read32(src + pos)) then
+    Result := 0;
+end;
+
+function CompressMidCore(src: PByte; n: SizeInt; var e: TEmit; tl, ts: PUInt16;
+  hashLog: Integer; lazy: Boolean): SizeInt;
+var
+  iend, mflimit: PByte;
+  pos, anchor, len, dist, len2, dist2, dshort, k, mend: SizeInt;
+begin
+  iend := src + n;
+  anchor := 0;
+  if n >= SEARCH_TAIL + 1 then
+  begin
+    mflimit := iend - SEARCH_TAIL;
+    pos := 0;
+    while src + pos < mflimit do
+    begin
+      dist := MidCand(tl, MidHashLong(src + pos, hashLog), src, pos);
+      if dist > 0 then
+        ts[MidHashShort(src + pos, hashLog)] := UInt16(pos)
+      else
+      begin
+        dist := MidCand(ts, MidHashShort(src + pos, hashLog), src, pos);
+        if dist = 0 then
+        begin
+          Inc(pos, 1 + (pos - anchor) shr MID_SKIP);
+          Continue;
+        end;
+      end;
+      len := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
+        src + pos - dist + SYLZ_MINMATCH, iend);
+
+      if lazy then
+        { both tables one byte later, while that finds a longer match }
+        while (len < MID_LAZY_ENOUGH) and (src + pos + 1 < mflimit) do
+        begin
+          k := pos + 1;
+          dist2 := MidCand(tl, MidHashLong(src + k, hashLog), src, k);
+          dshort := MidCand(ts, MidHashShort(src + k, hashLog), src, k);
+          if dist2 = 0 then
+            dist2 := dshort;
+          if dist2 = 0 then
+            Break;
+          len2 := SYLZ_MINMATCH + CountMatch(src + k + SYLZ_MINMATCH,
+            src + k - dist2 + SYLZ_MINMATCH, iend);
+          if len2 <= len then
+            Break;
+          pos := k;
+          len := len2;
+          dist := dist2;
+        end
+      else if (len < MID_NEXT_BELOW) and (src + pos + 1 < mflimit) then
+      begin
+        { a short match: a long one one byte later? }
+        k := pos + 1;
+        dist2 := MidCand(tl, MidHashLong(src + k, hashLog), src, k);
+        if dist2 > 0 then
+        begin
+          len2 := SYLZ_MINMATCH + CountMatch(src + k + SYLZ_MINMATCH,
+            src + k - dist2 + SYLZ_MINMATCH, iend);
+          if len2 > len then
+          begin
+            pos := k;
+            len := len2;
+            dist := dist2;
+          end;
+        end;
+      end;
+
+      while (pos > anchor) and (pos > dist) and (src[pos - 1] = src[pos - 1 - dist]) do
+      begin
+        Dec(pos);
+        Inc(len);
+      end;
+      if not EmitSequence(e, src + anchor, pos - anchor, dist, len) then
+        Exit(-1);
+      mend := pos + len;
+      if src + mend < mflimit then
+      begin
+        tl[MidHashLong(src + pos + 1, hashLog)] := UInt16(pos + 1);
+        ts[MidHashShort(src + pos + 2, hashLog)] := UInt16(pos + 2);
+        tl[MidHashLong(src + mend - 2, hashLog)] := UInt16(mend - 2);
+        ts[MidHashShort(src + mend - 1, hashLog)] := UInt16(mend - 1);
+      end;
+      pos := mend;
+      anchor := pos;
+    end;
+  end;
+  Result := EmitFinish(e, src + anchor, n - anchor);
+end;
+
+function CompressMid(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer): SizeInt;
+var
+  e: TEmit;
+  hashLog: Integer;
+begin
+  if ctx.table = nil then
+    ctx.table := GetMem(SizeOf(UInt16) shl CTX_TABLELOG);
+  if level = 2 then
+    hashLog := MID_MAXLOG - 1
+  else
+    hashLog := MID_MAXLOG;
+  FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
+  EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
+  Result := CompressMidCore(src, n, e, ctx.table, ctx.table + (1 shl hashLog),
+    hashLog, level = 3);
+end;
+
+{ ── levels 4-8: hash chains, lazy matching ────────────────────────────────── }
 
 type
   THcState = record
@@ -1346,8 +1499,10 @@ begin
     ctx.scratchSize := n + SCRATCH_SLACK;
     ctx.scratch := GetMem(ctx.scratchSize);
   end;
-  if level <= 2 then
+  if level <= 1 then
     Result := CompressFast(ctx, src, n, dst, cap, level)
+  else if level <= 3 then
+    Result := CompressMid(ctx, src, n, dst, cap, level)
   else if level = 9 then
     Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL9)
   else if level = 10 then

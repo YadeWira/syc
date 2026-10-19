@@ -56,6 +56,36 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Levels 2-3: two hash tables (2026-10-18)
+
+The old level 2 (single hash, 2^16 entries) made 44.19% against level
+1's 44.55%, at about the same speed; level 3 (hash chains, 2 attempts,
+lazy) 40.75% at 70 MB/s, 7x slower. lz4hc -1/-2 ("LZ4MID": two hash
+tables, greedy) made 42.05% at 211 MB/s, lizard -12 40.68% at 109.
+
+Hash chains insert and search every position; perf put most of their
+time on the head-table loads (two hot spots of 11% each, right after
+them). Smaller tables, 16-bit heads, a 5-byte hash, a capped lazy step or
+a single attempt moved them only to 60-77 MB/s (1 attempt: 41.37% at 77).
+
+The two-table parser (Pascal; silesia.tar / mixed, one session):
+
+| variant | silesia | compress | decompress | mixed | compress |
+|---|---|---|---|---|---|
+| greedy, no look at the next byte | 42.23% | 203 MB/s | 2990 MB/s | 64.02% | 191 MB/s |
+| greedy + next byte's long candidate when len < 8 (**level 2**) | 40.89% | 187 MB/s | 3351 MB/s | 63.29% | 200 MB/s |
+| greedy + that look for every len < 32 | 40.65% | 182 MB/s | 3121 MB/s | 63.19% | 200 MB/s |
+| lazy, 2^15 tables | 40.29% | 167 MB/s | 3118 MB/s | 63.00% | 188 MB/s |
+| lazy, 2^16 tables (**level 3**) | 39.99% | 139 MB/s | 3373 MB/s | 62.89% | 158 MB/s |
+| old level 3 (hash chains) | 40.75% | 71 MB/s | 3027 MB/s | 62.60% | 53 MB/s |
+
+Found on the way (experiment harness, Int32 tables): 16-bit position
+tables +35-40% compression speed, same output otherwise; 6-byte long hash
+better than 8 (41.37 vs 41.69%); a 5-byte short hash decodes faster
+(fewer short matches) but loses 0.4 points; inserting every position of
+a match, or every 2nd-4th into the long table, cost 10-30% speed for
+0.1-0.3 points; probe step shift 9 against 8, 10, 12: within noise.
+
 ## sylz format v3 (experimental, 2026-10-18)
 
 v2 plus optionally Huffman-coded literals. Bit 31 of the block's first

@@ -26,9 +26,10 @@ literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
 Format v3 (`-ec`, extra compression, experimental) adds Huffman-coded literals, in 64 KiB
 chunks with four interleaved streams; a v2 block is a valid v3 block.
-Eleven levels, `-0` to `-10` (default `-1`): `-0` to `-2` are greedy
-single-hash levels (a bigger hash table at each step); `-3` to `-8` use
-hash chains with lazy matching; `-9` and `-10` an optimal parser whose
+Eleven levels, `-0` to `-10` (default `-1`): `-0` and `-1` are greedy
+single-hash levels (`-1` with the bigger table); `-2` and `-3` use two
+hash tables, keyed on 6 and 4 bytes (`-2` greedy, `-3` lazy); `-4` to
+`-8` hash chains with lazy matching; `-9` and `-10` an optimal parser whose
 prices include decode time, so it picks cheaper sequences. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
