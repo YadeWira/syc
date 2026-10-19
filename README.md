@@ -34,44 +34,47 @@ prices include decode time, so it picks cheaper sequences. The decoder is safe o
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
-silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz).
-Fast and middle levels, one session:
+silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
+everything in one session (2026-10-19). Fast and middle levels:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 492 MB/s | 2979 MB/s | 47.59% |
-| zxc 0.15.0 -3 | 159 MB/s | 3464 MB/s | 46.65% |
-| misa77 0.6.0 --1 | 277 MB/s | 3979 MB/s | 46.74% |
-| **sylz -0** | **539 MB/s** | 3512 MB/s | 46.51% |
-| **sylz -1** | **503 MB/s** | 3523 MB/s | **44.55%** |
-| **sylz -2** | 479 MB/s | 3522 MB/s | 44.19% |
-| misa77 0.6.0 -0 | 171 MB/s | 3963 MB/s | 44.60% |
-| zxc 0.15.0 -4 | 117 MB/s | 3421 MB/s | 43.43% |
-| zxc 0.15.0 -5 | 69.8 MB/s | 3454 MB/s | 40.83% |
-| sylz -3 | 73.7 MB/s | 3002 MB/s | 40.75% |
+| lz4 1.10.0 | 518 MB/s | 3199 MB/s | 47.59% |
+| misa77 0.6.0 --1 | 265 MB/s | 3914 MB/s | 46.74% |
+| zxc 0.15.0 -3 | 151 MB/s | 3413 MB/s | 46.65% |
+| **sylz -0** | 507 MB/s | 3150 MB/s | 46.51% |
+| misa77 0.6.0 -0 | 160 MB/s | 3853 MB/s | 44.60% |
+| **sylz -1** | 455 MB/s | 3143 MB/s | 44.55% |
+| zxc 0.15.0 -4 | 110 MB/s | 3355 MB/s | 43.43% |
+| lz4hc 1.10.0 -2 | 229 MB/s | 2861 MB/s | 42.05% |
+| **sylz -2** | **255 MB/s** | 2955 MB/s | **40.89%** |
+| zxc 0.15.0 -5 | 67.0 MB/s | 3344 MB/s | 40.83% |
+| lizard 2.1 -12 | 115 MB/s | 2785 MB/s | 40.68% |
+| **sylz -3** | **189 MB/s** | 2990 MB/s | **39.99%** |
+| sylz -4 | 60.9 MB/s | 2975 MB/s | 39.35% |
 
-High ratios, another session (load ~6, so all speeds a little lower):
+High ratios:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4hc 1.10.0 -9 | 25.6 MB/s | 2784 MB/s | 36.75% |
-| zxc 0.15.0 -6 | 8.46 MB/s | 2655 MB/s | 36.28% |
-| **sylz -9** | 5.24 MB/s | **3170 MB/s** | 36.37% |
-| **sylz -10** | 2.52 MB/s | 3238 MB/s | 36.12% |
-| zstd 1.5.7 -1 | 317 MB/s | 1035 MB/s | 34.53% |
-| **sylz -ec -8** (v3) | 19.5 MB/s | **2062 MB/s** | 34.82% |
-| **sylz -ec -9** (v3) | 4.99 MB/s | 2032 MB/s | **34.29%** |
-| **sylz -ec -10** (v3) | 2.52 MB/s | **2080 MB/s** | 34.06% |
-| zxc 0.15.0 -7 | 5.67 MB/s | 1866 MB/s | 33.09% |
-| zstd 1.5.7 -2 | 223 MB/s | 757 MB/s | 32.70% |
-| zstd 1.5.7 -3 | 152 MB/s | 650 MB/s | 31.20% |
+| lz4hc 1.10.0 -9 | 26.5 MB/s | 3103 MB/s | 36.75% |
+| **sylz -9** | 5.29 MB/s | **3397 MB/s** | 36.37% |
+| zxc 0.15.0 -6 | 9.10 MB/s | 2888 MB/s | 36.28% |
+| **sylz -10** | 2.50 MB/s | 3171 MB/s | 36.12% |
+| **sylz -ec -8** (v3) | 20.2 MB/s | 2190 MB/s | 34.82% |
+| zstd 1.5.7 -1 | 344 MB/s | 1115 MB/s | 34.53% |
+| **sylz -ec -9** (v3) | 5.47 MB/s | 2273 MB/s | 34.29% |
+| **sylz -ec -10** (v3) | 2.75 MB/s | **2411 MB/s** | **34.06%** |
+| zxc 0.15.0 -7 | 6.38 MB/s | 1956 MB/s | 33.09% |
+| zstd 1.5.7 -2 | 240 MB/s | 811 MB/s | 32.70% |
+| zstd 1.5.7 -3 | 161 MB/s | 700 MB/s | 31.20% |
 
 `-ec` is format v3 (Huffman-coded literals, experimental): on silesia.tar
 it beats zstd -1 on ratio at twice its decompression speed, but compresses
 far slower; on mixed data zstd -1 is still smaller.
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
-the same core († in a later session, on another core). More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
 The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 
 ## Build
