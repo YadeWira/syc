@@ -29,6 +29,7 @@ const
   DEFAULT_BLOCK = 4 shl 20;
   MAX_BLOCK     = 512 shl 20;
   SUFFIX        = '.sylz';
+  TMP_SUFFIX    = '.syc-partial';
 
 var
   crcTable: array[0..255] of UInt32;
@@ -74,13 +75,26 @@ begin
     ': 0-1 single hash, 2-3 two hashes, 4-8 hash chains, 9-10 optimal parsing');
   WriteLn('  -ec       extra compression: entropy-coded literals (sylz format v3,');
   WriteLn('            experimental), smaller, slower to decode');
-  WriteLn('  -b MIB  block size in MiB, default ', DEFAULT_BLOCK shr 20);
+  WriteLn('  -b MIB    block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 
 procedure Die(const msg: string);
 begin
   WriteLn(StdErr, 'syc: ', msg);
   Halt(1);
+end;
+
+type
+  { an error while compressing or decompressing: the main program deletes
+    the partial output before reporting it }
+  ESycError = class(Exception);
+
+var
+  tmpPath: string = '';   { the output being written, renamed when complete }
+
+procedure Fail(const msg: string);
+begin
+  raise ESycError.Create(msg);
 end;
 
 procedure WriteU32(s: TStream; v: UInt32);
@@ -125,7 +139,8 @@ begin
   packed_ := GetMem(SylzBound(blockSize));
   SylzCtxInit(ctx);
   try
-    fout := TFileStream.Create(outPath, fmCreate);
+    tmpPath := outPath + TMP_SUFFIX;
+    fout := TFileStream.Create(tmpPath, fmCreate);
     Move(MAGIC[1], hdr[0], 4);
     if flags and SYLZ_ENTROPY <> 0 then
       hdr[4] := FORMAT_VER
@@ -140,7 +155,7 @@ begin
         Break;
       c := SylzCompressEx(ctx, raw, n, packed_, SylzBound(blockSize), level, flags);
       if c < 0 then
-        Die('internal error: compression failed');
+        Fail('internal error: compression failed');
       WriteU32(fout, UInt32(n));
       if c < n then
       begin
@@ -186,10 +201,11 @@ begin
   payCap := 0;
   try
     if (ReadFull(fin, @hdr[0], 6) <> 6) or (CompareByte(hdr[0], MAGIC[1], 4) <> 0) then
-      Die(inPath + ': not a syc file');
+      Fail(inPath + ': not a syc file');
     if (hdr[4] < 1) or (hdr[4] > FORMAT_VER) then
-      Die(Format('%s: format version %d not supported by syc %s', [inPath, hdr[4], SYC_VERSION]));
-    fout := TFileStream.Create(outPath, fmCreate);
+      Fail(Format('%s: format version %d not supported by syc %s', [inPath, hdr[4], SYC_VERSION]));
+    tmpPath := outPath + TMP_SUFFIX;
+    fout := TFileStream.Create(tmpPath, fmCreate);
     total := 0;
     while True do
     begin
@@ -200,7 +216,7 @@ begin
       sum := ReadU32(fin);
       payLen := packedField and PAYLOAD_MASK;
       if (rawLen > MAX_BLOCK) or (payLen > MAX_BLOCK) then
-        Die(inPath + ': corrupt block header');
+        Fail(Format('%s: corrupt block header at output offset %d', [inPath, total]));
       if SizeInt(rawLen) > rawCap then
       begin
         FreeMem(raw);
@@ -210,9 +226,9 @@ begin
       if packedField and STORED_FLAG <> 0 then
       begin
         if payLen <> rawLen then
-          Die(inPath + ': corrupt block header');
+          Fail(Format('%s: corrupt block header at output offset %d', [inPath, total]));
         if ReadFull(fin, raw, rawLen) <> SizeInt(rawLen) then
-          Die(inPath + ': truncated');
+          Fail(inPath + ': truncated');
       end
       else
       begin
@@ -223,12 +239,12 @@ begin
           payload := GetMem(payCap);
         end;
         if ReadFull(fin, payload, payLen) <> SizeInt(payLen) then
-          Die(inPath + ': truncated');
+          Fail(inPath + ': truncated');
         if SylzDecompress(payload, payLen, raw, rawLen) <> SizeInt(rawLen) then
-          Die(Format('%s: corrupt data at offset %d', [inPath, total]));
+          Fail(Format('%s: corrupt data in the block at output offset %d', [inPath, total]));
       end;
       if crc32(0, raw, rawLen) <> sum then
-        Die(Format('%s: checksum mismatch at offset %d', [inPath, total]));
+        Fail(Format('%s: checksum mismatch in the block at output offset %d', [inPath, total]));
       fout.WriteBuffer(raw^, rawLen);
       Inc(total, rawLen);
     end;
@@ -262,6 +278,9 @@ begin
     WriteLn('syc ', SYC_VERSION);
     Exit;
   end;
+
+  if (cmd <> 'c') and (cmd <> 'd') then
+    Die('unknown command ' + cmd + ' (syc -h for help)');
 
   level := SYLZ_DEFLEVEL;
   flags := 0;
@@ -302,6 +321,8 @@ begin
     begin
       if outPath = '' then
         outPath := inPath + SUFFIX;
+      if SameFileName(ExpandFileName(inPath), ExpandFileName(outPath)) then
+        Die('OUTPUT is INPUT');
       Compress(inPath, outPath, level, blockMiB shl 20, flags);
     end
     else if cmd = 'd' then
@@ -312,14 +333,23 @@ begin
           Die('INPUT has no ' + SUFFIX + ' suffix: give OUTPUT explicitly');
         outPath := ChangeFileExt(inPath, '');
       end;
+      if SameFileName(ExpandFileName(inPath), ExpandFileName(outPath)) then
+        Die('OUTPUT is INPUT');
       Decompress(inPath, outPath);
-    end
-    else
-      Die('unknown command ' + cmd + ' (syc -h for help)');
+    end;
+    { complete: replace OUTPUT (on Windows a rename does not overwrite) }
+    if FileExists(outPath) and not DeleteFile(outPath) then
+      Fail('cannot replace ' + outPath);
+    if not RenameFile(tmpPath, outPath) then
+      Fail('cannot rename ' + tmpPath + ' to ' + outPath);
+    tmpPath := '';
   except
-    on E: EStreamError do
+    on E: Exception do
+    begin
+      { no partial output left behind; an existing OUTPUT stays as it was }
+      if tmpPath <> '' then
+        DeleteFile(tmpPath);
       Die(E.Message);
-    on E: EInOutError do
-      Die(E.Message);
+    end;
   end;
 end.
