@@ -9,8 +9,8 @@
 
   lengths packs the code length of symbol 2k in the low nibble of byte k
   and of 2k+1 in the high nibble; 0 = the symbol does not occur, else
-  1..HUF_MAXBITS. Codes are canonical: shorter codes first, equal lengths
-  by symbol. The chunk's n symbols are split into four runs of
+  1..HUF_MAXBITS. Mode 1 needs n >= HUF_MIN_SYMBOLS. Codes are canonical:
+  shorter codes first, equal lengths by symbol. The chunk's n symbols are split into four runs of
   q = (n + 3) div 4 symbols (the last one shorter), each coded into its
   own stream, LSB first (a code's first bit is the lowest unused bit, as
   in deflate, so the decoder reads 8 bytes little-endian with no byte
@@ -34,6 +34,10 @@ const
   HUF_TABLESIZE = 1 shl HUF_MAXBITS;
   HUF_HEADER    = 128 + 6;   { lengths + three stream sizes }
   HUF_MIN_GAIN_PCT = 4;
+  { smallest chunk that may be Huffman-coded (mode 1); smaller ones are
+    raw. The decoder rejects mode 1 below it: with fewer symbols the
+    four-run split degenerates (n = 5: runs of 2, 2, 2 and -1). }
+  HUF_MIN_SYMBOLS = 256;
 
 { Worst-case size of a coded chunk of n bytes (mode byte included). }
 function HufBound(n: SizeInt): SizeInt;
@@ -300,7 +304,7 @@ var
 begin
   if cap < 1 + n then
     Exit(-1);
-  if n >= 256 then
+  if n >= HUF_MIN_SYMBOLS then
   begin
     for i := 0 to 255 do
       freq[i] := 0;
@@ -998,7 +1002,7 @@ begin
     Move(src[1], dst^, n);
     Exit(1 + n);
   end;
-  if (src[0] <> 1) or (srcLen < 1 + HUF_HEADER) or (n < 4) then
+  if (src[0] <> 1) or (srcLen < 1 + HUF_HEADER) or (n < HUF_MIN_SYMBOLS) then
     Exit;
   if not BuildTable(src + 1, t) then
     Exit;
@@ -1013,7 +1017,7 @@ begin
   RdInit(r[2], p0 + s1 + s2, p0 + s1 + s2 + s3);
   RdInit(r[3], p0 + s1 + s2 + s3, send);
   q := (n + 3) div 4;
-  lastN := n - 3 * q;
+  lastN := n - 3 * q;   { >= 0 for n >= HUF_MIN_SYMBOLS }
   d0 := dst; d1 := dst + q; d2 := dst + 2 * q; d3 := dst + 3 * q;
 
   { bulk: rounds of four symbols per stream, with branch-free refills

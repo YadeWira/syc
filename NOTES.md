@@ -56,6 +56,34 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Bug review, 2026-10-19
+
+A review of the changes since v0.2.4 (and a longer fuzz: 20000 cases with
+32 files copied from the format-sample corpus, arm64 under qemu, and an
+exhaustive edge test: sizes 0..300 x every level x v2/v3 x every output
+capacity, 5.7 M cases, canaries past cap) found:
+
+- **sylzhuf, since v0.2.4 (format v3 decoder): a one-byte heap write past
+  the output.** A Huffman chunk declaring 5 symbols splits into runs of
+  q = 2: 2, 2, 2 and -1, and stream 2 wrote dst[4..5], one past the end. The
+  encoder only Huffman-codes chunks of >= 256 symbols, so only a crafted
+  block reached it (litCount 5, or 65536k + 5). Fix: mode 1 needs
+  n >= HUF_MIN_SYMBOLS (256); the fuzzer now also decodes single Huffman
+  chunks with wrong declared sizes (it faults on the old code).
+- **zpaq-std plugin: read format v3 too.** SylzDecompress reads v2 and v3,
+  and the plugin passed blocks straight to it, so a crafted zpaq archive
+  could reach the v3 decoder (and the bug above) through `-ma:sylz`.
+  The plugin now refuses blocks with bit 31 set; the harness builds a
+  valid v3 block and checks it is refused.
+- **syc CLI: a failed decompression left a partial OUTPUT**, and had
+  already truncated an existing file of that name. Now OUTPUT is written
+  as OUTPUT.syc-partial and moved over OUTPUT in one step (rename on
+  Unix, MoveFileEx with REPLACE_EXISTING on Windows) when complete;
+  errors delete the partial file; OUTPUT = INPUT is refused.
+
+The assembler compressors (levels 0-1 and 2-3) and the Huffman bulk loops
+were checked against their Pascal versions branch by branch: no defect.
+
 ## Levels 2-3: two hash tables (2026-10-18)
 
 The old level 2 (single hash, 2^16 entries) made 44.19% against level

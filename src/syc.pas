@@ -17,6 +17,7 @@ program syc;
 {$mode objfpc}{$H+}
 
 uses
+  {$ifdef windows}Windows,{$endif}
   SysUtils, Classes, Math, sylz;
 
 const
@@ -91,10 +92,22 @@ type
 
 var
   tmpPath: string = '';   { the output being written, renamed when complete }
+  report: string = '';    { printed once the output is in place }
 
 procedure Fail(const msg: string);
 begin
   raise ESycError.Create(msg);
+end;
+
+{ Moves the complete output over OUTPUT in one step, replacing it: rename
+  does on Unix; on Windows it fails when OUTPUT exists, MoveFileEx doesn't. }
+function ReplaceFile(const src, dst: string): Boolean;
+begin
+{$ifdef windows}
+  Result := MoveFileEx(PChar(src), PChar(dst), MOVEFILE_REPLACE_EXISTING);
+{$else}
+  Result := RenameFile(src, dst);
+{$endif}
 end;
 
 procedure WriteU32(s: TStream; v: UInt32);
@@ -173,8 +186,8 @@ begin
     until n < blockSize;
     WriteU32(fout, 0);
     written := fout.Size;
-    WriteLn(Format('%s: %d -> %d bytes (%.2f%%)',
-      [inPath, total, written, written * 100.0 / Max(total, 1)]));
+    report := Format('%s: %d -> %d bytes (%.2f%%)',
+      [inPath, total, written, written * 100.0 / Max(total, 1)]);
   finally
     SylzCtxFree(ctx);
     FreeMem(packed_);
@@ -248,7 +261,7 @@ begin
       fout.WriteBuffer(raw^, rawLen);
       Inc(total, rawLen);
     end;
-    WriteLn(Format('%s: %d bytes', [outPath, total]));
+    report := Format('%s: %d bytes', [outPath, total]);
   finally
     FreeMem(payload);
     FreeMem(raw);
@@ -337,12 +350,16 @@ begin
         Die('OUTPUT is INPUT');
       Decompress(inPath, outPath);
     end;
-    { complete: replace OUTPUT (on Windows a rename does not overwrite) }
-    if FileExists(outPath) and not DeleteFile(outPath) then
-      Fail('cannot replace ' + outPath);
-    if not RenameFile(tmpPath, outPath) then
-      Fail('cannot rename ' + tmpPath + ' to ' + outPath);
+    { complete: replace OUTPUT. If that fails, the complete output stays
+      under its temporary name, and OUTPUT as it was. }
+    if not ReplaceFile(tmpPath, outPath) then
+    begin
+      arg := tmpPath;
+      tmpPath := '';
+      Fail('cannot replace ' + outPath + '; the output is in ' + arg);
+    end;
     tmpPath := '';
+    WriteLn(report);
   except
     on E: Exception do
     begin

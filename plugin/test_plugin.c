@@ -12,6 +12,7 @@
      small, and then returns a negative number
    - corrupted and truncated streams: decompress returns a negative number
      or the original size, never writes past cap
+   - a block flagged as format v3 is refused (the plugin reads v2 only)
    - several threads compress and decompress at the same time
 
    Build (Linux):  cc -O2 -pthread plugin/test_plugin.c -o out/test_plugin -ldl
@@ -120,6 +121,19 @@ static int check_one(const unsigned char* src, size_t n, int level, int quiet_co
         }
         long long r3 = C->decompress(comp, (size_t)c - 1 - rnd() % ((size_t)c - 1), out, n, 0);
         if (r3 == (long long)n && n > 0) { printf("FAIL: truncated stream accepted\n"); bad = 1; }
+        /* the plugin reads format v2 only: a valid format v3 block (no
+           sequences, the literals as one raw chunk) must be refused */
+        if (n > 0 && n <= 65536) {
+            unsigned char* v3 = malloc(n + 9);
+            v3[0] = 0; v3[1] = 0; v3[2] = 0; v3[3] = 0x80;          /* ctrlLen 0, v3 */
+            v3[4] = (unsigned char)n; v3[5] = (unsigned char)(n >> 8);
+            v3[6] = (unsigned char)(n >> 16); v3[7] = 0;             /* literal count */
+            v3[8] = 0;                                                 /* raw chunk */
+            memcpy(v3 + 9, src, n);
+            long long r4 = C->decompress(v3, n + 9, out, n, 0);
+            if (r4 >= 0) { printf("FAIL: format v3 block accepted (%lld)\n", r4); bad = 1; }
+            free(v3);
+        }
         free(cc);
     }
 done:

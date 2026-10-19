@@ -248,6 +248,51 @@ begin
   GuardedFree(input);
 end;
 
+{ One Huffman chunk decoded on its own: the chunk of m bytes must roundtrip;
+  declared sizes other than m (down to tiny ones, which the encoder never
+  codes) and corrupted copies must be rejected or decode within bounds. }
+procedure HufCase;
+var
+  m, n, csize, r, i: SizeInt;
+  input, comp, bad, outp: TGuarded;
+begin
+  m := HUF_MIN_SYMBOLS + RandBelow(65536 - HUF_MIN_SYMBOLS + 1);
+  input := GuardedAlloc(m);
+  MakeInput(input.p, m);
+  comp := GuardedAlloc(HufBound(m));
+  csize := HufEncodeChunk(input.p, m, comp.p, HufBound(m));
+  if csize < 0 then
+    Fail('HufEncodeChunk returned -1 with a HufBound buffer', m, -1);
+  bad := GuardedAlloc(csize);
+  Move(comp.p^, bad.p^, csize);
+  outp := GuardedAlloc(m);
+  if (HufDecodeChunk(bad.p, csize, outp.p, m) <> csize)
+     or (CompareByte(input.p^, outp.p^, m) <> 0) then
+    Fail('Huffman chunk roundtrip mismatch', m, -1);
+  GuardedFree(outp);
+  for i := 1 to 3 do
+  begin
+    case RandBelow(3) of
+      0: n := RandBelow(16);
+      1: n := RandBelow(2 * HUF_MIN_SYMBOLS);
+    else
+      n := RandBelow(m + 64);
+    end;
+    outp := GuardedAlloc(n);
+    Move(comp.p^, bad.p^, csize);
+    if RandBelow(2) = 0 then
+      bad.p[RandBelow(csize)] := Byte(Rand);
+    r := HufDecodeChunk(bad.p, csize, outp.p, n);
+    if r > csize then
+      Fail('Huffman chunk took more than its bytes', n, -1);
+    GuardedFree(outp);
+    Inc(corrupt);
+  end;
+  GuardedFree(bad);
+  GuardedFree(comp);
+  GuardedFree(input);
+end;
+
 var
   iters, k: Int64;
   i: Integer;
@@ -269,6 +314,7 @@ begin
     HufUseAsm := k mod 3 <> 0;
     HufUseBmi2 := bmi2 and (k mod 3 = 2);
     OneCase;
+    HufCase;
   end;
   WriteLn('ok: ', roundtrips, ' roundtrips, ', corrupt, ' corrupt/truncated decodes');
 end.
