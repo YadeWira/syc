@@ -1,9 +1,9 @@
 { sylzbench — in-memory benchmark for the sylz codec, lzbench-style.
 
-  Usage: sylzbench [-l LEVELS] [-t SECONDS] [-e] FILE...
+  Usage: sylzbench [-l LEVELS] [-t SECONDS] [-ec] FILE...
     -l  comma-separated levels, default 1,2,4,6,9,12
     -t  minimum time per measurement, default 1.0
-    -e  format v3: entropy-coded literals (SYLZ_ENTROPY)
+    -ec extra compression, format v3: entropy-coded literals (SYLZ_ENTROPY)
 
   Each file is one block. Speeds are the best of the repeated runs, in
   MB/s with MB = 10^6 bytes (as lzbench), measured on the input size.
@@ -170,7 +170,7 @@ begin
         levels[i] := StrToInt(parts[i]);
       Inc(argi, 2);
     end
-    else if ParamStr(argi) = '-e' then
+    else if ParamStr(argi) = '-ec' then
     begin
       flags := flags or SYLZ_ENTROPY;
       Inc(argi);
@@ -188,7 +188,7 @@ begin
   end;
   if argi > ParamCount then
   begin
-    WriteLn(StdErr, 'usage: sylzbench [-l 1,2,4] [-t SECONDS] FILE...');
+    WriteLn(StdErr, 'usage: sylzbench [-l 1,2,4] [-t SECONDS] [-ec] FILE...');
     Halt(1);
   end;
   WriteLn('Compressor  Compress.      Decompress.     Compr. size   Ratio  Filename');

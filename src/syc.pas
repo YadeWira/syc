@@ -66,13 +66,14 @@ procedure Usage;
 begin
   WriteLn('syc ', SYC_VERSION, ' — sylz file compressor (minimal CLI, provisional format)');
   WriteLn;
-  WriteLn('  syc c [-LEVEL] [-e] [-b MIB] INPUT [OUTPUT]');
+  WriteLn('  syc c [-LEVEL] [-ec] [-b MIB] INPUT [OUTPUT]');
   WriteLn('                                           compress (default OUTPUT = INPUT', SUFFIX, ')');
   WriteLn('  syc d INPUT [OUTPUT]                     decompress (default OUTPUT = INPUT without ', SUFFIX, ')');
   WriteLn;
   WriteLn('  -LEVEL    0 (fastest) .. ', SYLZ_MAXLEVEL, ' (best ratio), default ', SYLZ_DEFLEVEL,
     ': 0-2 single hash, 3-8 hash chains, 9-10 optimal parsing');
-  WriteLn('  -e        entropy-coded literals (sylz format v3): smaller, slower to decode');
+  WriteLn('  -ec       extra compression: entropy-coded literals (sylz format v3,');
+  WriteLn('            experimental), smaller, slower to decode');
   WriteLn('  -b MIB  block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 
@@ -271,7 +272,7 @@ begin
   while i <= ParamCount do
   begin
     arg := ParamStr(i);
-    if arg = '-e' then
+    if arg = '-ec' then
       flags := flags or SYLZ_ENTROPY
     else if arg = '-b' then
     begin

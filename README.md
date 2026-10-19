@@ -24,7 +24,7 @@ The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
 literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
-Format v3 (`-e`, experimental) adds Huffman-coded literals, in 64 KiB
+Format v3 (`-ec`, extra compression, experimental) adds Huffman-coded literals, in 64 KiB
 chunks with four interleaved streams; a v2 block is a valid v3 block.
 Eleven levels, `-0` to `-10` (default `-1`): `-0` to `-2` are greedy
 single-hash levels (a bigger hash table at each step); `-3` to `-8` use
@@ -58,14 +58,14 @@ High ratios, another session (load ~6, so all speeds a little lower):
 | **sylz -9** | 5.24 MB/s | **3170 MB/s** | 36.37% |
 | **sylz -10** | 2.52 MB/s | 3238 MB/s | 36.12% |
 | zstd 1.5.7 -1 | 317 MB/s | 1035 MB/s | 34.53% |
-| **sylz -e -8** (v3) | 19.5 MB/s | **2062 MB/s** | 34.82% |
-| **sylz -e -9** (v3) | 4.99 MB/s | 2032 MB/s | **34.29%** |
-| **sylz -e -10** (v3) | 2.52 MB/s | **2080 MB/s** | 34.06% |
+| **sylz -ec -8** (v3) | 19.5 MB/s | **2062 MB/s** | 34.82% |
+| **sylz -ec -9** (v3) | 4.99 MB/s | 2032 MB/s | **34.29%** |
+| **sylz -ec -10** (v3) | 2.52 MB/s | **2080 MB/s** | 34.06% |
 | zxc 0.15.0 -7 | 5.67 MB/s | 1866 MB/s | 33.09% |
 | zstd 1.5.7 -2 | 223 MB/s | 757 MB/s | 32.70% |
 | zstd 1.5.7 -3 | 152 MB/s | 650 MB/s | 31.20% |
 
-`-e` is format v3 (Huffman-coded literals, experimental): on silesia.tar
+`-ec` is format v3 (Huffman-coded literals, experimental): on silesia.tar
 it beats zstd -1 on ratio at twice its decompression speed, but compresses
 far slower; on mixed data zstd -1 is still smaller.
 
@@ -94,7 +94,7 @@ The current command line is minimal and its file format provisional:
 files it writes are not expected to open with later versions.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (-0 .. -10, -e, -b MIB block size)
+out/syc c -1 file          # -> file.sylz (-0 .. -10, -ec, -b MIB block size)
 out/syc d file.sylz        # -> file
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
