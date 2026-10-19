@@ -1012,11 +1012,452 @@ begin
   Result := EmitFinish(e, src + anchor, n - anchor);
 end;
 
+{$ifdef SYLZ_ASM_X64}
+type
+  { In/out state of the assembler two-table compressor; fixed field order. }
+  TMidEncState = record
+    src, iend, mflimit: PByte;   {  0,  8, 16: in }
+    tl, ts: PUInt16;             { 24, 32: in, long and short tables }
+    ctrl, lit: PByte;            { 40, 48: in/out }
+    anchor: PByte;               { 56: out }
+    exact: PByte;                { 64: in, ExactCode }
+    hashShift: Int64;            { 72: in, 64 - table log }
+    lazy: Int64;                 { 80: in, 1 = level 3 }
+  end;
+  PMidEncState = ^TMidEncState;
+
+{ CompressMidCore in x86_64 assembler, same output byte for byte (tests
+  check it); only used when dst holds SylzBound(n), as CompressFastX64.
+  Registers: r8 ip, r9 anchor, r10 src, r11 long table, r12 short table,
+  r13 iend, r14 control and r15 literal write pointers, rdi distance, rbp
+  match length, cl the long hash's shift (the short hash's 32-bit shift
+  is the same cl mod 32); rax, rbx, rdx, rsi scratch. Stack: [rsp]
+  mflimit, [rsp+8] long hash multiplier, [rsp+16] exact-code map, [rsp+24]
+  state, [rsp+32] lazy flag, [rsp+40] a candidate distance. }
+procedure CompressMidX64(st: PMidEncState); assembler; nostackframe;
+asm
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  sub rsp, 48
+  mov [rsp + 24], rax             { state }
+  mov rdx, [rax + 16]
+  mov [rsp], rdx                  { mflimit }
+  mov rdx, 889523592379
+  mov [rsp + 8], rdx              { long hash multiplier }
+  mov rdx, [rax + 64]
+  mov [rsp + 16], rdx             { exact code map }
+  mov rdx, [rax + 80]
+  mov [rsp + 32], rdx             { lazy }
+  mov rcx, [rax + 72]             { cl = hash shift, for the whole routine }
+  mov r10, [rax]
+  mov r13, [rax + 8]
+  mov r11, [rax + 24]
+  mov r12, [rax + 32]
+  mov r14, [rax + 40]
+  mov r15, [rax + 48]
+  mov r9, r10                     { anchor = src }
+  mov r8, r10                     { ip = src }
+
+@loop:
+  cmp r8, [rsp]
+  jae @last
+  mov rsi, r8
+  sub rsi, r10                    { pos }
+  { long table }
+  mov rdx, [r8]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], si
+  mov edi, esi
+  sub edi, eax
+  and edi, $FFFF
+  mov eax, 65536
+  test edi, edi
+  cmovz edi, eax                  { distance, 0 meaning 65536 }
+  cmp rdi, rsi
+  ja @short
+  mov rax, r8
+  sub rax, rdi
+  mov edx, [rax]
+  cmp edx, [r8]
+  jne @short
+  { long hit: ip goes into the short table too }
+  mov edx, [r8]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], si
+  jmp @found
+@short:
+  mov edx, [r8]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  movzx eax, word ptr [r12 + rdx * 2]
+  mov [r12 + rdx * 2], si
+  mov edi, esi
+  sub edi, eax
+  and edi, $FFFF
+  mov eax, 65536
+  test edi, edi
+  cmovz edi, eax
+  cmp rdi, rsi
+  ja @miss
+  mov rax, r8
+  sub rax, rdi
+  mov edx, [rax]
+  cmp edx, [r8]
+  je @found
+@miss:
+  mov rdx, r8
+  sub rdx, r9
+  shr rdx, MID_SKIP
+  lea r8, [r8 + rdx + 1]
+  jmp @loop
+
+@found:
+  { rbp = match length at ip, distance rdi }
+  lea rdx, [r8 + SYLZ_MINMATCH]
+  mov rsi, r8
+  sub rsi, rdi
+  add rsi, SYLZ_MINMATCH
+@cm1:
+  lea rax, [rdx + 8]
+  cmp rax, r13
+  ja @cm1Tail
+  mov rax, [rdx]
+  xor rax, [rsi]
+  jnz @cm1Diff
+  add rdx, 8
+  add rsi, 8
+  jmp @cm1
+@cm1Diff:
+  bsf rax, rax
+  shr eax, 3
+  add rdx, rax
+  jmp @cm1Done
+@cm1Tail:
+  cmp rdx, r13
+  jae @cm1Done
+  movzx eax, byte ptr [rdx]
+  cmp al, [rsi]
+  jne @cm1Done
+  add rdx, 1
+  add rsi, 1
+  jmp @cm1Tail
+@cm1Done:
+  mov rbp, rdx
+  sub rbp, r8
+
+  cmp qword ptr [rsp + 32], 0
+  jne @lazy
+  { level 2: a short match, and a long one a byte later? }
+  cmp rbp, MID_NEXT_BELOW
+  jae @back
+  lea rbx, [r8 + 1]
+  cmp rbx, [rsp]
+  jae @back
+  mov rsi, rbx
+  sub rsi, r10                    { pos + 1 }
+  mov rdx, [rbx]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], si
+  mov edx, esi
+  sub edx, eax
+  and edx, $FFFF
+  mov eax, 65536
+  test edx, edx
+  cmovz edx, eax
+  cmp rdx, rsi
+  ja @back
+  mov rax, rbx
+  sub rax, rdx
+  mov esi, [rax]
+  cmp esi, [rbx]
+  jne @back
+  mov [rsp + 40], rdx
+  call @count                     { rdx = match end at rbx, distance [rsp + 40] }
+  sub rdx, rbx
+  cmp rdx, rbp
+  jbe @back
+  mov r8, rbx
+  mov rbp, rdx
+  mov rdi, [rsp + 40]
+  jmp @back
+
+@lazy:
+  { level 3: both tables a byte later, while that finds a longer match }
+  cmp rbp, MID_LAZY_ENOUGH
+  jae @back
+  lea rbx, [r8 + 1]
+  cmp rbx, [rsp]
+  jae @back
+  mov rsi, rbx
+  sub rsi, r10
+  mov rdx, [rbx]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], si
+  mov edx, esi
+  sub edx, eax
+  and edx, $FFFF
+  mov eax, 65536
+  test edx, edx
+  cmovz edx, eax
+  cmp rdx, rsi
+  ja @lzNoLong
+  mov rax, rbx
+  sub rax, rdx
+  mov eax, [rax]
+  cmp eax, [rbx]
+  je @lzLong
+@lzNoLong:
+  xor edx, edx
+@lzLong:
+  mov [rsp + 40], rdx             { long candidate's distance, or 0 }
+  mov edx, [rbx]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  movzx eax, word ptr [r12 + rdx * 2]
+  mov [r12 + rdx * 2], si
+  cmp qword ptr [rsp + 40], 0
+  jne @lzHave
+  mov edx, esi
+  sub edx, eax
+  and edx, $FFFF
+  mov eax, 65536
+  test edx, edx
+  cmovz edx, eax
+  cmp rdx, rsi
+  ja @back
+  mov rax, rbx
+  sub rax, rdx
+  mov eax, [rax]
+  cmp eax, [rbx]
+  jne @back
+  mov [rsp + 40], rdx
+@lzHave:
+  call @count
+  sub rdx, rbx
+  cmp rdx, rbp
+  jbe @back
+  mov r8, rbx
+  mov rbp, rdx
+  mov rdi, [rsp + 40]
+  jmp @lazy
+
+@count:
+  { rdx = end of the match at rbx with distance [rsp + 48] (one return
+    address pushed): prefix length from 4 on, reads before iend }
+  lea rdx, [rbx + SYLZ_MINMATCH]
+  mov rsi, rbx
+  sub rsi, [rsp + 48]
+  add rsi, SYLZ_MINMATCH
+@cm2:
+  lea rax, [rdx + 8]
+  cmp rax, r13
+  ja @cm2Tail
+  mov rax, [rdx]
+  xor rax, [rsi]
+  jnz @cm2Diff
+  add rdx, 8
+  add rsi, 8
+  jmp @cm2
+@cm2Diff:
+  bsf rax, rax
+  shr eax, 3
+  add rdx, rax
+  ret
+@cm2Tail:
+  cmp rdx, r13
+  jae @cm2Done
+  movzx eax, byte ptr [rdx]
+  cmp al, [rsi]
+  jne @cm2Done
+  add rdx, 1
+  add rsi, 1
+  jmp @cm2Tail
+@cm2Done:
+  ret
+
+@back:
+  { extend backwards over the pending literals }
+  cmp r8, r9
+  jbe @emit
+  mov rax, r8
+  sub rax, rdi
+  cmp rax, r10
+  jbe @emit
+  movzx edx, byte ptr [r8 - 1]
+  cmp dl, [rax - 1]
+  jne @emit
+  sub r8, 1
+  add rbp, 1
+  jmp @back
+
+@emit:
+  lea rax, [r8 + rbp]             { match end, kept to the end of the emit }
+  mov rbx, r8
+  sub rbx, r9                     { literal length }
+  sub rbp, SYLZ_MINMATCH
+  lea rdx, [rdi - 1]
+  mov [r14 + 1], dx               { offset = distance - 1 }
+  cmp rbx, EXACT_LL
+  ja @tokLitBig
+  cmp rbp, EXACT_M
+  ja @tokEscMatch
+  imul esi, ebx, EXACT_M + 1
+  add esi, ebp
+  mov rdx, [rsp + 16]
+  movzx esi, byte ptr [rdx + rsi]
+  cmp esi, 255
+  je @tokEscMatch
+  mov [r14], sil
+  add r14, 3
+  jmp @noMlExt
+@tokEscMatch:
+  lea esi, [rbx + ESC_ML]
+  mov [r14], sil
+  add r14, 3
+  jmp @putMatch
+@tokLitBig:
+  mov byte ptr [r14], ESC_BOTH
+  cmp rbp, EXACT_M
+  ja @tokBoth
+  mov esi, ebp
+  add esi, ESC_LL
+  mov [r14], sil
+@tokBoth:
+  add r14, 3
+  mov rdx, rbx
+@litExt:
+  cmp rdx, 255
+  jb @litExtEnd
+  mov byte ptr [r14], 255
+  add r14, 1
+  sub rdx, 255
+  jmp @litExt
+@litExtEnd:
+  mov [r14], dl
+  add r14, 1
+  cmp rbp, EXACT_M
+  jbe @noMlExt
+@putMatch:
+  mov rdx, rbp
+@mlExt:
+  cmp rdx, 255
+  jb @mlExtEnd
+  mov byte ptr [r14], 255
+  add r14, 1
+  sub rdx, 255
+  jmp @mlExt
+@mlExtEnd:
+  mov [r14], dl
+  add r14, 1
+@noMlExt:
+  test rbx, rbx
+  jz @litDone
+  lea rdx, [r9 + rbx + 16]
+  cmp rdx, r13
+  ja @litBytes
+  mov rsi, r9
+  mov rdi, r15
+  mov rdx, rbx
+@lit16:
+  movdqu xmm0, [rsi]
+  movdqu [rdi], xmm0
+  add rsi, 16
+  add rdi, 16
+  sub rdx, 16
+  jg @lit16
+  jmp @litDone
+@litBytes:
+  xor edx, edx
+@litByte:
+  movzx esi, byte ptr [r9 + rdx]
+  mov [r15 + rdx], sil
+  add rdx, 1
+  cmp rdx, rbx
+  jb @litByte
+@litDone:
+  add r15, rbx
+  cmp rax, [rsp]
+  jae @noInsert
+  { insert the match's second and third, and the two before its end }
+  mov rsi, r8
+  sub rsi, r10
+  add rsi, 1
+  mov rdx, [r8 + 1]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  mov [r11 + rdx * 2], si
+  add rsi, 1
+  mov edx, [r8 + 2]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], si
+  mov rsi, rax
+  sub rsi, r10
+  sub rsi, 2
+  mov rdx, [rax - 2]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  mov [r11 + rdx * 2], si
+  add rsi, 1
+  mov edx, [rax - 1]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], si
+@noInsert:
+  mov r8, rax
+  mov r9, rax
+  jmp @loop
+
+@last:
+  mov rax, [rsp + 24]
+  mov [rax + 40], r14
+  mov [rax + 48], r15
+  mov [rax + 56], r9
+  add rsp, 48
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+end;
+{$endif}
+
 function CompressMid(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 var
   e: TEmit;
   hashLog: Integer;
+{$ifdef SYLZ_ASM_X64}
+  st: TMidEncState;
+{$endif}
 begin
   if ctx.table = nil then
     ctx.table := GetMem(SizeOf(UInt16) shl CTX_TABLELOG);
@@ -1026,6 +1467,25 @@ begin
     hashLog := MID_MAXLOG;
   FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
+{$ifdef SYLZ_ASM_X64}
+  if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+  begin
+    st.src := src;
+    st.iend := src + n;
+    st.mflimit := src + n - SEARCH_TAIL;
+    st.tl := ctx.table;
+    st.ts := ctx.table + (1 shl hashLog);
+    st.ctrl := e.ctrl;
+    st.lit := e.lit;
+    st.exact := @ExactCode[0, 0];
+    st.hashShift := 64 - hashLog;
+    st.lazy := Ord(level = 3);
+    CompressMidX64(@st);
+    e.ctrl := st.ctrl;
+    e.lit := st.lit;
+    Exit(EmitFinish(e, st.anchor, src + n - st.anchor));
+  end;
+{$endif}
   Result := CompressMidCore(src, n, e, ctx.table, ctx.table + (1 shl hashLog),
     hashLog, level = 3);
 end;

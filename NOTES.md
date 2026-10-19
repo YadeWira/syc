@@ -79,6 +79,21 @@ The two-table parser (Pascal; silesia.tar / mixed, one session):
 | lazy, 2^16 tables (**level 3**) | 39.99% | 139 MB/s | 3373 MB/s | 62.89% | 158 MB/s |
 | old level 3 (hash chains) | 40.75% | 71 MB/s | 3027 MB/s | 62.60% | 53 MB/s |
 
+x86-64 assembler (CompressMidX64, one routine for both levels, same
+bytes as the Pascal; same session as lz4hc/lizard runs of the day):
+
+| | silesia | compress | decompress | mixed | compress |
+|---|---|---|---|---|---|
+| sylz 1 | 44.55% | 473 MB/s | 3271 MB/s | 65.59% | 634 MB/s |
+| **sylz 2** | 40.89% | **255 MB/s** | 3078 MB/s | 63.29% | 257 MB/s |
+| **sylz 3** | 39.99% | **193 MB/s** | 3045 MB/s | 62.89% | 203 MB/s |
+| sylz 4 (hash chains) | 39.35% | 63 MB/s | 3077 MB/s | 61.94% | 51 MB/s |
+| lz4hc 1.10.0 -2 | 42.05% | 215 MB/s | 2833 MB/s | | |
+| lizard 2.1 -12 | 40.68% | 109 MB/s | 2742 MB/s | | |
+
+Pascal -> assembler: +35-45%. Level 2 at IPC 1.31 (memory bound: the
+table loads and the candidate reads).
+
 Found on the way (experiment harness, Int32 tables): 16-bit position
 tables +35-40% compression speed, same output otherwise; 6-byte long hash
 better than 8 (41.37 vs 41.69%); a 5-byte short hash decodes faster
