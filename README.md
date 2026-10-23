@@ -84,14 +84,6 @@ High ratios:
 | **sylz -9** | 7.65 MB/s | **3449 MB/s** | **36.04%** |
 | **sylz -10** | 6.45 MB/s | 3393 MB/s | **36.03%** |
 | zstd 1.5.7 -1 | 350 MB/s | 1135 MB/s | 34.53% |
-| **sylz -ec -6** (v3) | 21.6 MB/s | 2181 MB/s | 34.47% |
-| **sylz -ec -7** (v3) | 7.44 MB/s | 2219 MB/s | 33.99% |
-| **sylz -ec -8** (v3) | 6.37 MB/s | **2254 MB/s** | 33.98% |
-| **sylz -ec -9** (v3)† | 3.77 MB/s | 2196 MB/s | **33.61%** |
-| **sylz -ec -10** (v3)† | 3.27 MB/s | 2204 MB/s | **33.60%** |
-| zxc 0.15.0 -7 | 6.41 MB/s | 1978 MB/s | 33.09% |
-| zstd 1.5.7 -2 | 238 MB/s | 814 MB/s | 32.70% |
-| zstd 1.5.7 -3 | 153 MB/s | 678 MB/s | 31.20% |
 
 On very redundant data -10 searches deeper than -9 and pays for it: zpaq-std's mixed sample 17.73% (-9) -> 17.59% (-10).
 
@@ -101,14 +93,30 @@ Windows 7 32-bit (a VM, mozilla): compress -1 282 MB/s, -4 66.6 MB/s,
 11.1 MB/s, decode 850-1150 MB/s.
 [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks#32-bit-windows-v0211).
 
-`-ec` is format v3 (Huffman-coded literals, experimental), with levels
-`-0` to `-10`: `-ec -0` .. `-8` parse as `-2` .. `-10` do (v2's `-0`
-and `-1` leave so many literals that, Huffman-coded, they decode slower
-and compress worse than `-2`'s parse), and `-ec -9` / `-10` run the
-optimal parser with each literal priced by its Huffman code (two parses;
-† measured later, same machine, decode-only timing). On silesia.tar
-it beats zstd -1 on ratio at twice its decompression speed, but compresses
-far slower; on mixed data zstd -1 is still smaller.
+Format v3 (`-ec`, Huffman-coded literals, experimental), every level, in
+another session (load ~4): `-ec -0` .. `-8` parse as `-2` .. `-10` do
+(v2's `-0` and `-1` leave so many literals that, Huffman-coded, they
+decode slower and compress worse than `-2`'s parse); `-ec -9` / `-10` run
+the optimal parser with each literal priced by its Huffman code (two
+parses).
+
+| codec | compress | decompress | ratio |
+|---|---|---|---|
+| **sylz -ec -0** | 179 MB/s | 2121 MB/s | 38.80% |
+| **sylz -ec -2** | 75.5 MB/s | 1979 MB/s | 36.72% |
+| **sylz -ec -4** | 44.0 MB/s | 2140 MB/s | 35.18% |
+| zstd 1.5.7 -1 | 329 MB/s | 1061 MB/s | 34.53% |
+| **sylz -ec -6** | 20.8 MB/s | 2164 MB/s | 34.47% |
+| **sylz -ec -8** | 6.35 MB/s | **2282 MB/s** | 33.98% |
+| **sylz -ec -9** | 3.75 MB/s | 2126 MB/s | 33.61% |
+| **sylz -ec -10** | 3.13 MB/s | 2107 MB/s | **33.60%** |
+| zxc 0.15.0 -7 | 6.04 MB/s | 1905 MB/s | 33.09% |
+| zstd 1.5.7 -2 | 230 MB/s | 793 MB/s | 32.70% |
+| zstd 1.5.7 -3 | 157 MB/s | 693 MB/s | 31.20% |
+
+Same session, v2 `-10`: 36.03% at 3498 MB/s decode. With one thread v3
+decodes at 60-65% of v2's speed on silesia.tar, at twice zstd -1's; on
+mixed data zstd -1 is still smaller.
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
 the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
