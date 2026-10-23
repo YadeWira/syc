@@ -56,6 +56,38 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Levels 4-8: lz4hc's parse (2026-10-22)
+
+At the same attempts, lz4hc -3 (4 attempts) made 38.38% where sylz's
+lazy level 4 (4 attempts) made 39.35%: the difference was the parse.
+lz4hc's (LZ4HC_compress_hashChain) searches at the end of each match for
+a "wider" one that may start inside it and extend backwards, and trims
+overlapping matches so each pays for itself. Ported as is (silesia.tar,
+Pascal, same attempts; the machine was loaded, speeds +-10%):
+
+| attempts | lazy (old) | lz4hc's parse |
+|---|---|---|
+| 4 | 39.35% 61 MB/s | 37.74% 55 MB/s |
+| 8 | 38.35% 53 | 37.11% 46 |
+| 16 | 37.65% 45 | 36.72% 39 |
+| 64 | 36.89% 31 | 36.38% 26 |
+| 256 | 36.60% 21 | 36.28% 19 |
+
+With 1, 2, 3 attempts: 40.14% at 66 MB/s, 38.69% at 60, 38.09% at 55.
+Speed hardly follows the attempts below 8: inserting every position
+dominates (perf: the head-table load in HcInsertUpTo the hottest
+instruction). Heads now keep 16-bit positions (FastDist), 2^16 of them,
+128 KiB instead of 512: same speed and ratio (the opt levels moved by a
+few bytes), a quarter of the memory.
+
+New ladder (attempts 2, 4, 8, 16, 64): silesia 38.80 / 37.78 / 37.13 /
+36.73 / 36.38%, mixed 61.55 / 61.10 / 60.83 / 60.68 / 60.55%. Level 8
+now matches level 9's ratio (36.37%, mixed 60.63%) at ~4x its speed;
+level 9 keeps a ~9% faster decode.
+
+tests/sylzedge.pas (the exhaustive size x level x format x capacity
+test of the 2026-10-19 review) is now in the repository.
+
 ## Bug review, 2026-10-19
 
 A review of the changes since v0.2.4 (and a longer fuzz: 20000 cases with
