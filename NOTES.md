@@ -56,6 +56,27 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Format v3 frozen, the sylzec plugin (2026-10-23)
+
+Writing test vectors for zpaq-std showed v3 was hardly ever used on small
+blocks: EncodeLiteralChunks got the v2 literal stream's size as its
+limit and wanted room for each chunk's raw form inside it, so a block of
+one chunk (under ~65536 literals) never became v3, and -ec -9/-10's
+parse, priced for v3, was then emitted as v2 (worse than plain v2: dickens'
+first 200 KB 92201 bytes against 88001). Now the chunks get the output's
+room and v3 is kept when smaller: dickens 200 KB -ec 8 80862, -ec 10
+78622 bytes; 2 MB slices and silesia.tar unchanged (their earlier chunks
+left the room).
+
+The sylzec plugin (plugin/sylzec_zpaqstd.pas; zs_codec.inc shared with
+sylz's): name "sylzec", library "sylz format v3 (syc 0.2.14)", levels
+0..10 (-ec's), default 1, decodes v2 and v3. tools/sylz_ref.py decodes
+both formats from the wiki's description alone; it agrees with sylz on
+all 220 vectors of tests/sylzvectors.pas (10 cases x 11 levels x 2
+formats: empty, one byte, all equal, random, text, binary, multi-chunk
+with a short last chunk, 11-bit codes, generated text, under 256
+literals).
+
 ## Format v3: chunk mode 2 (2026-10-23)
 
 A Huffman chunk's stream 4 ended where its last code did, so the next

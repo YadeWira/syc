@@ -1,4 +1,4 @@
-/* test_plugin — loads the sylz zpaq-std plugin the way zpaq-std does and
+/* test_plugin — loads a sylz zpaq-std plugin (sylz or sylzec) the way zpaq-std does and
    checks it against zs_codec.h's contract.
 
    Usage: test_plugin PLUGIN FILE...
@@ -12,7 +12,8 @@
      small, and then returns a negative number
    - corrupted and truncated streams: decompress returns a negative number
      or the original size, never writes past cap
-   - a block flagged as format v3 is refused (the plugin reads v2 only)
+   - sylz: a block flagged as format v3 is refused (it reads v2 only);
+     sylzec: such a block decodes (it reads v3, and v2)
    - several threads compress and decompress at the same time
 
    Build (Linux):  cc -O2 -pthread plugin/test_plugin.c -o out/test_plugin -ldl
@@ -53,6 +54,7 @@ typedef const zs_codec* (*zs_codec_entry)(void);
 
 static const zs_codec* C;
 static int failures;
+static int is_ec;   /* sylzec: format v3, which it must read */
 
 #define CHECK(cond, ...) do { if (!(cond)) { printf("FAIL: " __VA_ARGS__); printf("\n"); failures++; } } while (0)
 
@@ -131,7 +133,10 @@ static int check_one(const unsigned char* src, size_t n, int level, int quiet_co
             v3[8] = 0;                                                 /* raw chunk */
             memcpy(v3 + 9, src, n);
             long long r4 = C->decompress(v3, n + 9, out, n, 0);
-            if (r4 >= 0) { printf("FAIL: format v3 block accepted (%lld)\n", r4); bad = 1; }
+            if (!is_ec && r4 >= 0) { printf("FAIL: format v3 block accepted (%lld)\n", r4); bad = 1; }
+            if (is_ec && (r4 != (long long)n || memcmp(out, src, n) != 0)) {
+                printf("FAIL: format v3 block not decoded (%lld)\n", r4); bad = 1;
+            }
             free(v3);
         }
         free(cc);
@@ -190,7 +195,11 @@ int main(int argc, char** argv)
     CHECK(C != NULL, "zpaqstd_codec_v1 returned NULL");
     if (!C) return 1;
     CHECK(C->abi == 1, "abi %d", C->abi);
-    CHECK(C->name && strcmp(C->name, "sylz") == 0, "name %s", C->name ? C->name : "(null)");
+    CHECK(C->name && (strcmp(C->name, "sylz") == 0 || strcmp(C->name, "sylzec") == 0),
+          "name %s", C->name ? C->name : "(null)");
+    is_ec = C->name && strcmp(C->name, "sylzec") == 0;
+    CHECK(C->library && strncmp(C->library, is_ec ? "sylz format v3 " : "sylz format v2 ", 15) == 0,
+          "library %s", C->library ? C->library : "(null)");
     CHECK(C->min_level == 0 && C->max_level == 10, "levels %d..%d", C->min_level, C->max_level);
     CHECK(C->bound && C->compress && C->decompress, "missing function");
     CHECK(C->query == NULL && C->data == NULL, "query/data should be NULL");

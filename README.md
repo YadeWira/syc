@@ -152,21 +152,23 @@ out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 
 Each block carries a CRC32 of its data, checked on decompression.
 
-## zpaq-std plugin
+## zpaq-std plugins
 
-`plugin/` holds sylz as a codec plugin for
-[zpaq-std](https://github.com/YadeWira/zpaq-std) (`-ma:sylz`, plugin ABI 1:
-one exported C function, `zpaqstd_codec_v1`):
+`plugin/` holds two codec plugins for
+[zpaq-std](https://github.com/YadeWira/zpaq-std) (plugin ABI 1: one
+exported C function, `zpaqstd_codec_v1`, per file): `sylz` (`-ma:sylz`,
+format v2) and `sylzec` (`-ma:sylzec`, format v3: `-ec`'s), levels 0..10,
+default 1.
 
 ```sh
-plugin/build.sh linux-x86_64                                  # out/plugin/linux-x86_64/sylz.so
-plugin/build.sh win64                                         # .../win64/sylz.dll
+plugin/build.sh linux-x86_64          # out/plugin/linux-x86_64/sylz.so and sylzec.so
+plugin/build.sh win64                 # .../win64/sylz.dll and sylzec.dll
 FPC=ppcross386 plugin/build.sh win32 -Fu<rtl>/units/i386-win32
 FPC=ppcrossa64 plugin/build.sh linux-arm64 -Fu<rtl>/units/aarch64-linux \
   -Fl/usr/lib/gcc-cross/aarch64-linux-gnu/14 -Fl/usr/aarch64-linux-gnu/lib
 ```
 
-`plugin/test_plugin.c` loads a plugin the way zpaq-std does and checks the
+`plugin/test_plugin.c` loads either plugin the way zpaq-std does and checks the
 contract: exported entry, ABI fields, roundtrips at every level,
 `compress` never past `cap` (also when `cap` is too small), corrupt and
 truncated streams, 8 threads at once, and that loading the library leaves
@@ -174,8 +176,13 @@ the process's floating-point state (MXCSR, x87 control word) alone. It
 passes on Linux x86-64 and arm64 (qemu-user), Windows 10 x64 and
 Windows 7 (32-bit plugin).
 
-The plugin writes sylz format v2 as frozen at tag v0.2.2; a later sylz
-format would be a new codec name in zpaq-std.
+`sylz` writes format v2 as frozen at tag v0.2.2, `sylzec` format v3 as
+frozen at tag v0.2.14 (a v3 block, or plain v2 when that is smaller);
+a later format would be a new codec name in zpaq-std. For decoders
+written elsewhere (zpaq-std's ZPAQL ones): `tools/sylz_ref.py`, a
+reference decoder in Python written from the format description, and
+`tests/sylzvectors.pas`, which writes test vectors (released as
+`sylz-vectors.zip`).
 
 ## Test
 
@@ -196,7 +203,8 @@ mmap).
 src/           sylz codec (sylz.pas, and sylzc.c: its C part), its Huffman
                coder (sylzhuf.pas), the syc CLI (syc.pas)
 bench/         sylzbench, sylzstats (sequence histograms of a block)
-tests/         sylzfuzz, sylzedge
+tests/         sylzfuzz, sylzedge, sylzvectors (test vectors for other decoders)
+tools/         sylz_ref.py: a reference decoder in Python
 plugin/        zpaq-std codec plugin and its test
 build.sh       (and build-c.sh, which compiles the C part for the target)
 NOTES.md       development log: measurements, FPC codegen findings

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds the zpaq-std plugin: out/plugin/<target>/sylz.so or sylz.dll.
+# Builds the zpaq-std plugins: out/plugin/<target>/sylz.so and sylzec.so
+# (or .dll): sylz is format v2, sylzec format v3.
 # Usage: [FPC=compiler] plugin/build.sh TARGET [extra fpc options]
 #   linux-x86_64                   (default compiler)
 #   win64        -> -Twin64
@@ -11,10 +12,10 @@ FPC=${FPC:-fpc}
 target=${1:-linux-x86_64}
 [ $# -gt 0 ] && shift
 case $target in
-  linux-x86_64) opts="-Cg";                       lib=libsylz_zpaqstd.so; out=sylz.so ;;
-  linux-arm64)  opts="-Cg -XPaarch64-linux-gnu-"; lib=libsylz_zpaqstd.so; out=sylz.so ;;
-  win64)        opts="-Twin64";                   lib=sylz_zpaqstd.dll;   out=sylz.dll ;;
-  win32)        opts="-Twin32";                   lib=sylz_zpaqstd.dll;   out=sylz.dll ;;
+  linux-x86_64) opts="-Cg";                       pre=lib; ext=so ;;
+  linux-arm64)  opts="-Cg -XPaarch64-linux-gnu-"; pre=lib; ext=so ;;
+  win64)        opts="-Twin64";                   pre=;    ext=dll ;;
+  win32)        opts="-Twin32";                   pre=;    ext=dll ;;
   *) echo "unknown target $target" >&2; exit 1 ;;
 esac
 dir=out/plugin/$target
@@ -22,6 +23,9 @@ mkdir -p "$dir/units"
 . ./build-c.sh
 # shellcheck disable=SC2086
 build_c "$dir/units" $opts "$@"
-"$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -FU"$dir/units" -Fo"$dir/units" -FE"$dir" "$@" plugin/sylz_zpaqstd.pas
-mv -f "$dir/$lib" "$dir/$out"
-echo "$dir/$out"
+for codec in sylz sylzec; do
+  "$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -Fuplugin -FU"$dir/units" -Fo"$dir/units" -FE"$dir" "$@" \
+    plugin/${codec}_zpaqstd.pas
+  mv -f "$dir/${pre}${codec}_zpaqstd.$ext" "$dir/$codec.$ext"
+  echo "$dir/$codec.$ext"
+done

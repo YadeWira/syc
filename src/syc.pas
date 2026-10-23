@@ -24,7 +24,7 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.13';
+  SYC_VERSION   = '0.2.14';
   MAGIC         = 'SYZ0';
   FORMAT_VER    = 3;   { 3: sylz v2 or v3 blocks, v3 chunks of mode 2 (syc
                          0.2.14-); 2: v3 chunks of mode 1 (syc 0.2.5-0.2.13);

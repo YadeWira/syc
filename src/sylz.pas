@@ -431,14 +431,15 @@ end;
 
 { Appends the block's tail literals and the literal stream; returns the
   block size or -1. }
-{ The block's literals as format v3 chunks at p, in no more than limit
-  bytes. Returns the section size, or -1 if it does not fit (or would not
-  be smaller than limit). }
-function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; limit: SizeInt): SizeInt;
+{ The block's literals as format v3 chunks at p, in no more than cap
+  bytes. Returns the section size, or -1 if it does not fit. (Until syc
+  0.2.13 cap was the v2 layout's size, and a chunk needed room for its raw
+  form there: a block with one chunk never became v3.) }
+function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; cap: SizeInt): SizeInt;
 var
   pos, c, r, used: SizeInt;
 begin
-  if limit < 4 then
+  if cap < 4 then
     Exit(-1);
   PUInt32(p)^ := UInt32(count);
   used := 4;
@@ -448,9 +449,7 @@ begin
     c := count - pos;
     if c > LIT_CHUNK then
       c := LIT_CHUNK;
-    if limit - used < 1 + c then
-      Exit(-1);       { a raw chunk might not fit: the v2 layout is no bigger }
-    r := HufEncodeChunk(lits + pos, c, p + used, limit - used);
+    r := HufEncodeChunk(lits + pos, c, p + used, cap - used);
     if r < 0 then
       Exit(-1);
     Inc(used, r);
@@ -472,8 +471,8 @@ begin
     { all literals in the scratch stream (it holds n + slack bytes), then
       code them; only kept when smaller than the v2 layout }
     Move(lit^, e.lit^, litLen);
-    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, litTotal);
-    if v3 >= 0 then
+    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+    if (v3 >= 0) and (v3 < litTotal) then
     begin
       PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_ENTROPY;
       Exit(HEADER_SIZE + ctrlLen + v3);
