@@ -30,53 +30,56 @@ Eleven levels, `-0` to `-10` (default `-1`): `-0` and `-1` are greedy
 single-hash levels (`-1` with the bigger table); `-2` and `-3` use two
 hash tables, keyed on 6 and 4 bytes (`-2` greedy, `-3` lazy); `-4` to
 `-8` hash chains with lz4hc's parse (matches may start inside the
-previous one and extend backwards); `-9` and `-10` an optimal parser whose
-prices include decode time, so it picks cheaper sequences. The decoder is safe on corrupt input. Hot
+previous one and extend backwards); `-9` and `-10` an optimal parser over
+a binary-tree match finder, whose prices include decode time, so it picks
+cheaper sequences. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
 silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
-everything in one session (2026-10-23; the machine was busy, so all
-speeds run ~10% under an idle one). Fast and middle levels:
+everything in one session (2026-10-23). Fast and middle levels:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 445 MB/s | 2769 MB/s | 47.59% |
-| misa77 0.6.0 --1 | 219 MB/s | 3489 MB/s | 46.74% |
-| zxc 0.15.0 -3 | 139 MB/s | 3307 MB/s | 46.65% |
-| **sylz -0** | **482 MB/s** | 3083 MB/s | 46.51% |
-| misa77 0.6.0 -0 | 139 MB/s | 3493 MB/s | 44.60% |
-| **sylz -1** | **453 MB/s** | 3088 MB/s | 44.55% |
-| zxc 0.15.0 -4 | 97.3 MB/s | 3182 MB/s | 43.43% |
-| lz4hc 1.10.0 -2 | 190 MB/s | 2484 MB/s | 42.05% |
-| **sylz -2** | **251 MB/s** | 2874 MB/s | 40.89% |
-| zxc 0.15.0 -5 | 62.2 MB/s | 3119 MB/s | 40.83% |
-| lizard 2.1 -12 | 99.0 MB/s | 2390 MB/s | 40.68% |
-| **sylz -3** | **190 MB/s** | 2900 MB/s | 39.99% |
-| **sylz -4** | 77.2 MB/s | 2919 MB/s | 38.80% |
-| lz4hc 1.10.0 -3 | 63.6 MB/s | 2588 MB/s | 38.38% |
-| **sylz -5** | 55.3 MB/s | 3004 MB/s | 37.78% |
-| lz4hc 1.10.0 -4 | 52.2 MB/s | 2602 MB/s | 37.65% |
-| **sylz -6** | 42.0 MB/s | 3041 MB/s | 37.13% |
-| lz4hc 1.10.0 -6 | 37.9 MB/s | 2647 MB/s | 36.98% |
+| lz4 1.10.0 | 516 MB/s | 3225 MB/s | 47.59% |
+| misa77 0.6.0 --1 | 229 MB/s | 3436 MB/s | 46.74% |
+| zxc 0.15.0 -3 | 135 MB/s | 3069 MB/s | 46.65% |
+| **sylz -0** | 492 MB/s | 3200 MB/s | 46.51% |
+| misa77 0.6.0 -0 | 143 MB/s | 3402 MB/s | 44.60% |
+| **sylz -1** | **473 MB/s** | 3286 MB/s | 44.55% |
+| zxc 0.15.0 -4 | 99.7 MB/s | 3022 MB/s | 43.43% |
+| lz4hc 1.10.0 -2 | 223 MB/s | 2887 MB/s | 42.05% |
+| **sylz -2** | **272 MB/s** | 2953 MB/s | **40.89%** |
+| zxc 0.15.0 -5 | 61.2 MB/s | 3079 MB/s | 40.83% |
+| lizard 2.1 -12 | 111 MB/s | 2583 MB/s | 40.68% |
+| **sylz -3** | **189 MB/s** | 3108 MB/s | **39.99%** |
+| **sylz -4** | 79.9 MB/s | 3120 MB/s | 38.80% |
+| lz4hc 1.10.0 -3 | 72.9 MB/s | 2993 MB/s | 38.38% |
+| **sylz -5** | 58.5 MB/s | 3204 MB/s | 37.78% |
+| misa77 0.6.0 -3 | 9.44 MB/s | 3325 MB/s | 37.76% |
+| lz4hc 1.10.0 -4 | 60.5 MB/s | 2995 MB/s | 37.65% |
+| **sylz -6** | 44.0 MB/s | 3207 MB/s | 37.13% |
+| lz4hc 1.10.0 -6 | 41.7 MB/s | 3063 MB/s | 36.98% |
 
 High ratios:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4hc 1.10.0 -9 | 23.9 MB/s | 2742 MB/s | 36.75% |
-| **sylz -7** | 31.9 MB/s | 3045 MB/s | 36.73% |
-| **sylz -8** | 19.6 MB/s | 3063 MB/s | 36.38% |
-| **sylz -9** | 4.24 MB/s | **3164 MB/s** | 36.37% |
-| zxc 0.15.0 -6 | 7.56 MB/s | 2608 MB/s | 36.28% |
-| **sylz -10** | 2.04 MB/s | 3100 MB/s | 36.12% |
-| zstd 1.5.7 -1 | 303 MB/s | 962 MB/s | 34.53% |
-| **sylz -ec -8** (v3) | 20.0 MB/s | 1942 MB/s | 34.47% |
-| **sylz -ec -9** (v3) | 4.42 MB/s | 2092 MB/s | 34.29% |
-| **sylz -ec -10** (v3) | 2.09 MB/s | **2128 MB/s** | **34.06%** |
-| zxc 0.15.0 -7 | 5.44 MB/s | 1817 MB/s | 33.09% |
-| zstd 1.5.7 -2 | 214 MB/s | 721 MB/s | 32.70% |
-| zstd 1.5.7 -3 | 143 MB/s | 616 MB/s | 31.20% |
+| lz4hc 1.10.0 -9 | 27.0 MB/s | 3010 MB/s | 36.75% |
+| **sylz -7** | 33.8 MB/s | 3236 MB/s | 36.73% |
+| lizard 2.1 -19 | 3.42 MB/s | 2455 MB/s | 36.52% |
+| lz4hc 1.10.0 -12 | 9.03 MB/s | 3023 MB/s | 36.45% |
+| **sylz -8** | 20.7 MB/s | 3263 MB/s | 36.38% |
+| zxc 0.15.0 -6 | 8.36 MB/s | 2705 MB/s | 36.28% |
+| **sylz -9** | 7.91 MB/s | 3506 MB/s | 36.17% |
+| **sylz -10** | 6.78 MB/s | **3650 MB/s** | **36.04%** |
+| zstd 1.5.7 -1 | 301 MB/s | 1033 MB/s | 34.53% |
+| **sylz -ec -8** (v3) | 23.5 MB/s | 2349 MB/s | 34.47% |
+| **sylz -ec -9** (v3) | 7.67 MB/s | 2310 MB/s | 34.11% |
+| **sylz -ec -10** (v3) | 6.42 MB/s | **2417 MB/s** | **33.99%** |
+| zxc 0.15.0 -7 | 5.70 MB/s | 1807 MB/s | 33.09% |
+| zstd 1.5.7 -2 | 222 MB/s | 745 MB/s | 32.70% |
+| zstd 1.5.7 -3 | 150 MB/s | 623 MB/s | 31.20% |
 
 `-ec` is format v3 (Huffman-coded literals, experimental): on silesia.tar
 it beats zstd -1 on ratio at twice its decompression speed, but compresses
