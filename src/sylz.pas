@@ -1981,15 +1981,18 @@ type
   end;
 
 const
-  { Levels 9 and 10 (silesia.tar, NOTES.md): 36.17% and 36.04%, where the
-    hash-chain versions made 36.37% and 36.12% at half the speed. Mild
+  { Levels 9 and 10 (silesia.tar, NOTES.md): 36.04% and 36.03%, where the
+    hash-chain versions made 36.37% and 36.12% at half the speed; level
+    10's depth pays on very redundant data (zpaq-std's mixed sample:
+    17.73% -> 17.59%). Depth 16 was too shallow there (17.93%, worse than
+    level 8's 17.71%). Mild
     penalties (half a byte per sequence) buy decode speed almost for free
     (pure byte prices: 0.01 points smaller, ~4% slower to decode); past
     depth 128 and matches of 1024 the ratio stops improving; skipping
     inside long matches costs more ratio than it saves time. }
-  OPT_LEVEL9: TSylzOptParams = (btCut: 16; btMaxLen: 256; sufficient: 128;
+  OPT_LEVEL9: TSylzOptParams = (btCut: 32; btMaxLen: 256; sufficient: 128;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
-  OPT_LEVEL10: TSylzOptParams = (btCut: 128; btMaxLen: 1024; sufficient: 512;
+  OPT_LEVEL10: TSylzOptParams = (btCut: 256; btMaxLen: 1024; sufficient: 512;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
 
 type
@@ -2284,6 +2287,9 @@ begin
 end;
 
 function BtFindAll(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
+var
+  len, dist: SizeInt;
+  cur: PByte;
 begin
   while b.nextToInsert < pos do
   begin
@@ -2291,6 +2297,20 @@ begin
     Inc(b.nextToInsert);
   end;
   Result := BtInsert(b, pos, cands);
+  { the tree compares up to maxLen bytes: a match that reached it goes on
+    as far as the bytes do (in a long run, maxLen-byte pieces would cost
+    a sequence each) }
+  if Result > 0 then
+  begin
+    len := cands[2 * (Result - 1)];
+    if len >= b.maxLen then
+    begin
+      dist := cands[2 * (Result - 1) + 1];
+      cur := b.src + pos;
+      Inc(len, CountMatch(cur + len, cur + len - dist, b.iend));
+      cands[2 * (Result - 1)] := Int32(len);
+    end;
+  end;
   b.nextToInsert := pos + 1;
 end;
 

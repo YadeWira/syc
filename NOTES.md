@@ -98,6 +98,26 @@ lookup for each of up to 36 lengths per candidate). Cycles, silesia.tar
 (compress + one decode): level 9 118.5 G -> 90.9 G (1.30x), level 10
 146.5 G -> 106.7 G (1.37x). Integer prices alone: DP -4.5%.
 
+zpaq-std's mixed sample (16 MB: binaries, a 2 MB run, random data, small
+files; /mnt/IA_LAB/compartido/syc-n9-mezcla) showed v0.2.9's level 9
+worse than v0.2.8's (18.56 vs 18.12%) and than level 8 (17.71%), and
+slower. Two causes:
+
+- the tree compares at most btMaxLen bytes (256 at level 9), so a long
+  run came out as 256-byte matches, a sequence each. A match that reaches
+  btMaxLen is now extended as far as the bytes go (CountMatch, outside
+  the tree). That alone also helps silesia (level 9 36.17 -> 36.11%) and
+  the mixed corpus (60.61 -> 60.52%);
+- depth 16 is too shallow on very redundant data (many similar suffixes):
+  the sample's 1.bin (text) and 20.bin. Depth (silesia / mixed / sample,
+  silesia speed): 16 36.11/60.52/17.93% 7.5 MB/s; 32 36.04/60.42/17.73%
+  7.4; 48 36.03/60.41/17.72% 7.1; 64 36.03/60.40/17.70% 6.9. Level 10 at
+  depth 256: 36.03/60.39/17.59%, 5.9 MB/s.
+
+Level 9 now uses depth 32, level 10 depth 256. Not the cause: the window
+edges (32 KiB windows: same size), the penalties (none: -0.03%), the
+`sufficient` cut (without it: +7%).
+
 ## Levels 4-8: lz4hc's parse (2026-10-22)
 
 At the same attempts, lz4hc -3 (4 attempts) made 38.38% where sylz's
