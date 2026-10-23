@@ -21,7 +21,7 @@ uses
   SysUtils, Classes, Math, sylz;
 
 const
-  SYC_VERSION   = '0.2.10';
+  SYC_VERSION   = '0.2.11';
   MAGIC         = 'SYZ0';
   FORMAT_VER    = 2;   { 2: sylz v2 or v3 blocks; 1: v2 only (syc 0.2.2-0.2.4);
                          0 was sylz v1 (syc 0.2.0-0.2.1) }
