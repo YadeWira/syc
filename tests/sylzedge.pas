@@ -6,7 +6,8 @@
   and decodes back to the input; nothing may be written past cap, nor
   past the decoded output (canary bytes). About 5.7 M cases.
 
-  Usage: sylzedge   (SYLZ_NOASM=1: Pascal code paths only) }
+  Usage: sylzedge   (SYLZ_NOASM=1: Pascal code paths only; SYLZ_C=1: C
+  instead of assembler where both exist) }
 program sylzedge;
 
 {$mode objfpc}{$H+}
@@ -58,6 +59,8 @@ end;
 begin
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
     SylzUseAsm := False;
+  if GetEnvironmentVariable('SYLZ_C') <> '' then
+    SylzPreferC := True;
   seed := 1;
   fails := 0;
   cases := 0;

@@ -858,6 +858,26 @@ asm
 end;
 {$endif}
 
+{$ifdef SYLZ_C}
+type
+  { sylzc_emit / sylzc_fast in sylzc.c: fixed field order }
+  TEmitC = record
+    ctrl, lit: PByte;
+    srcEnd: PByte;
+    exact: PByte;              { ExactCode }
+  end;
+  TFastCState = record
+    src: PByte;
+    n: SizeInt;
+    table: PUInt16;
+    hashLog: SizeInt;
+    anchor: SizeInt;           { out: start of the tail literals }
+    e: TEmitC;
+  end;
+
+procedure sylzc_compress_fast(st: Pointer); cdecl; external name 'sylzc_compress_fast';
+{$endif}
+
 function CompressFast(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 var
@@ -866,6 +886,9 @@ var
   hashLog: Integer;
 {$ifdef SYLZ_ASM_X64}
   st: TFastEncState;
+{$endif}
+{$ifdef SYLZ_C}
+  sc: TFastCState;
 {$endif}
 begin
   if ctx.table = nil then
@@ -876,7 +899,7 @@ begin
     FillChar(table^, SizeOf(UInt16) shl hashLog, 0);
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
 {$ifdef SYLZ_ASM_X64}
-    if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+    if SylzUseAsm and not SylzPreferC and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
     begin
       st.src := src;
       st.iend := src + n;
@@ -890,6 +913,23 @@ begin
       e.ctrl := st.ctrl;
       e.lit := st.lit;
       Exit(EmitFinish(e, st.anchor, src + n - st.anchor));
+    end;
+{$endif}
+{$ifdef SYLZ_C}
+    if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+    begin
+      sc.src := src;
+      sc.n := n;
+      sc.table := table;
+      sc.hashLog := hashLog;
+      sc.e.ctrl := e.ctrl;
+      sc.e.lit := e.lit;
+      sc.e.srcEnd := src + n;
+      sc.e.exact := @ExactCode[0, 0];
+      sylzc_compress_fast(@sc);
+      e.ctrl := sc.e.ctrl;
+      e.lit := sc.e.lit;
+      Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
     end;
 {$endif}
     Result := CompressFastCore(src, n, e, table, hashLog);

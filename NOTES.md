@@ -81,6 +81,13 @@ Windows 7 32-bit (VM), decode, Pascal -> C: dickens level 1 501 -> 853
 MB/s, level 10 794 -> 1338; mozilla level 1 925 -> 1507, level 10 1120 ->
 1892 (+63-70%).
 
+Levels 0-1's compressor in C (sylzc_compress_fast, with emit_sequence
+for the next ones): CompressFastCore with positions as offsets (fwd can
+run past the input; a pointer there is undefined in C). Same bytes as
+the assembler and Pascal. x86_64, compress MB/s, silesia level 0 / 1:
+assembler 486 / 452, C 420 / 403, Pascal 304 / 302; mixed: 688 / 648, 605
+/ 564, 440 / 408.
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack
