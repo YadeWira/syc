@@ -145,7 +145,7 @@ The current command line is minimal and its file format provisional:
 files it writes are not expected to open with later versions.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (-0 .. -10, -ec, -b MIB block size)
+out/syc c -1 file          # -> file.sylz (-0 .. -10, -ec, -b MIB block size, -th N threads)
 out/syc d file.sylz        # -> file
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```

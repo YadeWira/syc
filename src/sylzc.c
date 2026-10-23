@@ -1008,3 +1008,27 @@ void sylzc_opt_cands(sylzc_optcands *st)
     }
     st->w = w;
 }
+
+/* ── CRC-32 (for syc's container) ─────────────────────────────────────── */
+
+/* crc32 in syc.pas: CRC-32 (IEEE, reflected, $EDB88320), as zlib's, by
+   slicing 8. tables: the 8 x 256 table syc.pas builds. FPC ran its version
+   at ~1.2 GB/s, 40% of a syc decompression. */
+uint32_t sylzc_crc32(uint32_t crc, const uint8_t *p, intptr_t n, const uint32_t *tables)
+{
+    const uint32_t *t0 = tables, *t1 = tables + 256, *t2 = tables + 512, *t3 = tables + 768,
+                   *t4 = tables + 1024, *t5 = tables + 1280, *t6 = tables + 1536,
+                   *t7 = tables + 1792;
+    crc = ~crc;
+    while (n >= 8) {
+        uint32_t a = (p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24) ^ crc;
+        uint32_t b = p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
+        crc = t7[a & 0xFF] ^ t6[(a >> 8) & 0xFF] ^ t5[(a >> 16) & 0xFF] ^ t4[a >> 24]
+            ^ t3[b & 0xFF] ^ t2[(b >> 8) & 0xFF] ^ t1[(b >> 16) & 0xFF] ^ t0[b >> 24];
+        p += 8;
+        n -= 8;
+    }
+    while (n-- > 0)
+        crc = t0[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}

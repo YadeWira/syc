@@ -56,6 +56,30 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## syc -th: threads (2026-10-23)
+
+`-th N` (default 1): blocks are compressed and decompressed N at a time;
+the output is the same whatever N. A pipeline of 2N slots, slot k worked
+on by thread k mod N, the main thread reading the next blocks into free
+slots and writing finished ones in order.
+
+First version: batches (read N blocks, run, write N). Decompression got
+slower with threads (silesia.tar 0.43 s with 1, 0.71 s with 2): same
+instructions and cycles, but 1.56 GHz against 2.75 (perf): each block
+decodes in ~1.5 ms, so the workers ran in bursts and their cores never
+left a low clock. The pipeline keeps them busy.
+
+The CRC-32 ran byte by byte at a few hundred MB/s and was the CLI's real
+limit: slicing by 8 (now in C, sylzc_crc32; FPC's slicing ran at ~1.2
+GB/s, gcc's the same within noise here, the kernel's writes dominate
+after it).
+
+silesia.tar on CPUs 20-23, seconds (1 / 2 / 4 threads): compress level 1
+0.68 / 0.46 / 0.39 (was 1.16 single-threaded with the old CRC), level 4
+2.56 / 1.47 / 0.87, -ec -9 55.6 / - / 17.5; decompress 0.33 / 0.31 /
+0.34 (was 0.79): bound by the main thread's writes (half the time in the
+kernel) after the CRC fix.
+
 ## Format v3 levels (2026-10-23)
 
 -ec levels 0..8 parse as v2's 2..10: v2's 0 and 1 leave 27-30% of the
