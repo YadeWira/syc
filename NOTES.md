@@ -69,6 +69,18 @@ to 25% (~1.6x), but the separate candidate pass costs ~5%: total cycles
 -5% (level 9) and -3% (level 10). What is left is the tree (64%,
 assembler, memory bound).
 
+The decoder in C (sylzc_decode: DecodePas's fast loop and margins, and
+DecodeSafe), the fast path where there is no assembler (32-bit Windows,
+arm64). x86_64, silesia.tar decode, level 1 / 8 / 10: assembler 3372 /
+3433 / 3693 MB/s, C 2900-3060 / 2770-2950 / 3020-3270, Pascal 2456 /
+2419 / 2650. First C version 2852 / 2683 / 2857: the token table came as
+a 7th argument, on the stack, read for every sequence, and the literal
+limit spilled; limits computed once as integers (no pointer before a
+buffer's start, undefined in C) and the table in a local fixed both.
+Windows 7 32-bit (VM), decode, Pascal -> C: dickens level 1 501 -> 853
+MB/s, level 10 794 -> 1338; mozilla level 1 925 -> 1507, level 10 1120 ->
+1892 (+63-70%).
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack

@@ -106,3 +106,178 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
         }
     }
 }
+
+/* ── decoder ──────────────────────────────────────────────────────────── */
+
+/* SYLZ_TOKENS entries: bits 0..7 literals, 8..15 match length, 16 / 17
+   their extension flags */
+#define TOK_LLEXT 0x10000u
+#define TOK_MLEXT 0x20000u
+
+static void copy8(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 8); }
+static void copy16(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 16); }
+
+/* DecodeSafe in sylz.pas: exact, fully checked, to the end of the block */
+static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
+                            const uint8_t *lit, const uint8_t *lend,
+                            uint8_t *op, uint8_t *oend, uint8_t *dst,
+                            const uint32_t *tokens)
+{
+    while (ctrl < cend) {
+        if (cend - ctrl < 3)
+            return -1;
+        uint32_t e = tokens[ctrl[0]];
+        intptr_t off = (intptr_t)(ctrl[1] | (uint32_t)ctrl[2] << 8) + 1;
+        ctrl += 3;
+        intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
+        if (e & TOK_LLEXT) {
+            uint8_t b;
+            do {
+                if (ctrl >= cend)
+                    return -1;
+                b = *ctrl++;
+                ll += b;
+            } while (b == 255);
+        }
+        if (e & TOK_MLEXT) {
+            uint8_t b;
+            do {
+                if (ctrl >= cend)
+                    return -1;
+                b = *ctrl++;
+                ml += b;
+            } while (b == 255);
+        }
+        if (ll > lend - lit || ll > oend - op)
+            return -1;
+        for (intptr_t i = 0; i < ll; i++)
+            op[i] = lit[i];
+        op += ll;
+        lit += ll;
+        if (off > op - dst || ml > oend - op)
+            return -1;
+        const uint8_t *m = op - off;
+        while (ml-- > 0)
+            *op++ = *m++;
+    }
+    /* the rest of the literal stream is the block's tail */
+    if (lend - lit != oend - op)
+        return -1;
+    while (lit < lend)
+        *op++ = *lit++;
+    return oend - dst;
+}
+
+/* DecodePas in sylz.pas, the same fast loop and margins: a sequence starts
+   in it only with 3 control bytes, 16 literal bytes and 64 output bytes
+   left, so the common sequence copies without bounds checks. The limits
+   are integers (a pointer before a buffer's start would be undefined in
+   C), computed once, and the token table is a local: passed as a 7th
+   argument it stayed on the stack, read again for every sequence. */
+intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
+                      const uint8_t *lit, const uint8_t *lend,
+                      uint8_t *dst, intptr_t dstLen, const uint32_t *tokens_)
+{
+    static const uint8_t period[8] = {0, 8, 8, 9, 8, 10, 12, 14};
+    const uint32_t *tokens = tokens_;
+    uint8_t *op = dst, *oend = dst + dstLen;
+    /* the fast loop runs while ctrl <= cfast, lit <= lfast, op <= ofast;
+       a limit below its buffer (short block) is 0: nothing runs */
+    uintptr_t cfast = cend - ctrl >= 3 ? (uintptr_t)cend - 3 : 0;
+    uintptr_t lfast = lend - lit >= 16 ? (uintptr_t)lend - 16 : 0;
+    uintptr_t ofast = dstLen >= 64 ? (uintptr_t)oend - 64 : 0;
+
+    while ((uintptr_t)ctrl <= cfast && (uintptr_t)lit <= lfast && (uintptr_t)op <= ofast) {
+        uint32_t e = tokens[ctrl[0]];
+        uintptr_t off = (uintptr_t)(ctrl[1] | (uint32_t)ctrl[2] << 8) + 1;
+        intptr_t ll, ml;
+        ctrl += 3;
+        if (__builtin_expect(e <= 0xFFFF, 1)) {
+            /* exact pair: literals <= 15, match <= 32 */
+            ll = e & 0xFF;
+            ml = e >> 8;
+            copy16(op, lit);
+            op += ll;
+            lit += ll;
+        } else {
+            /* extended field(s): read through m, so giving up leaves
+               everything at the token, nothing written yet */
+            const uint8_t *m = ctrl;
+            ll = e & 0xFF;
+            ml = (e >> 8) & 0xFF;
+            if (e & TOK_LLEXT) {
+                do {
+                    if (m >= cend) { ll = -1; break; }
+                    ll += *m++;
+                } while (m[-1] == 255);
+            }
+            if ((e & TOK_MLEXT) && ll >= 0) {
+                do {
+                    if (m >= cend) { ll = -1; break; }
+                    ml += *m++;
+                } while (m[-1] == 255);
+            }
+            if (ll < 0 || ll > (intptr_t)(lfast - (uintptr_t)lit)
+                || ll + ml > (intptr_t)(ofast - (uintptr_t)op) + 16) {
+                ctrl -= 3;   /* decode_safe redoes this sequence exactly */
+                break;
+            }
+            ctrl = m;
+            /* count down; the last step overshoots by -ll, taken back */
+            do {
+                copy16(op, lit);
+                op += 16;
+                lit += 16;
+                ll -= 16;
+            } while (ll > 0);
+            op += ll;
+            lit += ll;
+        }
+
+        /* match */
+        if (__builtin_expect((intptr_t)off > op - dst, 0))
+            return -1;
+        const uint8_t *m = op - off;
+        if (__builtin_expect(off >= 16, 1)) {
+            copy16(op, m);
+            copy16(op + 16, m + 16);
+            if (__builtin_expect(ml > 32, 0)) {
+                op += 32;
+                m += 32;
+                ml -= 32;
+                do {
+                    copy16(op, m);
+                    op += 16;
+                    m += 16;
+                    ml -= 16;
+                } while (ml > 0);
+            }
+            op += ml;   /* ml <= 32: one step; else ml <= 0, the overshoot */
+        } else if (off >= 8) {
+            do {
+                copy8(op, m);
+                op += 8;
+                m += 8;
+                ml -= 8;
+            } while (ml > 0);
+            op += ml;
+        } else {
+            /* off < 8: the first 8 bytes one by one; they repeat with
+               period off, so the rest copies from the nearest multiple of
+               off that is >= 8, in 8-byte steps */
+            op[0] = m[0]; op[1] = m[1]; op[2] = m[2]; op[3] = m[3];
+            op[4] = m[4]; op[5] = m[5]; op[6] = m[6]; op[7] = m[7];
+            op += 8;
+            m = op - period[off];
+            ml -= 8;
+            while (ml > 0) {
+                copy8(op, m);
+                op += 8;
+                m += 8;
+                ml -= 8;
+            }
+            op += ml;
+        }
+    }
+    return decode_safe(ctrl, cend, lit, lend, op, oend, dst, tokens);
+}

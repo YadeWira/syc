@@ -175,6 +175,9 @@ var
     unless built with -dSYLZ_PUREPASCAL. Every path produces the same
     results; tests turn this off to exercise the Pascal ones. }
   SylzUseAsm: Boolean = True;
+  { On x86_64, take the C paths instead of the assembler ones where both
+    exist (tests and benchmarks; elsewhere C is the fast path anyway). }
+  SylzPreferC: Boolean = False;
 
 implementation
 
@@ -3282,11 +3285,20 @@ begin
 end;
 {$endif}
 
+{$ifdef SYLZ_C}
+function sylzc_decode(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt;
+  tokens: PUInt32): SizeInt; cdecl; external name 'sylzc_decode';
+{$endif}
+
 function DecodeStreams(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt): SizeInt;
 begin
 {$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm then
+  if SylzUseAsm and not SylzPreferC then
     Exit(DecodeAsm(ctrl, cend, lit, lend, dst, dstLen));
+{$endif}
+{$ifdef SYLZ_C}
+  if SylzUseAsm then
+    Exit(sylzc_decode(ctrl, cend, lit, lend, dst, dstLen, @SYLZ_TOKENS[0]));
 {$endif}
   Result := DecodePas(ctrl, cend, lit, lend, dst, dstLen);
 end;

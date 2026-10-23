@@ -5,7 +5,7 @@
   Every buffer handed to the decoder sits flush against a PROT_NONE guard
   page, so a read past the compressed input or a write past the output
   faults immediately instead of going unnoticed. Cases alternate between
-  the assembler and the Pascal code paths (SylzUseAsm; for the Huffman
+  the assembler (or C: SylzPreferC) and the Pascal code paths (SylzUseAsm; for the Huffman
   decoder, HufUseAsm and HufUseBmi2 in turn), and every
   compressed block is also produced by the other path and compared. }
 program sylzfuzz;
@@ -310,6 +310,7 @@ begin
   for k := 1 to iters do
   begin
     SylzUseAsm := Odd(k);   { alternate the assembler and Pascal decoders }
+    SylzPreferC := k mod 4 = 1;   { and, on x86_64, C instead of assembler }
     { and the Huffman decoder's: Pascal, assembler, assembler with BMI2 }
     HufUseAsm := k mod 3 <> 0;
     HufUseBmi2 := bmi2 and (k mod 3 = 2);
