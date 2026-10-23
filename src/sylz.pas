@@ -116,6 +116,7 @@ type
     head: PUInt16;       { levels 4+: hash heads (low 16 bits of positions) }
     chain: PUInt16;      { levels 4+: chain deltas }
     opt: PByte;          { optimal parser: nodes, candidates, path }
+    bt: PUInt32;         { optimal parser: binary-tree match finder }
     flags: Integer;      { of the current call }
   end;
 
@@ -1968,7 +1969,8 @@ const
 
 type
   TSylzOptParams = record
-    attempts: Integer;          { hash chain depth }
+    btCut: Integer;             { match finder: binary tree depth }
+    btMaxLen: Integer;          { its longest compared match }
     sufficient: Integer;        { a match at least this long is taken as is }
     pSeq, pEsc, pShort: Single; { decode-time penalties, in bytes: per
                                   sequence, per escape token, per offset < 16 }
@@ -1979,15 +1981,15 @@ type
   end;
 
 const
-  { Levels 9 and 10. Calibrated on silesia.tar (NOTES.md): against lazy
-    parsing with 1024 attempts, level 9 is 0.5% smaller and decodes with
-    3-4% fewer cycles; level 10 is 1% smaller. Mild penalties (half a byte
-    per sequence) buy decode speed almost for free; skipping inside long
-    matches speeds compression up but costs more ratio than shallower
-    lazy levels, so the optimal levels don't skip. }
-  OPT_LEVEL9: TSylzOptParams = (attempts: 64; sufficient: 128;
+  { Levels 9 and 10 (silesia.tar, NOTES.md): 36.17% and 36.04%, where the
+    hash-chain versions made 36.37% and 36.12% at half the speed. Mild
+    penalties (half a byte per sequence) buy decode speed almost for free
+    (pure byte prices: 0.01 points smaller, ~4% slower to decode); past
+    depth 128 and matches of 1024 the ratio stops improving; skipping
+    inside long matches costs more ratio than it saves time. }
+  OPT_LEVEL9: TSylzOptParams = (btCut: 16; btMaxLen: 256; sufficient: 128;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
-  OPT_LEVEL10: TSylzOptParams = (attempts: 256; sufficient: 256;
+  OPT_LEVEL10: TSylzOptParams = (btCut: 128; btMaxLen: 1024; sufficient: 512;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
 
 type
@@ -2004,47 +2006,113 @@ const
   OPT_CANDS_BYTES = OPT_MAXCAND * 2 * SizeOf(Int32);
   OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
 
-{ Every match at pos longer than the previous one found, nearest first;
-  cands holds (length, distance) pairs. Returns how many. }
-function HcFindAll(var s: THcState; pos: SizeInt; matchlimit: PByte;
-  cands: PInt32): Integer;
+{ The optimal parser's match finder: a binary tree (LZMA's bt4 without
+  its 2- and 3-byte hashes). Every position is inserted into a binary
+  search tree of the window's suffixes, rooted per 4-byte hash, and
+  walking down to insert it meets the longest matches, so it is nearly
+  exhaustive at a fixed cost per position. Against the hash chain it
+  replaced (silesia.tar): depth 16 made 36.18% where 64 chain attempts
+  made 36.37% and 1024 made 36.05% at 1 MB/s; depth 32 made 36.09%. }
+const
+  BT_HASHLOG = 16;
+  BT_WINDOW = 65536;           { cyclic: son pairs of the last 64 KiB }
+
+type
+  TBtState = record
+    src, iend: PByte;
+    head: PUInt32;             { root per hash: position + 1, 0 = none }
+    son: PUInt32;              { two links per cyclic position }
+    nextToInsert: SizeInt;
+    cut, maxLen: SizeInt;
+  end;
+  PBtState = ^TBtState;
+
+{ Inserts pos; with cands <> nil, records every match longer than the
+  previous one, shortest first, as (length, distance) pairs. }
+function BtInsert(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
 var
-  ip, ref: PByte;
-  cand, delta, len, best: SizeInt;
-  tries: Integer;
-  first: UInt32;
+  cur, pb: PByte;
+  h: UInt32;
+  curMatch, delta, len, len0, len1, lenLimit, maxLen, cut: SizeInt;
+  ptr0, ptr1, pair: PUInt32;
 begin
   Result := 0;
-  HcInsertUpTo(s, pos);
-  ip := s.src + pos;
-  first := Read32(ip);
-  best := SYLZ_MINMATCH - 1;
-  cand := HcHead(s, Hash4(first, HC_HASHLOG), pos);
-  if cand < 0 then
-    Exit;
-  tries := s.attempts;
-  while (tries > 0) and (pos - cand <= HC_MAXDIST) do
+  cur := b.src + pos;
+  lenLimit := b.iend - cur;
+  if lenLimit > b.maxLen then
+    lenLimit := b.maxLen;
+  h := Hash4(Read32(cur), BT_HASHLOG);
+  curMatch := SizeInt(b.head[h]) - 1;
+  b.head[h] := UInt32(pos + 1);
+  ptr0 := b.son + ((pos and (BT_WINDOW - 1)) shl 1) + 1;
+  ptr1 := b.son + ((pos and (BT_WINDOW - 1)) shl 1);
+  len0 := 0;
+  len1 := 0;
+  maxLen := SYLZ_MINMATCH - 1;
+  cut := b.cut;
+  while True do
   begin
-    ref := s.src + cand;
-    if (ref[best] = ip[best]) and (Read32(ref) = first) then
+    delta := pos - curMatch;
+    if (curMatch < 0) or (cut = 0) or (delta >= BT_WINDOW) then
     begin
-      len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, matchlimit);
-      if len > best then
+      ptr0^ := 0;
+      ptr1^ := 0;
+      Exit;
+    end;
+    Dec(cut);
+    pair := b.son + ((curMatch and (BT_WINDOW - 1)) shl 1);
+    pb := cur - delta;
+    len := len0;
+    if len1 < len then
+      len := len1;
+    if pb[len] = cur[len] then
+    begin
+      Inc(len);
+      while (len < lenLimit) and (pb[len] = cur[len]) do
+        Inc(len);
+      if len > maxLen then
       begin
-        best := len;
-        cands[2 * Result] := Int32(len);
-        cands[2 * Result + 1] := Int32(pos - cand);
-        Inc(Result);
-        if (Result = OPT_MAXCAND) or (ip + len >= matchlimit) then
-          Break;
+        maxLen := len;
+        if (cands <> nil) and (Result < OPT_MAXCAND) then
+        begin
+          cands[2 * Result] := Int32(len);
+          cands[2 * Result + 1] := Int32(delta);
+          Inc(Result);
+        end;
+        if len >= lenLimit then
+        begin
+          ptr1^ := pair[0];
+          ptr0^ := pair[1];
+          Exit;
+        end;
       end;
     end;
-    Dec(tries);
-    delta := s.chain[cand and HC_CHAINMASK];
-    if delta = 0 then
-      Break;
-    Dec(cand, delta);
+    if pb[len] < cur[len] then
+    begin
+      ptr1^ := UInt32(curMatch + 1);
+      ptr1 := pair + 1;
+      curMatch := SizeInt(ptr1^) - 1;
+      len1 := len;
+    end
+    else
+    begin
+      ptr0^ := UInt32(curMatch + 1);
+      ptr0 := pair;
+      curMatch := SizeInt(ptr0^) - 1;
+      len0 := len;
+    end;
   end;
+end;
+
+function BtFindAll(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
+begin
+  while b.nextToInsert < pos do
+  begin
+    BtInsert(b, b.nextToInsert, nil);
+    Inc(b.nextToInsert);
+  end;
+  Result := BtInsert(b, pos, cands);
+  b.nextToInsert := pos + 1;
 end;
 
 function ExtBytes(v: SizeInt): SizeInt; inline;
@@ -2088,7 +2156,7 @@ begin
     Result := Result + p.pShort;
 end;
 
-function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
+function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var b: TBtState;
   work: PByte; const p: TSylzOptParams): SizeInt;
 var
   nodes: POptNode;
@@ -2106,9 +2174,6 @@ begin
   anchor := 0;
   if n >= SEARCH_TAIL + 1 then
   begin
-    s.src := src;
-    s.nextToInsert := 0;
-    s.attempts := p.attempts;
     limit := n - SEARCH_TAIL;
     start := 0;
     while start < limit do
@@ -2135,7 +2200,7 @@ begin
           nodes[i + 1].ll := nodes[i].ll + 1;
           nodes[i + 1].ml := 0;
         end;
-        k := HcFindAll(s, start + i, iend, cands);
+        k := BtFindAll(b, start + i, cands);
         if k > 0 then
         begin
           if cands[2 * (k - 1)] >= p.sufficient then
@@ -2225,21 +2290,22 @@ function CompressOpt(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; const p: TSylzOptParams): SizeInt;
 var
   e: TEmit;
-  s: THcState;
-  i: Integer;
+  b: TBtState;
 begin
-  if ctx.head = nil then
-    ctx.head := GetMem(SizeOf(UInt16) shl HC_HASHLOG);
-  if ctx.chain = nil then
-    ctx.chain := GetMem(SizeOf(UInt16) * HC_CHAINSIZE);
   if ctx.opt = nil then
     ctx.opt := GetMem(OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
-  s.head := ctx.head;
-  s.chain := ctx.chain;
-  for i := 0 to (1 shl HC_HASHLOG) - 1 do
-    s.head[i] := 0;
+  if ctx.bt = nil then
+    ctx.bt := GetMem(SizeOf(UInt32) * ((1 shl BT_HASHLOG) + 2 * BT_WINDOW));
+  FillChar(ctx.bt^, SizeOf(UInt32) shl BT_HASHLOG, 0);
+  b.src := src;
+  b.iend := src + n;
+  b.head := ctx.bt;
+  b.son := ctx.bt + (1 shl BT_HASHLOG);
+  b.nextToInsert := 0;
+  b.cut := p.btCut;
+  b.maxLen := p.btMaxLen;
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
-  Result := CompressOptCore(src, n, e, s, ctx.opt, p);
+  Result := CompressOptCore(src, n, e, b, ctx.opt, p);
 end;
 
 procedure SylzCtxInit(out ctx: TSylzCtx);
@@ -2251,6 +2317,7 @@ procedure SylzCtxFree(var ctx: TSylzCtx);
 begin
   FreeMem(ctx.scratch);
   FreeMem(ctx.table);
+  FreeMem(ctx.bt);
   FreeMem(ctx.head);
   FreeMem(ctx.chain);
   FreeMem(ctx.opt);

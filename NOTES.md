@@ -56,6 +56,38 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Levels 9-10: a binary-tree match finder (2026-10-23)
+
+After v0.2.8, level 8 (lz4hc's parse, 64 attempts) made 36.38%, as much
+as level 9 (optimal parser, 64 hash-chain attempts: 36.37%) at 4.6x its
+speed. Sweeping the optimal parser (silesia.tar):
+
+- penalties: none 36.36% (decode -4%), half-byte (as is) 36.37%, 1-byte
+  36.43%, 2-byte 37.62%: they cost almost nothing up to 1 byte, then a lot;
+- chain attempts: 256 36.12% at 2.2 MB/s, 1024 36.05% at 1.0 MB/s. The
+  ratio was limited by the candidates, and a deeper chain is slow;
+- perf: 73% of the time in the chain search (every position, 64 attempts).
+
+A binary tree (LZMA's bt4 without its 2- and 3-byte hashes; positions in
+a 64 KiB cyclic son array, roots per 4-byte hash; 768 KiB) finds nearly
+every useful candidate at a fixed cost per position:
+
+| finder | silesia | compress |
+|---|---|---|
+| chain, 64 attempts (old level 9) | 36.37% | 4.7 MB/s |
+| chain, 1024 attempts | 36.05% | 1.0 MB/s |
+| tree, depth 16 (**level 9**) | 36.17% | 5.4-5.7 MB/s |
+| tree, depth 32 | 36.09% | 5.1 MB/s |
+| tree, depth 128, matches to 1024, sufficient 512 (**level 10**) | 36.04% | 4.4-4.8 MB/s |
+| tree, depth 512, to 2048, subLen 128, lighter penalties | 36.02% | 3.6 MB/s |
+
+Mixed corpus: level 9 60.63 -> 60.61%, level 10 60.49 -> 60.41%; compress
+7.3 -> 8.3 and 3.7 -> 5.7 MB/s; decode unchanged or slightly faster.
+Speed barely follows the depth (16: 5.7, 8: 7.8 MB/s for 36.85%): the
+tree insert (63%, Pascal) and the DP (33%) at every position dominate.
+Skipping inside long matches (skipLen 32-64) cost 0.03-0.2 points for
+little speed.
+
 ## Levels 4-8: lz4hc's parse (2026-10-22)
 
 At the same attempts, lz4hc -3 (4 attempts) made 38.38% where sylz's
