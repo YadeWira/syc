@@ -114,21 +114,20 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
 #define TOK_LLEXT 0x10000u
 #define TOK_MLEXT 0x20000u
 
-/* On 32-bit x86 the decoder alone uses SSE2 (Pentium 4 / Athlon 64 and
-   later): its 16-byte copies become one load and one store, +10-15%
-   decode on Windows 7 32-bit. Not the compressors: with -msse2 gcc moved
-   their 64-bit compares into xmm registers, 10% slower (levels 3, 8). */
-#if defined(__i386__) && !defined(SYLZC_NO_SSE2)   /* -DSYLZC_NO_SSE2: plain i686 */
-#define DECODER_TARGET __attribute__((target("sse2")))
-#else
-#define DECODER_TARGET
-#endif
+/* On 32-bit x86 the decoder comes twice: compiled for SSE2 (its 16-byte
+   copies become one load and one store, +22-27% decode on Windows 7
+   32-bit) and for plain i686; sylzc_decode picks one with cpuid on its
+   first call, so one binary runs on any x86 and uses SSE2 where there is
+   one. -DSYLZC_NO_SSE2 keeps only the i686 one. The compressors stay
+   i686: with -msse2 gcc moved their 64-bit compares into xmm registers,
+   10% slower (levels 3, 8). */
+#define DECODER_INLINE static inline __attribute__((always_inline))
 
 static void copy8(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 8); }
 static void copy16(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 16); }
 
 /* DecodeSafe in sylz.pas: exact, fully checked, to the end of the block */
-DECODER_TARGET static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
+DECODER_INLINE intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
                             const uint8_t *lit, const uint8_t *lend,
                             uint8_t *op, uint8_t *oend, uint8_t *dst,
                             const uint32_t *tokens)
@@ -184,7 +183,7 @@ DECODER_TARGET static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *c
    are integers (a pointer before a buffer's start would be undefined in
    C), computed once, and the token table is a local: passed as a 7th
    argument it stayed on the stack, read again for every sequence. */
-DECODER_TARGET intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
+DECODER_INLINE intptr_t decode_core(const uint8_t *ctrl, const uint8_t *cend,
                       const uint8_t *lit, const uint8_t *lend,
                       uint8_t *dst, intptr_t dstLen, const uint32_t *tokens_)
 {
@@ -291,6 +290,51 @@ DECODER_TARGET intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
     }
     return decode_safe(ctrl, cend, lit, lend, op, oend, dst, tokens);
 }
+
+#if defined(__i386__) && !defined(SYLZC_NO_SSE2)
+#include <cpuid.h>   /* header only: inline asm, no libc */
+
+__attribute__((target("sse2")))
+static intptr_t decode_sse2(const uint8_t *ctrl, const uint8_t *cend,
+                            const uint8_t *lit, const uint8_t *lend,
+                            uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode_core(ctrl, cend, lit, lend, dst, dstLen, tokens);
+}
+
+static intptr_t decode_i686(const uint8_t *ctrl, const uint8_t *cend,
+                            const uint8_t *lit, const uint8_t *lend,
+                            uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode_core(ctrl, cend, lit, lend, dst, dstLen, tokens);
+}
+
+/* 0 not checked yet, 1 i686, 2 SSE2 (cpuid leaf 1, edx bit 26). Threads
+   racing here all store the same value. */
+static volatile int decoder_kind;
+
+intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
+                      const uint8_t *lit, const uint8_t *lend,
+                      uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    int kind = decoder_kind;
+    if (kind == 0) {
+        unsigned a, b, c, d;
+        kind = __get_cpuid(1, &a, &b, &c, &d) && (d & bit_SSE2) ? 2 : 1;
+        decoder_kind = kind;
+    }
+    if (kind == 2)
+        return decode_sse2(ctrl, cend, lit, lend, dst, dstLen, tokens);
+    return decode_i686(ctrl, cend, lit, lend, dst, dstLen, tokens);
+}
+#else
+intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
+                      const uint8_t *lit, const uint8_t *lend,
+                      uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode_core(ctrl, cend, lit, lend, dst, dstLen, tokens);
+}
+#endif
 
 /* ── compressor helpers ───────────────────────────────────────────────── */
 

@@ -116,6 +116,14 @@ pass (sylzc_opt_cands, BtFindAll included) the same way over
 BtInsertX64. Same bytes. Cycles, silesia.tar: level 4 -13% (1.15x), 6
 -7%, 8 -5%, 9 -2.4%, 10 -1.4%.
 
+zpaq-std asked for one 32-bit DLL that runs on any x86: the decoder is
+now compiled twice in the same object (decode_core inlined into a
+target("sse2") function and a plain one) and sylzc_decode picks one with
+cpuid (leaf 1, edx bit 26; <cpuid.h> is header-only, fine freestanding)
+on its first call. Windows 7 32-bit, mozilla decode, -DSYLZC_NO_SSE2
+build vs the automatic one: 1302-1834 vs 1661-2299 MB/s (it picks SSE2
+there). Same bytes.
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack
