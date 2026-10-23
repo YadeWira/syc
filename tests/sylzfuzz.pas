@@ -254,7 +254,7 @@ end;
 procedure HufCase;
 var
   m, n, csize, r, i: SizeInt;
-  input, comp, bad, outp: TGuarded;
+  input, comp, bad, outp, old: TGuarded;
 begin
   m := HUF_MIN_SYMBOLS + RandBelow(65536 - HUF_MIN_SYMBOLS + 1);
   input := GuardedAlloc(m);
@@ -270,6 +270,21 @@ begin
      or (CompareByte(input.p^, outp.p^, m) <> 0) then
     Fail('Huffman chunk roundtrip mismatch', m, -1);
   GuardedFree(outp);
+  { the same chunk as mode 1 (syc 0.2.4-0.2.13: no stream 4 size), which
+    the decoder still reads }
+  if comp.p[0] = 2 then
+  begin
+    old := GuardedAlloc(csize - 2);
+    old.p[0] := 1;
+    Move(comp.p[1], old.p[1], 128 + 6);
+    Move(comp.p[1 + 128 + 8], old.p[1 + 128 + 6], csize - (1 + 128 + 8));
+    outp := GuardedAlloc(m);
+    if (HufDecodeChunk(old.p, csize - 2, outp.p, m) <> csize - 2)
+       or (CompareByte(input.p^, outp.p^, m) <> 0) then
+      Fail('Huffman mode 1 chunk roundtrip mismatch', m, -1);
+    GuardedFree(outp);
+    GuardedFree(old);
+  end;
   for i := 1 to 3 do
   begin
     case RandBelow(3) of

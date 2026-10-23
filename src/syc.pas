@@ -5,7 +5,9 @@
   version are not expected to open with later ones.
 
     file   := "SYZ0" version:u8 level:u8 block*  end
-              version 2 = sylz format v2 or v3 blocks (1: v2 only, also read)
+              version 3 = sylz format v2 or v3 blocks, v3 literal chunks
+              with four stream sizes; 2: the same with three (syc
+              0.2.5-0.2.13); 1: v2 only. All read.
     block  := rawLen:u32le packed:u32le crc32:u32le payload
               packed bit 31 set = payload stored raw, else a sylz block;
               the low 31 bits are the payload length
@@ -24,8 +26,10 @@ uses
 const
   SYC_VERSION   = '0.2.13';
   MAGIC         = 'SYZ0';
-  FORMAT_VER    = 2;   { 2: sylz v2 or v3 blocks; 1: v2 only (syc 0.2.2-0.2.4);
-                         0 was sylz v1 (syc 0.2.0-0.2.1) }
+  FORMAT_VER    = 3;   { 3: sylz v2 or v3 blocks, v3 chunks of mode 2 (syc
+                         0.2.14-); 2: v3 chunks of mode 1 (syc 0.2.5-0.2.13);
+                         1: v2 only (syc 0.2.2-); 0 was sylz v1 (syc
+                         0.2.0-0.2.1) }
   STORED_FLAG   = UInt32($80000000);
   PAYLOAD_MASK  = UInt32($7FFFFFFF);
   DEFAULT_BLOCK = 4 shl 20;

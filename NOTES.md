@@ -56,6 +56,18 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Format v3: chunk mode 2 (2026-10-23)
+
+A Huffman chunk's stream 4 ended where its last code did, so the next
+chunk's place was only known after decoding this one: no decoding chunks
+in parallel. Mode 2 stores all four stream sizes (+2 bytes per 64 KiB
+chunk: +778 bytes on silesia.tar's 82 MB at -ec 0), and the chunk is
+exactly its header plus them. Mode 1 is still read (v0.2.4-0.2.13
+files); older decoders reject mode 2, and syc writes container version 3
+for -ec files so v0.2.13 says "format version 3 not supported" instead
+of "corrupt". The fuzzer also decodes each Huffman chunk converted back
+to mode 1.
+
 ## syc -th: threads (2026-10-23)
 
 `-th N` (default 1): blocks are compressed and decompressed N at a time;

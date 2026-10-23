@@ -4,18 +4,24 @@
 
     chunk   := mode:u8  payload
     mode 0  := raw bytes (the chunk's length is known to the caller)
-    mode 1  := lengths[128]  size1:u16le size2:u16le size3:u16le
+    mode 2  := lengths[128]  size1:u16le size2:u16le size3:u16le size4:u16le
                stream1 stream2 stream3 stream4
+    mode 1  := lengths[128]  size1:u16le size2:u16le size3:u16le
+               stream1 stream2 stream3 stream4   (written by syc 0.2.4 to
+               0.2.13, still read; stream 4 ends where its last code does)
+
+  Mode 2 gives every stream's size, so the next chunk's place is known
+  without decoding this one (chunks can be decoded in parallel).
 
   lengths packs the code length of symbol 2k in the low nibble of byte k
   and of 2k+1 in the high nibble; 0 = the symbol does not occur, else
-  1..HUF_MAXBITS. Mode 1 needs n >= HUF_MIN_SYMBOLS. Codes are canonical:
+  1..HUF_MAXBITS. Modes 1 and 2 need n >= HUF_MIN_SYMBOLS. Codes are canonical:
   shorter codes first, equal lengths by symbol. The chunk's n symbols are split into four runs of
   q = (n + 3) div 4 symbols (the last one shorter), each coded into its
   own stream, LSB first (a code's first bit is the lowest unused bit, as
   in deflate, so the decoder reads 8 bytes little-endian with no byte
-  swap); stream 4 ends where its last code does. Four independent streams let the decoder
-  interleave four dependency chains.
+  swap). Four independent streams let the decoder interleave four
+  dependency chains.
 
   The decoder never reads or writes out of bounds, whatever the input:
   it rejects length sets that are not a complete prefix code, and checks
@@ -32,7 +38,8 @@ interface
 const
   HUF_MAXBITS   = 11;
   HUF_TABLESIZE = 1 shl HUF_MAXBITS;
-  HUF_HEADER    = 128 + 6;   { lengths + three stream sizes }
+  HUF_HEADER    = 128 + 6;   { mode 1: lengths + three stream sizes }
+  HUF_HEADER2   = 128 + 8;   { mode 2: lengths + four stream sizes }
   HUF_MIN_GAIN_PCT = 4;
   { smallest chunk that may be Huffman-coded (mode 1); smaller ones are
     raw. The decoder rejects mode 1 below it: with fewer symbols the
@@ -328,12 +335,12 @@ begin
         nearly random data it saves little and costs a table decode per
         byte (mixed corpus: 4% gives +12% decode speed for 0.1 point of
         ratio; 8% gives +25% for 0.5) }
-      if HUF_HEADER + bits div 8 + 4 + n * HUF_MIN_GAIN_PCT div 100 < n then
+      if HUF_HEADER2 + bits div 8 + 4 + n * HUF_MIN_GAIN_PCT div 100 < n then
       begin
         p := dst + 1;
         for i := 0 to 127 do
           p[i] := len[2 * i] or (len[2 * i + 1] shl 4);
-        start := p + HUF_HEADER;
+        start := p + HUF_HEADER2;
         q := (n + 3) div 4;
         BwInit(w, start, dst + cap);
         for s := 0 to 3 do
@@ -346,18 +353,15 @@ begin
             BwPut(w, code[src[i]], len[src[i]]);
           BwFlush(w);
           size := w.p - start;
-          if s < 3 then
-          begin
-            if size > $FFFF then
-              w.overflow := True;
-            p[128 + 2 * s] := Byte(size);
-            p[129 + 2 * s] := Byte(size shr 8);
-          end;
+          if size > $FFFF then
+            w.overflow := True;
+          p[128 + 2 * s] := Byte(size);
+          p[129 + 2 * s] := Byte(size shr 8);
           start := w.p;
         end;
         if not w.overflow and (w.p - dst < 1 + n) then
         begin
-          dst[0] := 1;
+          dst[0] := 2;
           Exit(w.p - dst);
         end;
       end;
@@ -997,7 +1001,8 @@ var
   t: THufTable;
   send: PByte;
   r: array[0..3] of THufReader;
-  q, i, j, k, lastN, s1, s2, s3, bulkEnd, used: SizeInt;
+  q, i, j, k, lastN, s1, s2, s3, s4, bulkEnd, used: SizeInt;
+  chunkEnd: PByte;
   v: UInt16;
   d: array[0..3] of PByte;
   b0, b1, b2, b3: UInt64;
@@ -1019,20 +1024,34 @@ begin
     Move(src[1], dst^, n);
     Exit(1 + n);
   end;
-  if (src[0] <> 1) or (srcLen < 1 + HUF_HEADER) or (n < HUF_MIN_SYMBOLS) then
+  if ((src[0] <> 1) and (src[0] <> 2)) or (n < HUF_MIN_SYMBOLS) then
+    Exit;
+  if (srcLen < 1 + HUF_HEADER) or ((src[0] = 2) and (srcLen < 1 + HUF_HEADER2)) then
     Exit;
   if not BuildTable(src + 1, t) then
     Exit;
   s1 := src[129] or (SizeInt(src[130]) shl 8);
   s2 := src[131] or (SizeInt(src[132]) shl 8);
   s3 := src[133] or (SizeInt(src[134]) shl 8);
-  if 1 + HUF_HEADER + s1 + s2 + s3 > srcLen then
-    Exit;
-  p0 := src + 1 + HUF_HEADER;
+  if src[0] = 2 then
+  begin
+    s4 := src[135] or (SizeInt(src[136]) shl 8);
+    if 1 + HUF_HEADER2 + s1 + s2 + s3 + s4 > srcLen then
+      Exit;
+    p0 := src + 1 + HUF_HEADER2;
+    chunkEnd := p0 + s1 + s2 + s3 + s4;
+  end
+  else
+  begin
+    if 1 + HUF_HEADER + s1 + s2 + s3 > srcLen then
+      Exit;
+    p0 := src + 1 + HUF_HEADER;
+    chunkEnd := send;   { stream 4 ends where its last code does }
+  end;
   RdInit(r[0], p0, p0 + s1);
   RdInit(r[1], p0 + s1, p0 + s1 + s2);
   RdInit(r[2], p0 + s1 + s2, p0 + s1 + s2 + s3);
-  RdInit(r[3], p0 + s1 + s2 + s3, send);
+  RdInit(r[3], p0 + s1 + s2 + s3, chunkEnd);
   q := (n + 3) div 4;
   lastN := n - 3 * q;   { >= 0 for n >= HUF_MIN_SYMBOLS }
   d0 := dst; d1 := dst + q; d2 := dst + 2 * q; d3 := dst + 3 * q;
@@ -1120,7 +1139,10 @@ begin
     if not RdEndsInside(r[k]) then
       Exit;
   end;
-  Result := r[3].p - src - r[3].count div 8;
+  if src[0] = 2 then
+    Result := chunkEnd - src
+  else
+    Result := r[3].p - src - r[3].count div 8;
 end;
 
 {$ifdef HUF_ASM_X64}
