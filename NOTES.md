@@ -108,6 +108,14 @@ SSE2 for the decoder only (__attribute__((target("sse2")))): Windows 7
 32-bit, mozilla, decode 1383-1692 -> 1726-2107 MB/s (+22-27%),
 compression unchanged.
 
+x86_64, where the parse around the assembler searches stayed Pascal:
+levels 4-8's lz4hc parse in C (sylzc_compress_hc), calling the chain
+search through a pointer (HcSearchX64 follows the C calling convention,
+SysV and Win64; sylzc_hc_search elsewhere); and levels 9-10's candidate
+pass (sylzc_opt_cands, BtFindAll included) the same way over
+BtInsertX64. Same bytes. Cycles, silesia.tar: level 4 -13% (1.15x), 6
+-7%, 8 -5%, 9 -2.4%, 10 -1.4%.
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack

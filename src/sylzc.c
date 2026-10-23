@@ -732,3 +732,230 @@ void sylzc_bt_insert(sylzc_bt *b)
     }
     b->count = count;
 }
+
+/* ── levels 4-8: lz4hc's parse ────────────────────────────────────────── */
+
+#define HCW_OPTIMAL_ML 18
+
+/* In/out of sylzc_compress_hc (THcCState in sylz.pas). search is the
+   chain search to use: the x86_64 assembler one (it follows the C calling
+   convention) or sylzc_hc_search. */
+typedef struct {
+    sylzc_hc *s;
+    void (*search)(sylzc_hc *);
+    intptr_t anchor;              /* out */
+    sylzc_emit e;
+} sylzc_hcparse;
+
+static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intptr_t longest)
+{
+    st->s->pos = pos;
+    st->s->lowLimit = lowLimit;
+    st->s->longest = longest;
+    st->search(st->s);
+    return st->s->longest;
+}
+
+/* Emit in CompressHCCore: a match shorter than MINMATCH stays literals */
+static void hc_emit(sylzc_hcparse *st, intptr_t p, intptr_t len, intptr_t r)
+{
+    if (len < MINMATCH)
+        return;
+    emit_sequence(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
+    st->anchor = p + len;
+}
+
+/* CompressHCCore in sylz.pas (LZ4HC_compress_hashChain), same output; the
+   state machine as there: 0 search at pos, 2 / 3 lz4hc's _Search2 /
+   _Search3. The caller set s's src, iend, nextToInsert and attempts. */
+void sylzc_compress_hc(sylzc_hcparse *st)
+{
+    sylzc_hc *s = st->s;
+    intptr_t n = s->iend - s->src;
+    intptr_t mfl, pos = 0, ml = 0, ref = 0, ml0 = 0, ref0 = 0, start0 = 0,
+             ml2 = 0, ref2 = 0, start2 = 0, ml3 = 0, ref3 = 0, start3 = 0,
+             newMl, corr;
+    int state = 0;
+
+    st->anchor = 0;
+    if (n < 12 + 1)
+        return;
+    mfl = n - 12;
+    while (pos < mfl) {
+        if (state == 0) {
+            ml = hc_find(st, pos, pos, MINMATCH - 1);
+            if (ml < MINMATCH) {
+                pos++;
+                continue;
+            }
+            ref = s->mpos;
+            start0 = pos; ref0 = ref; ml0 = ml;
+            state = 2;
+        }
+        if (state == 2) {
+            if (pos + ml <= mfl) {
+                ml2 = hc_find(st, pos + ml - 2, pos, ml);
+                ref2 = s->mpos;
+                start2 = s->spos;
+            } else
+                ml2 = ml;
+            if (ml2 == ml) {
+                hc_emit(st, pos, ml, ref);
+                pos += ml;
+                state = 0;
+                continue;
+            }
+            if (start0 < pos && start2 < pos + ml0) {
+                pos = start0; ref = ref0; ml = ml0;
+            }
+            if (start2 - pos < 3) {
+                ml = ml2; pos = start2; ref = ref2;
+                continue;   /* state 2 again */
+            }
+            state = 3;
+        }
+        /* state 3: ml2 > ml, ml >= MINMATCH */
+        if (start2 - pos < HCW_OPTIMAL_ML) {
+            newMl = ml;
+            if (newMl > HCW_OPTIMAL_ML)
+                newMl = HCW_OPTIMAL_ML;
+            if (pos + newMl > start2 + ml2 - MINMATCH)
+                newMl = start2 - pos + ml2 - MINMATCH;
+            corr = newMl - (start2 - pos);
+            if (corr > 0) {
+                start2 += corr; ref2 += corr; ml2 -= corr;
+            }
+        }
+        if (start2 + ml2 <= mfl) {
+            ml3 = hc_find(st, start2 + ml2 - 3, start2, ml2);
+            ref3 = s->mpos;
+            start3 = s->spos;
+        } else
+            ml3 = ml2;
+        if (ml3 == ml2) {
+            /* no better match: ML1 then ML2 */
+            if (start2 < pos + ml)
+                ml = start2 - pos;
+            hc_emit(st, pos, ml, ref);
+            hc_emit(st, start2, ml2, ref2);
+            pos = start2 + ml2;
+            state = 0;
+            continue;
+        }
+        if (start3 < pos + ml + 3) {
+            /* no room for match 2 */
+            if (start3 >= pos + ml) {
+                if (start2 < pos + ml) {
+                    corr = pos + ml - start2;
+                    start2 += corr; ref2 += corr; ml2 -= corr;
+                    if (ml2 < MINMATCH) {
+                        start2 = start3; ref2 = ref3; ml2 = ml3;
+                    }
+                }
+                hc_emit(st, pos, ml, ref);
+                pos = start3; ref = ref3; ml = ml3;
+                start0 = start2; ref0 = ref2; ml0 = ml2;
+                state = 2;
+                continue;
+            }
+            start2 = start3; ref2 = ref3; ml2 = ml3;
+            state = 3;
+            continue;
+        }
+        /* three ascending matches: write the first */
+        if (start2 < pos + ml) {
+            if (start2 - pos < HCW_OPTIMAL_ML) {
+                if (ml > HCW_OPTIMAL_ML)
+                    ml = HCW_OPTIMAL_ML;
+                if (pos + ml > start2 + ml2 - MINMATCH)
+                    ml = start2 - pos + ml2 - MINMATCH;
+                corr = ml - (start2 - pos);
+                if (corr > 0) {
+                    start2 += corr; ref2 += corr; ml2 -= corr;
+                }
+            } else
+                ml = start2 - pos;
+        }
+        hc_emit(st, pos, ml, ref);
+        pos = start2; ref = ref2; ml = ml2;
+        start2 = start3; ref2 = ref3; ml2 = ml3;
+        state = 3;
+    }
+}
+
+/* ── levels 9-10: the candidate pass ──────────────────────────────────── */
+
+/* In/out of sylzc_opt_cands (TOptCandsC in sylz.pas): the first pass of
+   CompressOptCore's window, BtFindAll included. insert is the tree insert
+   to use (the x86_64 assembler one, or sylzc_bt_insert). */
+typedef struct {
+    sylzc_bt *b;
+    void (*insert)(sylzc_bt *);
+    intptr_t start, w;            /* in; w out, cut at a forced match */
+    intptr_t sufficient, skipLen;
+    int32_t *cands, *off, *cnt;
+    intptr_t forced, forcedLen, forcedDist;   /* out */
+} sylzc_optcands;
+
+/* BtFindAll in sylz.pas: insert the positions before pos, then pos with
+   its candidates; a match that reached the tree's compare length goes on
+   as far as the bytes do. */
+static intptr_t bt_find_all(sylzc_optcands *st, intptr_t pos, int32_t *cands)
+{
+    sylzc_bt *b = st->b;
+    while (b->nextToInsert < pos) {
+        b->pos = b->nextToInsert;
+        b->cands = 0;
+        st->insert(b);
+        b->nextToInsert++;
+    }
+    b->pos = pos;
+    b->cands = cands;
+    st->insert(b);
+    b->nextToInsert = pos + 1;
+    intptr_t k = b->count;
+    if (k > 0) {
+        intptr_t len = cands[2 * (k - 1)];
+        if (len >= b->maxLen) {
+            intptr_t dist = cands[2 * (k - 1) + 1];
+            const uint8_t *cur = b->src + pos;
+            len += count_match(cur + len, cur + len - dist, b->iend);
+            cands[2 * (k - 1)] = (int32_t)len;
+        }
+    }
+    return k;
+}
+
+/* Pass 1 of CompressOptCore's window in sylz.pas, same results. */
+void sylzc_opt_cands(sylzc_optcands *st)
+{
+    intptr_t w = st->w, total = 0, i = 0, k, len, j;
+    int32_t *cands = st->cands, *off = st->off, *cnt = st->cnt;
+    st->forced = 0;
+    st->forcedLen = 0;
+    st->forcedDist = 0;
+    while (i < w) {
+        k = bt_find_all(st, st->start + i, cands + 2 * total);
+        off[i] = (int32_t)total;
+        cnt[i] = (int32_t)k;
+        if (k > 0) {
+            len = cands[2 * (total + k - 1)];
+            if (len >= st->sufficient) {
+                st->forced = 1;
+                st->forcedLen = len;
+                st->forcedDist = cands[2 * (total + k - 1) + 1];
+                w = i;
+                break;
+            }
+            total += k;
+            /* inside a long match: skip to its end (see sylz.pas) */
+            if (len >= st->skipLen && i + len <= w) {
+                for (j = i + 1; j < i + len; j++)
+                    cnt[j] = -1;
+                i += len - 1;
+            }
+        }
+        i++;
+    }
+    st->w = w;
+}

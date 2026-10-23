@@ -2034,12 +2034,28 @@ begin
   Result := EmitFinish(e, src + anchor, n - anchor);
 end;
 
+{$ifdef SYLZ_C}
+type
+  { sylzc_hcparse in sylzc.c: fixed field order }
+  THcCState = record
+    s: PHcState;
+    search: Pointer;           { HcSearchX64 or sylzc_hc_search }
+    anchor: SizeInt;           { out }
+    e: TEmitC;
+  end;
+
+procedure sylzc_compress_hc(st: Pointer); cdecl; external name 'sylzc_compress_hc';
+{$endif}
+
 function CompressHC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 var
   e: TEmit;
   s: THcState;
   i: Integer;
+{$ifdef SYLZ_C}
+  sc: THcCState;
+{$endif}
 begin
   if ctx.head = nil then
     ctx.head := GetMem(SizeOf(UInt16) shl HC_HASHLOG);
@@ -2050,6 +2066,31 @@ begin
   for i := 0 to (1 shl HC_HASHLOG) - 1 do
     s.head[i] := 0;
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
+{$ifdef SYLZ_C}
+  { the parse in C (FPC kept its many live values on the stack), over the
+    assembler chain search on x86_64 }
+  if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+  begin
+    s.src := src;
+    s.iend := src + n;
+    s.nextToInsert := 0;
+    s.attempts := HC_ATTEMPTS[level];
+    sc.s := @s;
+    sc.search := @sylzc_hc_search;
+{$ifdef SYLZ_ASM_X64}
+    if not SylzPreferC then
+      sc.search := @HcSearchX64;
+{$endif}
+    sc.e.ctrl := e.ctrl;
+    sc.e.lit := e.lit;
+    sc.e.srcEnd := src + n;
+    sc.e.exact := @ExactCode[0, 0];
+    sylzc_compress_hc(@sc);
+    e.ctrl := sc.e.ctrl;
+    e.lit := sc.e.lit;
+    Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
+  end;
+{$endif}
   Result := CompressHCCore(src, n, e, s, level);
 end;
 
@@ -2570,6 +2611,19 @@ end;
 {$ifdef SYLZ_C}
 procedure sylzc_opt_dp(nodes: POptNode; w: Int32; cands, off, cnt, mtab: PInt32;
   a: POptDpArgs); cdecl; external name 'sylzc_opt_dp';
+
+type
+  { sylzc_optcands in sylzc.c: fixed field order }
+  TOptCandsC = record
+    b: PBtState;
+    insert: Pointer;           { BtInsertX64 or sylzc_bt_insert }
+    start, w: SizeInt;
+    sufficient, skipLen: SizeInt;
+    cands, off, cnt: PInt32;
+    forced, forcedLen, forcedDist: SizeInt;
+  end;
+
+procedure sylzc_opt_cands(st: Pointer); cdecl; external name 'sylzc_opt_cands';
 {$endif}
 
 { Each window in three passes: the candidates of every position (the
@@ -2585,6 +2639,9 @@ var
   forced: Boolean;
   q: TOptPrices;
   a: TOptDpArgs;
+{$ifdef SYLZ_C}
+  oc: TOptCandsC;
+{$endif}
   { match prices without the short-offset penalty, by pending run (row
     EXACT_LL + 1: any longer run) and length - MINMATCH }
   mtab: array[0..EXACT_LL + 1, 0..OPT_MTAB_COLS - 1] of Int32;
@@ -2607,6 +2664,19 @@ begin
   path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
   off := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
   cnt := off + (OPT_WINDOW + 1);
+{$ifdef SYLZ_C}
+  oc.b := @b;
+  oc.insert := @sylzc_bt_insert;
+{$ifdef SYLZ_ASM_X64}
+  if not SylzPreferC then
+    oc.insert := @BtInsertX64;
+{$endif}
+  oc.sufficient := p.sufficient;
+  oc.skipLen := p.skipLen;
+  oc.cands := cands;
+  oc.off := off;
+  oc.cnt := cnt;
+{$endif}
   anchor := 0;
   if n >= SEARCH_TAIL + 1 then
   begin
@@ -2622,6 +2692,21 @@ begin
       forced := False;
       forcedLen := 0;
       forcedDist := 0;
+{$ifdef SYLZ_C}
+      if SylzUseAsm then
+      begin
+        { in C: FPC kept BtFindAll's and this loop's values on the stack }
+        oc.start := start;
+        oc.w := w;
+        sylzc_opt_cands(@oc);
+        w := oc.w;
+        forced := oc.forced <> 0;
+        forcedLen := oc.forcedLen;
+        forcedDist := oc.forcedDist;
+      end
+      else
+{$endif}
+      begin
       total := 0;
       i := 0;
       while i < w do
@@ -2654,6 +2739,7 @@ begin
           end;
         end;
         Inc(i);
+      end;
       end;
 
       { 2: the DP }
