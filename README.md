@@ -37,49 +37,52 @@ loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, and the fuzzer checks that both compressors produce the same bytes.
 
 silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
-everything in one session (2026-10-23). Fast and middle levels:
+everything in one session (2026-10-23; the machine was busy, so all
+speeds run ~10% under an idle one). Fast and middle levels:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 516 MB/s | 3225 MB/s | 47.59% |
-| misa77 0.6.0 --1 | 229 MB/s | 3436 MB/s | 46.74% |
-| zxc 0.15.0 -3 | 135 MB/s | 3069 MB/s | 46.65% |
-| **sylz -0** | 492 MB/s | 3200 MB/s | 46.51% |
-| misa77 0.6.0 -0 | 143 MB/s | 3402 MB/s | 44.60% |
-| **sylz -1** | **473 MB/s** | 3286 MB/s | 44.55% |
-| zxc 0.15.0 -4 | 99.7 MB/s | 3022 MB/s | 43.43% |
-| lz4hc 1.10.0 -2 | 223 MB/s | 2887 MB/s | 42.05% |
-| **sylz -2** | **272 MB/s** | 2953 MB/s | **40.89%** |
-| zxc 0.15.0 -5 | 61.2 MB/s | 3079 MB/s | 40.83% |
-| lizard 2.1 -12 | 111 MB/s | 2583 MB/s | 40.68% |
-| **sylz -3** | **189 MB/s** | 3108 MB/s | **39.99%** |
-| **sylz -4** | 79.9 MB/s | 3120 MB/s | 38.80% |
-| lz4hc 1.10.0 -3 | 72.9 MB/s | 2993 MB/s | 38.38% |
-| **sylz -5** | 58.5 MB/s | 3204 MB/s | 37.78% |
-| misa77 0.6.0 -3 | 9.44 MB/s | 3325 MB/s | 37.76% |
-| lz4hc 1.10.0 -4 | 60.5 MB/s | 2995 MB/s | 37.65% |
-| **sylz -6** | 44.0 MB/s | 3207 MB/s | 37.13% |
-| lz4hc 1.10.0 -6 | 41.7 MB/s | 3063 MB/s | 36.98% |
+| lz4 1.10.0 | 463 MB/s | 2817 MB/s | 47.59% |
+| misa77 0.6.0 --1 | 228 MB/s | 3299 MB/s | 46.74% |
+| zxc 0.15.0 -3 | 137 MB/s | 3028 MB/s | 46.65% |
+| **sylz -0** | 452 MB/s | 2847 MB/s | 46.51% |
+| misa77 0.6.0 -0 | 139 MB/s | 3321 MB/s | 44.60% |
+| **sylz -1** | **419 MB/s** | 2830 MB/s | 44.55% |
+| zxc 0.15.0 -4 | 101 MB/s | 2972 MB/s | 43.43% |
+| lz4hc 1.10.0 -2 | 206 MB/s | 2573 MB/s | 42.05% |
+| **sylz -2** | **227 MB/s** | 2772 MB/s | **40.89%** |
+| zxc 0.15.0 -5 | 61.1 MB/s | 2904 MB/s | 40.83% |
+| lizard 2.1 -12 | 105 MB/s | 2450 MB/s | 40.68% |
+| **sylz -3** | **183 MB/s** | 2767 MB/s | **39.99%** |
+| **sylz -4** | 75.0 MB/s | 2811 MB/s | 38.80% |
+| lz4hc 1.10.0 -3 | 67.7 MB/s | 2648 MB/s | 38.38% |
+| **sylz -5** | 55.0 MB/s | 2807 MB/s | 37.78% |
+| misa77 0.6.0 -3 | 9.08 MB/s | 3294 MB/s | 37.76% |
+| lz4hc 1.10.0 -4 | 57.5 MB/s | 2743 MB/s | 37.65% |
+| **sylz -6** | 42.1 MB/s | 2878 MB/s | 37.13% |
+| lz4hc 1.10.0 -6 | 40.7 MB/s | 2801 MB/s | 36.98% |
 
 High ratios:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4hc 1.10.0 -9 | 27.0 MB/s | 3010 MB/s | 36.75% |
-| **sylz -7** | 33.8 MB/s | 3236 MB/s | 36.73% |
-| lizard 2.1 -19 | 3.42 MB/s | 2455 MB/s | 36.52% |
-| lz4hc 1.10.0 -12 | 9.03 MB/s | 3023 MB/s | 36.45% |
-| **sylz -8** | 20.7 MB/s | 3263 MB/s | 36.38% |
-| zxc 0.15.0 -6 | 8.36 MB/s | 2705 MB/s | 36.28% |
-| **sylz -9** | 7.91 MB/s | 3506 MB/s | 36.17% |
-| **sylz -10** | 6.78 MB/s | **3650 MB/s** | **36.04%** |
-| zstd 1.5.7 -1 | 301 MB/s | 1033 MB/s | 34.53% |
-| **sylz -ec -8** (v3) | 23.5 MB/s | 2349 MB/s | 34.47% |
-| **sylz -ec -9** (v3) | 7.67 MB/s | 2310 MB/s | 34.11% |
-| **sylz -ec -10** (v3) | 6.42 MB/s | **2417 MB/s** | **33.99%** |
-| zxc 0.15.0 -7 | 5.70 MB/s | 1807 MB/s | 33.09% |
-| zstd 1.5.7 -2 | 222 MB/s | 745 MB/s | 32.70% |
-| zstd 1.5.7 -3 | 150 MB/s | 623 MB/s | 31.20% |
+| lz4hc 1.10.0 -9 | 26.3 MB/s | 2787 MB/s | 36.75% |
+| **sylz -7** | 33.2 MB/s | 2963 MB/s | 36.73% |
+| lizard 2.1 -19 | 3.38 MB/s | 2358 MB/s | 36.52% |
+| lz4hc 1.10.0 -12 | 8.88 MB/s | 2918 MB/s | 36.45% |
+| **sylz -8** | 21.0 MB/s | 2954 MB/s | 36.38% |
+| zxc 0.15.0 -6 | 7.83 MB/s | 2480 MB/s | 36.28% |
+| **sylz -9** | 6.98 MB/s | **3182 MB/s** | **36.04%** |
+| **sylz -10** | 5.95 MB/s | 3043 MB/s | **36.03%** |
+| zstd 1.5.7 -1 | 298 MB/s | 962 MB/s | 34.53% |
+| **sylz -ec -8** (v3) | 19.0 MB/s | 1960 MB/s | 34.47% |
+| **sylz -ec -9** (v3) | 6.59 MB/s | 2016 MB/s | 33.99% |
+| **sylz -ec -10** (v3) | 5.80 MB/s | **2110 MB/s** | **33.98%** |
+| zxc 0.15.0 -7 | 5.33 MB/s | 1826 MB/s | 33.09% |
+| zstd 1.5.7 -2 | 206 MB/s | 684 MB/s | 32.70% |
+| zstd 1.5.7 -3 | 139 MB/s | 594 MB/s | 31.20% |
+
+On very redundant data -10 searches deeper than -9 and pays for it: zpaq-std's mixed sample 17.73% (-9) -> 17.59% (-10).
 
 `-ec` is format v3 (Huffman-coded literals, experimental): on silesia.tar
 it beats zstd -1 on ratio at twice its decompression speed, but compresses
