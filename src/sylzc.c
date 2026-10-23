@@ -1032,3 +1032,14 @@ uint32_t sylzc_crc32(uint32_t crc, const uint8_t *p, intptr_t n, const uint32_t 
         crc = t0[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     return ~crc;
 }
+
+/* ── arm64 Linux: FPC 3.2.2's program startup ─────────────────────────── */
+
+#if defined(__aarch64__) && defined(__linux__)
+/* FPC 3.2.2's aarch64 cprt0.o (the startup of programs linked with libc,
+   which cthreads makes syc one) passes these to __libc_start_main; glibc
+   2.34 removed them and ignores those arguments (it runs the init arrays
+   itself), so empty ones only satisfy the linker. */
+void __libc_csu_init(void) {}
+void __libc_csu_fini(void) {}
+#endif
