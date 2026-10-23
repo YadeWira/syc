@@ -153,13 +153,14 @@ function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
 const
   { SylzCompressEx flags }
   SYLZ_ENTROPY = 1;   { format v3: Huffman-code the literals where it pays }
-  { With SYLZ_ENTROPY the levels are 0..SYLZ_EC_MAXLEVEL, level N parsing
-    as format v2's level N + SYLZ_EC_SHIFT: v2's levels 0 and 1 leave so
-    many literals that, Huffman-coded, they decode slower than level 2's
-    parse and compress worse (silesia.tar: 40.11% / 1655 MB/s, 39.21% /
-    1795, against 38.80% / 2209). }
+  { With SYLZ_ENTROPY the levels are 0..SYLZ_EC_MAXLEVEL: 0..8 parse as
+    format v2's level N + SYLZ_EC_SHIFT (v2's levels 0 and 1 leave so many
+    literals that, Huffman-coded, they decode slower than level 2's parse
+    and compress worse: silesia.tar 40.11% / 1655 MB/s, 39.21% / 1795,
+    against 38.80% / 2209); 9 and 10 run the optimal parser with each
+    literal priced by its Huffman code (CompressOptEC). }
   SYLZ_EC_SHIFT = 2;
-  SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL - SYLZ_EC_SHIFT;
+  SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL;   { 9 and 10: entropy-aware prices }
 
 { SylzCompressCtx with flags. Without SYLZ_ENTROPY the output is format v2
   (what SylzCompress writes); with it, format v3 if that is smaller, else
@@ -2148,7 +2149,7 @@ const
 
 type
   TOptNode = record
-    cost: Int32;    { in quarter bytes, relative to the window's start }
+    cost: Int32;    { in bits, relative to the window's start }
     ll: Int32;      { pending literals at this node }
     ml: Int32;      { 0: reached by a literal, else by a match of ml bytes }
     dist: Int32;
@@ -2488,12 +2489,12 @@ end;
   and comparing nodes with different runs is fair. Charging the literal
   extension to the match that ends a run instead made a match after a long
   run look prohibitive, and the parse then never ended a run. }
-{ Prices are integers in quarter bytes (OPT_SCALE): the penalties are
+{ Prices are integers in bits (OPT_SCALE per byte): the penalties are
   multiples of a quarter, so the sums are exact, as they were in Single,
   and the DP picks the same path, without the float code FPC compiled
   poorly. }
 const
-  OPT_SCALE = 4;
+  OPT_SCALE = 8;
   OPT_MTAB_COLS = 64;   { match lengths priced from a table: MINMATCH .. +63 }
 
 type
@@ -2538,7 +2539,10 @@ type
     (sylzc_dpargs in sylzc.c) reads it. }
   TOptDpArgs = record
     exactLL, minMatch, mtabCols, subLen: Int32;
-    seq, esc, short: Int32;     { penalties, quarter bytes }
+    seq, esc, short: Int32;     { penalties, bits }
+    scale: Int32;               { OPT_SCALE }
+    litPrice: PInt32;           { a literal's price by byte value, bits }
+    wsrc: PByte;                { the window's input }
   end;
   POptDpArgs = ^TOptDpArgs;
 
@@ -2566,7 +2570,8 @@ begin
       Continue;
     cost := nodes[i].cost;
     ll := nodes[i].ll;
-    tc := cost + LitStep(ll, q);
+    { the byte's price, and what the run's growing costs beyond a byte }
+    tc := cost + a.litPrice[a.wsrc[i]] + LitStep(ll, q) - OPT_SCALE;
     if tc < nodes[i + 1].cost then
     begin
       nodes[i + 1].cost := tc;
@@ -2637,8 +2642,31 @@ procedure sylzc_opt_cands(st: Pointer); cdecl; external name 'sylzc_opt_cands';
 { Each window in three passes: the candidates of every position (the
   binary tree), the DP over them (OptDpPas, or its C version), and the
   cheapest path, emitted. }
+const
+  { regions of the input with their own literal prices (format v3's
+    entropy-aware levels): 256 KiB; 64 KiB, closer to the literal chunks,
+    did no better (silesia.tar 33.72 vs 33.70% without the penalty) }
+  OPT_REGION_SHIFT = 18;
+  { added to each literal's code length: the first parse's lengths miss the
+    chunk's table and the second parse's own literals; 1 bit made both a
+    smaller output (silesia.tar 33.70 -> 33.60%) and a faster decode, 2
+    bits decode as fast as level 8's parse but give the gain back }
+  OPT_LIT_PENALTY = 1;
+
+{ Count the literals of src[from..upto) into hist, by region. }
+procedure CountLiterals(src: PByte; from, upto: SizeInt; hist: PUInt32);
+var
+  i: SizeInt;
+begin
+  for i := from to upto - 1 do
+    Inc(hist[(i shr OPT_REGION_SHIFT) * 256 + src[i]]);
+end;
+
+{ prices: per region of 2^OPT_REGION_SHIFT input bytes, 256 literal prices
+  in bits (nil: 8 bits each, format v2's byte). hist: when set, nothing is
+  emitted; the parse's literals are counted into it by region instead. }
 function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var b: TBtState;
-  work: PByte; const p: TSylzOptParams): SizeInt;
+  work: PByte; const p: TSylzOptParams; prices: PInt32; hist: PUInt32): SizeInt;
 var
   nodes: POptNode;
   cands, path, off, cnt: PInt32;
@@ -2647,6 +2675,7 @@ var
   forced: Boolean;
   q: TOptPrices;
   a: TOptDpArgs;
+  flat: array[0..255] of Int32;
 {$ifdef SYLZ_C}
   oc: TOptCandsC;
 {$endif}
@@ -2667,6 +2696,10 @@ begin
   a.seq := q.seq;
   a.esc := q.esc;
   a.short := q.short;
+  a.scale := OPT_SCALE;
+  for i := 0 to 255 do
+    flat[i] := OPT_SCALE;
+  a.litPrice := @flat[0];
   nodes := POptNode(work);
   cands := PInt32(work + OPT_NODES_BYTES);
   path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
@@ -2751,6 +2784,9 @@ begin
       end;
 
       { 2: the DP }
+      a.wsrc := src + start;
+      if prices <> nil then
+        a.litPrice := prices + (start shr OPT_REGION_SHIFT) * 256;
       nodes[0].cost := 0;
       nodes[0].ll := Int32(start - anchor);
       nodes[0].ml := 0;
@@ -2780,14 +2816,18 @@ begin
       for t := npath - 1 downto 0 do
       begin
         pos := start + path[3 * t];
-        if not EmitSequence(e, src + anchor, pos - anchor, path[3 * t + 2], path[3 * t + 1]) then
+        if hist <> nil then
+          CountLiterals(src, anchor, pos, hist)
+        else if not EmitSequence(e, src + anchor, pos - anchor, path[3 * t + 2], path[3 * t + 1]) then
           Exit(-1);
         anchor := pos + path[3 * t + 1];
       end;
       if forced then
       begin
         pos := start + w;
-        if not EmitSequence(e, src + anchor, pos - anchor, forcedDist, forcedLen) then
+        if hist <> nil then
+          CountLiterals(src, anchor, pos, hist)
+        else if not EmitSequence(e, src + anchor, pos - anchor, forcedDist, forcedLen) then
           Exit(-1);
         anchor := pos + forcedLen;
         start := anchor;
@@ -2795,6 +2835,11 @@ begin
       else
         start := start + w;
     end;
+  end;
+  if hist <> nil then
+  begin
+    CountLiterals(src, anchor, n, hist);
+    Exit(0);
   end;
   Result := EmitFinish(e, src + anchor, n - anchor);
 end;
@@ -2818,7 +2863,95 @@ begin
   b.cut := p.btCut;
   b.maxLen := p.btMaxLen;
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
-  Result := CompressOptCore(src, n, e, b, ctx.opt, p);
+  Result := CompressOptCore(src, n, e, b, ctx.opt, p, nil, nil);
+end;
+
+{ Literal prices from counted literals, per region: each region's Huffman
+  code lengths, as HufEncodeChunk would build them; 8 bits where Huffman
+  would not pay (the chunk stays raw) or a region has no literals; absent
+  symbols get HUF_MAXBITS + 1. }
+procedure LiteralPrices(hist: PUInt32; regions: SizeInt; prices: PInt32);
+var
+  r, i: SizeInt;
+  len: array[0..255] of Byte;
+  total, bits: UInt64;
+  h: PUInt32;
+  pr: PInt32;
+begin
+  for r := 0 to regions - 1 do
+  begin
+    h := hist + r * 256;
+    pr := prices + r * 256;
+    total := 0;
+    for i := 0 to 255 do
+      Inc(total, h[i]);
+    for i := 0 to 255 do
+      pr[i] := OPT_SCALE;
+    if total = 0 then
+      Continue;
+    HufLengths(h, @len[0]);
+    bits := 0;
+    for i := 0 to 255 do
+      Inc(bits, UInt64(h[i]) * len[i]);
+    if bits * 100 > total * 8 * (100 - HUF_MIN_GAIN_PCT) then
+      Continue;   { would stay raw }
+    for i := 0 to 255 do
+      if len[i] > 0 then
+        pr[i] := len[i] + OPT_LIT_PENALTY
+      else
+        pr[i] := HUF_MAXBITS + 1 + OPT_LIT_PENALTY;
+  end;
+end;
+
+{ Format v3's levels 9 and 10: the optimal parser pricing each literal by
+  its Huffman code. A first parse (format v2's prices) counts the
+  literals per region, and their code lengths price the parse that is
+  emitted. Against -ec 8 (level 10's parse priced as v2), silesia.tar
+  33.98 -> 33.61% (-ec 9) / 33.60% (-ec 10), mixed 57.15 -> 56.94 /
+  56.91%, at about half the speed (two parses) and ~5% slower decode (more
+  literals). A third parse, priced from the second's literals, gained
+  0.02 points (33.58%). }
+function CompressOptEC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; const p: TSylzOptParams): SizeInt;
+var
+  e: TEmit;
+  b: TBtState;
+  regions: SizeInt;
+  hist: PUInt32;
+  prices: PInt32;
+
+  procedure ResetTree;
+  begin
+    FillChar(ctx.bt^, SizeOf(UInt32) shl BT_HASHLOG, 0);
+    b.src := src;
+    b.iend := src + n;
+    b.head := ctx.bt;
+    b.son := ctx.bt + (1 shl BT_HASHLOG);
+    b.nextToInsert := 0;
+    b.cut := p.btCut;
+    b.maxLen := p.btMaxLen;
+  end;
+
+begin
+  if ctx.opt = nil then
+    ctx.opt := GetMem(OPT_WORK_BYTES);
+  if ctx.bt = nil then
+    ctx.bt := GetMem(SizeOf(UInt32) * ((1 shl BT_HASHLOG) + 2 * BT_WINDOW));
+  regions := (n shr OPT_REGION_SHIFT) + 1;
+  hist := GetMem(regions * 256 * SizeOf(UInt32));
+  prices := GetMem(regions * 256 * SizeOf(Int32));
+  try
+    FillChar(hist^, regions * 256 * SizeOf(UInt32), 0);
+    ResetTree;
+    CompressOptCore(src, n, e, b, ctx.opt, p, nil, hist);
+    LiteralPrices(hist, regions, prices);
+    ResetTree;
+    EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
+    Result := CompressOptCore(src, n, e, b, ctx.opt, p, prices, nil);
+  finally
+    FreeMem(prices);
+    FreeMem(hist);
+  end;
 end;
 
 procedure SylzCtxInit(out ctx: TSylzCtx);
@@ -2855,6 +2988,19 @@ begin
   begin
     if level > SYLZ_EC_MAXLEVEL then
       level := SYLZ_EC_MAXLEVEL;
+    if level >= SYLZ_MAXLEVEL - SYLZ_EC_SHIFT + 1 then
+    begin
+      if ctx.scratchSize < n + SCRATCH_SLACK then
+      begin
+        FreeMem(ctx.scratch);
+        ctx.scratchSize := n + SCRATCH_SLACK;
+        ctx.scratch := GetMem(ctx.scratchSize);
+      end;
+      if level = SYLZ_MAXLEVEL - 1 then
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9))
+      else
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10));
+    end;
     Inc(level, SYLZ_EC_SHIFT);
   end;
   if level > SYLZ_MAXLEVEL then

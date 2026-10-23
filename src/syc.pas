@@ -76,8 +76,9 @@ begin
     ': 0-1 single hash, 2-3 two hashes, 4-8 hash chains, 9-10 optimal parsing');
   WriteLn('  -ec       extra compression: entropy-coded literals (sylz format v3,');
   WriteLn('            experimental), smaller, slower to decode; levels 0 .. ', SYLZ_EC_MAXLEVEL,
-    ',');
-  WriteLn('            level N parsing as -', SYLZ_EC_SHIFT, ' + N does');
+    ':');
+  WriteLn('            0-8 parse as -', SYLZ_EC_SHIFT, ' .. -', SYLZ_MAXLEVEL,
+    ' do, 9-10 price literals by their Huffman codes');
   WriteLn('  -b MIB    block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 

@@ -52,6 +52,10 @@ function HufEncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeI
   corrupt. }
 function HufDecodeChunk(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
 
+{ The code lengths (0 = absent, else 1..HUF_MAXBITS) HufEncodeChunk would
+  give symbols with these frequencies. }
+procedure HufLengths(freq: PUInt32; len: PByte);
+
 var
   { x86-64: decode with the assembler bulk loop, and in it BMI2's shrx
     (set at startup from cpuid). Both can be cleared (tests, benchmarks);
@@ -363,6 +367,19 @@ begin
   if n > 0 then
     Move(src^, dst[1], n);
   Result := 1 + n;
+end;
+
+procedure HufLengths(freq: PUInt32; len: PByte);
+var
+  f: array[0..255] of UInt32;
+  l: array[0..255] of Byte;
+  i: Integer;
+begin
+  for i := 0 to 255 do
+    f[i] := freq[i];
+  BuildLengths(f, l, HUF_MAXBITS);
+  for i := 0 to 255 do
+    len[i] := l[i];
 end;
 
 { ── decoder ────────────────────────────────────────────────────────────── }

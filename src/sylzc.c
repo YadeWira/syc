@@ -24,7 +24,10 @@ typedef struct {
     int32_t minMatch;   /* SYLZ_MINMATCH */
     int32_t mtabCols;   /* columns of mtab: lengths MINMATCH .. +mtabCols-1 */
     int32_t subLen;     /* every match length up to this is tried */
-    int32_t seq, esc, shortOff;   /* penalties, quarter bytes */
+    int32_t seq, esc, shortOff;   /* penalties, bits */
+    int32_t scale;      /* OPT_SCALE: a byte's price */
+    const int32_t *litPrice;      /* a literal's price by byte value, bits */
+    const uint8_t *wsrc;          /* the window's input */
 } sylzc_dpargs;
 
 static int32_t ext_bytes(int32_t v) { return v / 255 + 1; }
@@ -32,11 +35,12 @@ static int32_t ext_bytes(int32_t v) { return v / 255 + 1; }
 /* LitStep in sylz.pas */
 static int32_t lit_step(int32_t ll, const sylzc_dpargs *a)
 {
+    int32_t s = a->scale;
     if (ll < a->exactLL)
-        return 4;
+        return s;
     if (ll == a->exactLL)
-        return 4 * (1 + ext_bytes(ll + 1)) + a->esc;
-    return 4 * (1 + ext_bytes(ll + 1) - ext_bytes(ll));
+        return s * (1 + ext_bytes(ll + 1)) + a->esc;
+    return s * (1 + ext_bytes(ll + 1) - ext_bytes(ll));
 }
 
 /* MatchCost in sylz.pas for a length past mtab (so past the exact codes) */
@@ -44,7 +48,7 @@ static int32_t long_match_cost(int32_t ll, int32_t ml, int32_t dist,
                                const sylzc_dpargs *a)
 {
     int32_t m = ml - a->minMatch;
-    int32_t r = 4 * (3 + ext_bytes(m)) + a->seq;
+    int32_t r = a->scale * (3 + ext_bytes(m)) + a->seq;
     if (ll <= a->exactLL)
         r += a->esc;
     if (dist < 16)
@@ -68,7 +72,8 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
             continue;
         int32_t cost = nodes[i].cost;
         int32_t ll = nodes[i].ll;
-        int32_t tc = cost + lit_step(ll, a);
+        /* the byte's price, and what the run's growing costs beyond a byte */
+        int32_t tc = cost + a->litPrice[a->wsrc[i]] + lit_step(ll, a) - a->scale;
         if (tc < nodes[i + 1].cost) {
             nodes[i + 1].cost = tc;
             nodes[i + 1].ll = ll + 1;

@@ -4,7 +4,8 @@
     -l  comma-separated levels, default 1,2,4,6,9,12
     -t  minimum time per measurement, default 1.0
     -ec extra compression, format v3: entropy-coded literals (SYLZ_ENTROPY);
-        levels 0..SYLZ_EC_MAXLEVEL, level N parsing as v2's N + 2
+        levels 0..8 parse as v2's N + 2, 9 and 10 price literals by
+        their Huffman codes
 
   Each file is one block. Speeds are the best of the repeated runs, in
   MB/s with MB = 10^6 bytes (as lzbench), measured on the input size.

@@ -56,6 +56,34 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Format v3 levels (2026-10-23)
+
+-ec levels 0..8 parse as v2's 2..10: v2's 0 and 1 leave 27-30% of the
+output as literals, which Huffman-coded decode slower than level 2's
+parse and compress worse (silesia.tar -ec on v2's 0 / 1 / 2: 40.11% 1655
+MB/s, 39.21% 1795, 38.80% 2209).
+
+-ec 9 and 10 are new: the optimal parser with each literal priced by its
+Huffman code instead of a byte. A first parse (v2 prices) counts the
+literals per 256 KiB region; their code lengths (as HufEncodeChunk would
+build them; 8 bits where the chunk would stay raw) plus a 1-bit penalty
+price the parse that is emitted. Prices are now in bits (OPT_SCALE 8;
+v2 output unchanged, checked on every path). silesia.tar / mixed / zpaq-
+std's sample, against -ec 8:
+
+| | silesia | mixed | sample | compress (silesia) | decode only (silesia) |
+|---|---|---|---|---|---|
+| -ec 8 | 33.98% | 57.15% | 16.82% | 6.5 MB/s | 2311 MB/s |
+| -ec 9 (level 9's tree) | 33.61% | 56.94% | 16.81% | 3.8 MB/s | 2196 MB/s |
+| -ec 10 (level 10's tree) | 33.60% | 56.91% | 16.69% | 3.3 MB/s | 2204 MB/s |
+
+Tried: no penalty 33.70% (and slower decode: more literals); 2 bits
+33.71%, decode back at level 8's; 64 KiB regions 33.72%; a third parse
+priced from the second's literals 33.58% (+50% time); accumulating both
+parses' counts 33.70%. The 1-bit penalty helps the ratio too: the first
+parse's lengths miss each chunk's table and the shift in statistics the
+cheaper literals cause.
+
 ## C (2026-10-23)
 
 New rule from the user: the project is Free Pascal, C and embedded

@@ -86,7 +86,9 @@ High ratios:
 | zstd 1.5.7 -1 | 350 MB/s | 1135 MB/s | 34.53% |
 | **sylz -ec -6** (v3) | 21.6 MB/s | 2181 MB/s | 34.47% |
 | **sylz -ec -7** (v3) | 7.44 MB/s | 2219 MB/s | 33.99% |
-| **sylz -ec -8** (v3) | 6.37 MB/s | **2254 MB/s** | **33.98%** |
+| **sylz -ec -8** (v3) | 6.37 MB/s | **2254 MB/s** | 33.98% |
+| **sylz -ec -9** (v3)† | 3.77 MB/s | 2196 MB/s | **33.61%** |
+| **sylz -ec -10** (v3)† | 3.27 MB/s | 2204 MB/s | **33.60%** |
 | zxc 0.15.0 -7 | 6.41 MB/s | 1978 MB/s | 33.09% |
 | zstd 1.5.7 -2 | 238 MB/s | 814 MB/s | 32.70% |
 | zstd 1.5.7 -3 | 153 MB/s | 678 MB/s | 31.20% |
@@ -100,9 +102,11 @@ Windows 7 32-bit (a VM, mozilla): compress -1 282 MB/s, -4 66.6 MB/s,
 [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks#32-bit-windows-v0211).
 
 `-ec` is format v3 (Huffman-coded literals, experimental), with levels
-`-0` to `-8`: `-ec -N` parses as `-(N+2)` does, since v2's `-0` and `-1`
-leave so many literals that, Huffman-coded, they decode slower and
-compress worse than `-2`'s parse. On silesia.tar
+`-0` to `-10`: `-ec -0` .. `-8` parse as `-2` .. `-10` do (v2's `-0`
+and `-1` leave so many literals that, Huffman-coded, they decode slower
+and compress worse than `-2`'s parse), and `-ec -9` / `-10` run the
+optimal parser with each literal priced by its Huffman code (two parses;
+† measured later, same machine, decode-only timing). On silesia.tar
 it beats zstd -1 on ratio at twice its decompression speed, but compresses
 far slower; on mixed data zstd -1 is still smaller.
 
