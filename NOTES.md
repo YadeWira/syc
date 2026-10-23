@@ -85,6 +85,16 @@ New ladder (attempts 2, 4, 8, 16, 64): silesia 38.80 / 37.78 / 37.13 /
 now matches level 9's ratio (36.37%, mixed 60.63%) at ~4x its speed;
 level 9 keeps a ~9% faster decode.
 
+x86-64 assembler (HcSearchX64): the insertion loop and the chain walk
+with forward and backward extension, one routine for both searches of
+the parse (a plain one at pos, lowLimit = pos, and the "wider" one); the
+parse itself stays in Pascal (~12% of the time). Same bytes as the
+Pascal. Cycles, silesia.tar (compress + one decode): level 4 12.8 G ->
+9.6 G (1.33x), level 6 19.8 -> 16.6 G (1.18x), level 8 36.3 -> 31.2 G
+(1.16x). What remains is memory latency: the hottest instructions wait on
+the candidate's bytes and on its chain link. Loading the link first, so
+the two loads overlap: no gain (+0.6 to +6% cycles), dropped.
+
 tests/sylzedge.pas (the exhaustive size x level x format x capacity
 test of the 2026-10-19 review) is now in the repository.
 
