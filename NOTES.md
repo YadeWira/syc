@@ -101,6 +101,13 @@ MB/s, 1 171 -> 291, 2 147 -> 157, 3 107 -> 131, 4 43 -> 58, 6 26 -> 36, 8
 output. Every level of 32-bit Windows and arm64 now runs C where x86_64
 runs assembler.
 
+32-bit x86 and SSE2 (Pentium 4 / Athlon 64 and later): -msse2 for all
+of sylzc.c made decode +10-15% but compression ~10% slower at levels 3
+and 8 (gcc moved the 64-bit compares of count_match into xmm registers).
+SSE2 for the decoder only (__attribute__((target("sse2")))): Windows 7
+32-bit, mozilla, decode 1383-1692 -> 1726-2107 MB/s (+22-27%),
+compression unchanged.
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack

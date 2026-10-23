@@ -17,7 +17,9 @@ command line is a placeholder and will also be designed from scratch.
 - bounded memory, small match-finder tables, reusable contexts;
 - good on 1–4 cores rather than needing 16;
 - no AVX2 requirement: x86-64 baseline (SSE2) is enough;
-- 32-bit targets supported (the Pascal code paths run anywhere FPC does).
+- 32-bit targets supported (the Pascal code paths run anywhere FPC does);
+  the 32-bit x86 release binaries need SSE2 (Pentium 4 / Athlon 64 or
+  later), used by the decoder.
 
 Languages: Free Pascal first; C and x86-64 assembler only where Free
 Pascal's code falls short, each next to a Pascal version that stays the

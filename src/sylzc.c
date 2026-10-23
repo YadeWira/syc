@@ -114,11 +114,21 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
 #define TOK_LLEXT 0x10000u
 #define TOK_MLEXT 0x20000u
 
+/* On 32-bit x86 the decoder alone uses SSE2 (Pentium 4 / Athlon 64 and
+   later): its 16-byte copies become one load and one store, +10-15%
+   decode on Windows 7 32-bit. Not the compressors: with -msse2 gcc moved
+   their 64-bit compares into xmm registers, 10% slower (levels 3, 8). */
+#if defined(__i386__)
+#define DECODER_TARGET __attribute__((target("sse2")))
+#else
+#define DECODER_TARGET
+#endif
+
 static void copy8(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 8); }
 static void copy16(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 16); }
 
 /* DecodeSafe in sylz.pas: exact, fully checked, to the end of the block */
-static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
+DECODER_TARGET static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
                             const uint8_t *lit, const uint8_t *lend,
                             uint8_t *op, uint8_t *oend, uint8_t *dst,
                             const uint32_t *tokens)
@@ -174,7 +184,7 @@ static intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
    are integers (a pointer before a buffer's start would be undefined in
    C), computed once, and the token table is a local: passed as a 7th
    argument it stayed on the stack, read again for every sequence. */
-intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
+DECODER_TARGET intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
                       const uint8_t *lit, const uint8_t *lend,
                       uint8_t *dst, intptr_t dstLen, const uint32_t *tokens_)
 {
