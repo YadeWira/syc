@@ -118,7 +118,7 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
    later): its 16-byte copies become one load and one store, +10-15%
    decode on Windows 7 32-bit. Not the compressors: with -msse2 gcc moved
    their 64-bit compares into xmm registers, 10% slower (levels 3, 8). */
-#if defined(__i386__)
+#if defined(__i386__) && !defined(SYLZC_NO_SSE2)   /* -DSYLZC_NO_SSE2: plain i686 */
 #define DECODER_TARGET __attribute__((target("sse2")))
 #else
 #define DECODER_TARGET

@@ -1,6 +1,8 @@
 # Sourced by build.sh and plugin/build.sh: build_c OUTDIR [fpc options]
 # compiles src/sylzc.c to OUTDIR/sylzc.o for the target the fpc options
-# name (unless -dSYLZ_PUREPASCAL). CC overrides the compiler. (Variables
+# name (unless -dSYLZ_PUREPASCAL). CC overrides the compiler; CFLAGS_EXTRA
+# adds flags (e.g. -DSYLZC_NO_SSE2: a 32-bit x86 decoder without SSE2,
+# for CPUs before the Pentium 4). (Variables
 # prefixed: this runs in the caller's shell.)
 CFLAGS_SYLZ="-O2 -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns \
 -fno-stack-protector -fno-asynchronous-unwind-tables -Wall"
@@ -19,5 +21,5 @@ build_c() {
     esac
   done
   # shellcheck disable=SC2086
-  ${CC:-$_bc_cc} $CFLAGS_SYLZ $_bc_extra -c src/sylzc.c -o "$_bc_out/sylzc.o"
+  ${CC:-$_bc_cc} $CFLAGS_SYLZ $_bc_extra $CFLAGS_EXTRA -c src/sylzc.c -o "$_bc_out/sylzc.o"
 }
