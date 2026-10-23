@@ -171,15 +171,22 @@ function SylzDecompressCtx(var dctx: TSylzDCtx; src: PByte; n: SizeInt; dst: PBy
   dstLen: SizeInt): SizeInt;
 
 var
-  { Use the assembler fast paths where there are any (x86_64, unless built
-    with -dSYLZ_PUREPASCAL). Both paths produce the same results; tests
-    turn this off to exercise the Pascal one. }
+  { Use the assembler (x86_64) and C fast paths where there are any,
+    unless built with -dSYLZ_PUREPASCAL. Every path produces the same
+    results; tests turn this off to exercise the Pascal ones. }
   SylzUseAsm: Boolean = True;
 
 implementation
 
 uses
   sylzhuf;
+
+{ C parts (sylzc.c, built by build.sh into the object path): every
+  target, unless SYLZ_PUREPASCAL }
+{$ifndef SYLZ_PUREPASCAL}
+{$define SYLZ_C}
+{$L sylzc.o}
+{$endif}
 
 {$if defined(CPUX86_64) and not defined(SYLZ_PUREPASCAL)}
 {$define SYLZ_ASM_X64}
@@ -2006,8 +2013,12 @@ type
 
 const
   OPT_NODES_BYTES = (OPT_WINDOW + 1) * SizeOf(TOptNode);
-  OPT_CANDS_BYTES = OPT_MAXCAND * 2 * SizeOf(Int32);
+  { every position's candidates, at most OPT_MAXCAND pairs each }
+  OPT_CANDS_BYTES = OPT_WINDOW * OPT_MAXCAND * 2 * SizeOf(Int32);
   OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
+  OPT_INDEX_BYTES = (OPT_WINDOW + 1) * SizeOf(Int32);   { off, cnt }
+  OPT_WORK_BYTES  = OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES
+                    + 2 * OPT_INDEX_BYTES;
 
 { The optimal parser's match finder: a binary tree (LZMA's bt4 without
   its 2- and 3-byte hashes). Every position is inserted into a binary
@@ -2371,22 +2382,110 @@ begin
     Inc(Result, q.short);
 end;
 
+type
+  { What the DP needs besides the window; fixed layout, the C version
+    (sylzc_dpargs in sylzc.c) reads it. }
+  TOptDpArgs = record
+    exactLL, minMatch, mtabCols, subLen: Int32;
+    seq, esc, short: Int32;     { penalties, quarter bytes }
+  end;
+  POptDpArgs = ^TOptDpArgs;
+
+{ The forward DP over one window of w positions: nodes[0] is set and
+  nodes[1..w].cost are High(Int32). Position i has cnt[i] candidates at
+  cands[2 * off[i]], (length, distance) pairs, longest last; cnt[i] < 0:
+  inside a skipped match, no transitions at all. mtab: match prices
+  without the short-offset penalty, by pending run (row EXACT_LL + 1: any
+  longer run) and length - MINMATCH. }
+procedure OptDpPas(nodes: POptNode; w: SizeInt; cands, off, cnt, mtab: PInt32;
+  const a: TOptDpArgs);
+var
+  i, j, k, c, ml, len, dist, prevLen, ll: SizeInt;
+  cost, tc, base: Int32;
+  row, cp: PInt32;
+  q: TOptPrices;
+begin
+  q.seq := a.seq;
+  q.esc := a.esc;
+  q.short := a.short;
+  for i := 0 to w - 1 do
+  begin
+    k := cnt[i];
+    if k < 0 then
+      Continue;
+    cost := nodes[i].cost;
+    ll := nodes[i].ll;
+    tc := cost + LitStep(ll, q);
+    if tc < nodes[i + 1].cost then
+    begin
+      nodes[i + 1].cost := tc;
+      nodes[i + 1].ll := Int32(ll + 1);
+      nodes[i + 1].ml := 0;
+    end;
+    if k = 0 then
+      Continue;
+    if ll > EXACT_LL then
+      row := mtab + (EXACT_LL + 1) * OPT_MTAB_COLS
+    else
+      row := mtab + ll * OPT_MTAB_COLS;
+    cp := cands + 2 * off[i];
+    prevLen := SYLZ_MINMATCH - 1;
+    for c := 0 to k - 1 do
+    begin
+      len := cp[2 * c];
+      dist := cp[2 * c + 1];
+      base := cost;
+      if dist < 16 then
+        Inc(base, q.short);
+      ml := prevLen;
+      while ml < len do
+      begin
+        { every length up to subLen, then straight to the full one }
+        if ml < a.subLen then
+          Inc(ml)
+        else
+          ml := len;
+        j := i + ml;
+        if j > w then
+          Break;
+        if ml < SYLZ_MINMATCH + OPT_MTAB_COLS then
+          tc := base + row[ml - SYLZ_MINMATCH]
+        else
+          tc := cost + MatchCost(ll, ml, dist, q);
+        if tc < nodes[j].cost then
+        begin
+          nodes[j].cost := tc;
+          nodes[j].ll := 0;
+          nodes[j].ml := Int32(ml);
+          nodes[j].dist := Int32(dist);
+        end;
+      end;
+      prevLen := len;
+    end;
+  end;
+end;
+
+{$ifdef SYLZ_C}
+procedure sylzc_opt_dp(nodes: POptNode; w: Int32; cands, off, cnt, mtab: PInt32;
+  a: POptDpArgs); cdecl; external name 'sylzc_opt_dp';
+{$endif}
+
+{ Each window in three passes: the candidates of every position (the
+  binary tree), the DP over them (OptDpPas, or its C version), and the
+  cheapest path, emitted. }
 function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var b: TBtState;
   work: PByte; const p: TSylzOptParams): SizeInt;
 var
   nodes: POptNode;
-  cands, path: PInt32;
-  iend: PByte;
-  limit, anchor, start, w, i, j, k, c, ml, len, dist, prevLen, npath, t,
+  cands, path, off, cnt: PInt32;
+  limit, anchor, start, w, i, j, k, len, npath, t, total,
     pos, forcedLen, forcedDist: SizeInt;
-  cost, tc, base: Int32;
   forced: Boolean;
   q: TOptPrices;
-  ll: SizeInt;
+  a: TOptDpArgs;
   { match prices without the short-offset penalty, by pending run (row
     EXACT_LL + 1: any longer run) and length - MINMATCH }
   mtab: array[0..EXACT_LL + 1, 0..OPT_MTAB_COLS - 1] of Int32;
-  row: PInt32;
 begin
   q.seq := Round(p.pSeq * OPT_SCALE);
   q.esc := Round(p.pEsc * OPT_SCALE);
@@ -2394,10 +2493,18 @@ begin
   for i := 0 to EXACT_LL + 1 do
     for j := 0 to OPT_MTAB_COLS - 1 do
       mtab[i, j] := MatchCost(i, j + SYLZ_MINMATCH, 16, q);
+  a.exactLL := EXACT_LL;
+  a.minMatch := SYLZ_MINMATCH;
+  a.mtabCols := OPT_MTAB_COLS;
+  a.subLen := p.subLen;
+  a.seq := q.seq;
+  a.esc := q.esc;
+  a.short := q.short;
   nodes := POptNode(work);
   cands := PInt32(work + OPT_NODES_BYTES);
   path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
-  iend := src + n;
+  off := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
+  cnt := off + (OPT_WINDOW + 1);
   anchor := 0;
   if n >= SEARCH_TAIL + 1 then
   begin
@@ -2408,87 +2515,59 @@ begin
       w := OPT_WINDOW;
       if start + w > limit then
         w := limit - start;
+
+      { 1: candidates }
+      forced := False;
+      forcedLen := 0;
+      forcedDist := 0;
+      total := 0;
+      i := 0;
+      while i < w do
+      begin
+        k := BtFindAll(b, start + i, cands + 2 * total);
+        off[i] := Int32(total);
+        cnt[i] := Int32(k);
+        if k > 0 then
+        begin
+          len := cands[2 * (total + k - 1)];
+          if len >= p.sufficient then
+          begin
+            forced := True;
+            forcedLen := len;
+            forcedDist := cands[2 * (total + k - 1) + 1];
+            w := i;
+            Break;
+          end;
+          Inc(total, k);
+          { inside a long match, searching every position costs a lot and
+            rarely finds a better parse: skip to its end. Only when the
+            match ends inside the window: its full-length transition then
+            sets that node, so the path stays valid (skipped positions
+            start no transitions, so none of them can become a parent) }
+          if (len >= p.skipLen) and (i + len <= w) then
+          begin
+            for j := i + 1 to i + len - 1 do
+              cnt[j] := -1;
+            i := i + len - 1;
+          end;
+        end;
+        Inc(i);
+      end;
+
+      { 2: the DP }
       nodes[0].cost := 0;
       nodes[0].ll := Int32(start - anchor);
       nodes[0].ml := 0;
       for i := 1 to w do
         nodes[i].cost := High(Int32);
-      forced := False;
-      forcedLen := 0;
-      forcedDist := 0;
-      i := 0;
-      while i < w do
-      begin
-        cost := nodes[i].cost;
-        tc := cost + LitStep(nodes[i].ll, q);
-        if tc < nodes[i + 1].cost then
-        begin
-          nodes[i + 1].cost := tc;
-          nodes[i + 1].ll := nodes[i].ll + 1;
-          nodes[i + 1].ml := 0;
-        end;
-        k := BtFindAll(b, start + i, cands);
-        if k > 0 then
-        begin
-          if cands[2 * (k - 1)] >= p.sufficient then
-          begin
-            forced := True;
-            forcedLen := cands[2 * (k - 1)];
-            forcedDist := cands[2 * (k - 1) + 1];
-            w := i;
-            Break;
-          end;
-          prevLen := SYLZ_MINMATCH - 1;
-          ll := nodes[i].ll;
-          if ll > EXACT_LL then
-            row := @mtab[EXACT_LL + 1, 0]
-          else
-            row := @mtab[ll, 0];
-          for c := 0 to k - 1 do
-          begin
-            len := cands[2 * c];
-            dist := cands[2 * c + 1];
-            base := cost;
-            if dist < 16 then
-              Inc(base, q.short);
-            ml := prevLen;
-            while ml < len do
-            begin
-              { every length up to subLen, then straight to the full one }
-              if ml < p.subLen then
-                Inc(ml)
-              else
-                ml := len;
-              j := i + ml;
-              if j > w then
-                Break;
-              if ml < SYLZ_MINMATCH + OPT_MTAB_COLS then
-                tc := base + row[ml - SYLZ_MINMATCH]
-              else
-                tc := cost + MatchCost(ll, ml, dist, q);
-              if tc < nodes[j].cost then
-              begin
-                nodes[j].cost := tc;
-                nodes[j].ll := 0;
-                nodes[j].ml := Int32(ml);
-                nodes[j].dist := Int32(dist);
-              end;
-            end;
-            prevLen := len;
-          end;
-          { inside a long match, searching every position costs a lot and
-            rarely finds a better parse: skip to its end. Only when the
-            match ends inside the window: its full-length transition then
-            set that node, so the path stays valid (skipped nodes start no
-            transitions, so none of them can become a parent) }
-          len := cands[2 * (k - 1)];
-          if (len >= p.skipLen) and (i + len <= w) then
-            i := i + len - 1;
-        end;
-        Inc(i);
-      end;
+{$ifdef SYLZ_C}
+      if SylzUseAsm then
+        sylzc_opt_dp(nodes, Int32(w), cands, off, cnt, @mtab[0, 0], @a)
+      else
+{$endif}
+        OptDpPas(nodes, w, cands, off, cnt, @mtab[0, 0], a);
 
-      { the cheapest path to node w, back to front }
+      { 3: the cheapest path to node w, back to front }
       npath := 0;
       j := w;
       while j > 0 do
@@ -2531,7 +2610,7 @@ var
   b: TBtState;
 begin
   if ctx.opt = nil then
-    ctx.opt := GetMem(OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
+    ctx.opt := GetMem(OPT_WORK_BYTES);
   if ctx.bt = nil then
     ctx.bt := GetMem(SizeOf(UInt32) * ((1 shl BT_HASHLOG) + 2 * BT_WINDOW));
   FillChar(ctx.bt^, SizeOf(UInt32) shl BT_HASHLOG, 0);

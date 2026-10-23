@@ -19,6 +19,9 @@ case $target in
 esac
 dir=out/plugin/$target
 mkdir -p "$dir/units"
-"$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -FU"$dir/units" -FE"$dir" "$@" plugin/sylz_zpaqstd.pas
+. ./build-c.sh
+# shellcheck disable=SC2086
+build_c "$dir/units" $opts "$@"
+"$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -FU"$dir/units" -Fo"$dir/units" -FE"$dir" "$@" plugin/sylz_zpaqstd.pas
 mv -f "$dir/$lib" "$dir/$out"
 echo "$dir/$out"

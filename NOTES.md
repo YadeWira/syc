@@ -56,6 +56,26 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## C (2026-10-23)
+
+New rule from the user: the project is Free Pascal, C and embedded
+assembler, C never the main language; C goes where FPC's code falls
+short. First use: the optimal parser's DP (sylzc_opt_dp in src/sylzc.c),
+FPC's version spilled its many live values to the stack. The window now
+runs in three passes (candidates from the tree; the DP over them, in C
+or Pascal; the path), same output byte for byte on silesia, the mixed
+corpus and zpaq-std's sample. The DP went from ~39% of level 9's cycles
+to 25% (~1.6x), but the separate candidate pass costs ~5%: total cycles
+-5% (level 9) and -3% (level 10). What is left is the tree (64%,
+assembler, memory bound).
+
+Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
+x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
+freestanding (no libc, no builtins, no loop-to-memset, no stack
+protector, no unwind tables), into the object path fpc gets with -Fo;
+sylz.pas links it with {$L sylzc.o}. On win32 FPC adds C's leading
+underscore itself. -dSYLZ_PUREPASCAL builds without C.
+
 ## Levels 9-10: a binary-tree match finder (2026-10-23)
 
 After v0.2.8, level 8 (lz4hc's parse, 64 attempts) made 36.38%, as much

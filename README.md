@@ -1,7 +1,8 @@
 # syc
 
 A streaming archiver and compressor with its own LZ codecs, written from
-scratch in Free Pascal. Tuned for modest hardware.
+scratch in Free Pascal, with C and assembler for the hottest loops. Tuned
+for modest hardware.
 
 **Status: v0.2.x, pre-release.** Every release stays a pre-release until
 v1.0.0, and the formats can change between versions. syc v0.1.x was a
@@ -17,6 +18,11 @@ command line is a placeholder and will also be designed from scratch.
 - good on 1–4 cores rather than needing 16;
 - no AVX2 requirement: x86-64 baseline (SSE2) is enough;
 - 32-bit targets supported (the Pascal code paths run anywhere FPC does).
+
+Languages: Free Pascal first; C and x86-64 assembler only where Free
+Pascal's code falls short, each next to a Pascal version that stays the
+reference (the tests check they give the same bytes). C never becomes
+the main language.
 
 ## sylz
 
@@ -34,7 +40,8 @@ previous one and extend backwards); `-9` and `-10` an optimal parser over
 a binary-tree match finder, whose prices include decode time, so it picks
 cheaper sequences. The decoder is safe on corrupt input. Hot
 loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
-ones, and the fuzzer checks that both compressors produce the same bytes.
+ones, the optimal parser's DP a C one, and the fuzzer checks that every
+path produces the same bytes.
 
 silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
 everything in one session (2026-10-23; the machine was busy, so all
@@ -94,12 +101,14 @@ The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 
 ## Build
 
-Free Pascal 3.2.2:
+Free Pascal 3.2.2 and a C compiler for the target (gcc; mingw-w64 for
+Windows; aarch64-linux-gnu-gcc for arm64; `CC` overrides), which
+build.sh picks from the fpc options:
 
 ```sh
 ./build.sh                    # out/syc and out/sylzbench
 ./build.sh -Twin64            # Windows x86-64 (FPC's win64 units)
-./build.sh -dSYLZ_PUREPASCAL  # no assembler, Pascal paths only
+./build.sh -dSYLZ_PUREPASCAL  # no assembler, no C: Pascal paths only
 FPC=ppcross386 ./build.sh -Twin32                  # Windows 32-bit
 FPC=ppcrossa64 ./build.sh -XPaarch64-linux-gnu-    # Linux arm64
 ```
@@ -161,12 +170,12 @@ mmap).
 ## Layout
 
 ```
-src/           sylz codec (sylz.pas), its Huffman coder (sylzhuf.pas), the
-               syc CLI (syc.pas)
+src/           sylz codec (sylz.pas, and sylzc.c: its C part), its Huffman
+               coder (sylzhuf.pas), the syc CLI (syc.pas)
 bench/         sylzbench, sylzstats (sequence histograms of a block)
-tests/         sylzfuzz
+tests/         sylzfuzz, sylzedge
 plugin/        zpaq-std codec plugin and its test
-build.sh
+build.sh       (and build-c.sh, which compiles the C part for the target)
 NOTES.md       development log: measurements, FPC codegen findings
 legacy/rust/   syc v0.1.x, the Rust archiver: README, NOTES and its sources
                archived in syc-rust-v0.1.29.zip
