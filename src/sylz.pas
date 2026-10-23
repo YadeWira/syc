@@ -1501,6 +1501,22 @@ asm
 end;
 {$endif}
 
+{$ifdef SYLZ_C}
+type
+  { sylzc_mid in sylzc.c: fixed field order }
+  TMidCState = record
+    src: PByte;
+    n: SizeInt;
+    tl, ts: PUInt16;
+    hashLog, lazy: SizeInt;
+    skip, lazyEnough, nextBelow: SizeInt;
+    anchor: SizeInt;           { out }
+    e: TEmitC;
+  end;
+
+procedure sylzc_compress_mid(st: Pointer); cdecl; external name 'sylzc_compress_mid';
+{$endif}
+
 function CompressMid(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer): SizeInt;
 var
@@ -1508,6 +1524,9 @@ var
   hashLog: Integer;
 {$ifdef SYLZ_ASM_X64}
   st: TMidEncState;
+{$endif}
+{$ifdef SYLZ_C}
+  sc: TMidCState;
 {$endif}
 begin
   if ctx.table = nil then
@@ -1519,7 +1538,7 @@ begin
   FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags);
 {$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+  if SylzUseAsm and not SylzPreferC and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
   begin
     st.src := src;
     st.iend := src + n;
@@ -1535,6 +1554,28 @@ begin
     e.ctrl := st.ctrl;
     e.lit := st.lit;
     Exit(EmitFinish(e, st.anchor, src + n - st.anchor));
+  end;
+{$endif}
+{$ifdef SYLZ_C}
+  if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+  begin
+    sc.src := src;
+    sc.n := n;
+    sc.tl := ctx.table;
+    sc.ts := ctx.table + (1 shl hashLog);
+    sc.hashLog := hashLog;
+    sc.lazy := Ord(level = 3);
+    sc.skip := MID_SKIP;
+    sc.lazyEnough := MID_LAZY_ENOUGH;
+    sc.nextBelow := MID_NEXT_BELOW;
+    sc.e.ctrl := e.ctrl;
+    sc.e.lit := e.lit;
+    sc.e.srcEnd := src + n;
+    sc.e.exact := @ExactCode[0, 0];
+    sylzc_compress_mid(@sc);
+    e.ctrl := sc.e.ctrl;
+    e.lit := sc.e.lit;
+    Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
   end;
 {$endif}
   Result := CompressMidCore(src, n, e, ctx.table, ctx.table + (1 shl hashLog),
@@ -1794,15 +1835,26 @@ asm
 end;
 {$endif}
 
+{$ifdef SYLZ_C}
+procedure sylzc_hc_search(st: PHcState); cdecl; external name 'sylzc_hc_search';
+{$endif}
+
 function HcSearch(var s: THcState; pos, lowLimit, longest: SizeInt): SizeInt; inline;
 begin
   s.pos := pos;
   s.lowLimit := lowLimit;
   s.longest := longest;
 {$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm then
+  if SylzUseAsm and not SylzPreferC then
   begin
     HcSearchX64(@s);
+    Exit(s.longest);
+  end;
+{$endif}
+{$ifdef SYLZ_C}
+  if SylzUseAsm then
+  begin
+    sylzc_hc_search(@s);
     Exit(s.longest);
   end;
 {$endif}
@@ -2325,19 +2377,26 @@ asm
 end;
 {$endif}
 
+{$ifdef SYLZ_C}
+procedure sylzc_bt_insert(st: PBtState); cdecl; external name 'sylzc_bt_insert';
+{$endif}
+
 function BtInsert(var b: TBtState; pos: SizeInt; cands: PInt32): Integer; inline;
 begin
+  b.pos := pos;
+  b.cands := cands;
 {$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm then
-  begin
-    b.pos := pos;
-    b.cands := cands;
-    BtInsertX64(@b);
-    Result := Integer(b.count);
-  end
+  if SylzUseAsm and not SylzPreferC then
+    BtInsertX64(@b)
   else
 {$endif}
-    Result := BtInsertPas(b, pos, cands);
+{$ifdef SYLZ_C}
+  if SylzUseAsm then
+    sylzc_bt_insert(@b)
+  else
+{$endif}
+    b.count := BtInsertPas(b, pos, cands);
+  Result := Integer(b.count);
 end;
 
 function BtFindAll(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;

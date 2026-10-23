@@ -461,3 +461,264 @@ done:
     st->anchor = anchor;
     st->e = e;
 }
+
+/* ── levels 2-3 ───────────────────────────────────────────────────────── */
+
+static uint32_t hash4(uint32_t v, int hashLog)
+{
+    return (uint32_t)(v * 2654435761u) >> (32 - hashLog);
+}
+
+/* MidHashLong / MidHashShort in sylz.pas */
+static uint32_t mid_hash_long(const uint8_t *p, int hashLog)
+{
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    return (uint32_t)(((read64(p) << 16) * 889523592379ull) >> (64 - hashLog));
+#else
+    return hash4(read32(p) + (uint32_t)(read32(p + 2) * 2246822519u), hashLog);
+#endif
+}
+
+static uint32_t mid_hash_short(const uint8_t *p, int hashLog)
+{
+    return hash4(read32(p), hashLog);
+}
+
+/* MidCand in sylz.pas: looks up and replaces table[h] with pos; the
+   candidate's distance if its first 4 bytes match, else 0 */
+static intptr_t mid_cand(uint16_t *table, uint32_t h, const uint8_t *src, intptr_t pos)
+{
+    intptr_t d = fast_dist(pos, table[h]);
+    table[h] = (uint16_t)pos;
+    if (d > pos || read32(src + pos - d) != read32(src + pos))
+        return 0;
+    return d;
+}
+
+/* In/out of sylzc_compress_mid (TMidCState in sylz.pas). */
+typedef struct {
+    const uint8_t *src;
+    intptr_t n;
+    uint16_t *tl, *ts;            /* long and short tables */
+    intptr_t hashLog;
+    intptr_t lazy;                /* level 3 */
+    intptr_t skip, lazyEnough, nextBelow;   /* MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW */
+    intptr_t anchor;              /* out */
+    sylzc_emit e;
+} sylzc_mid;
+
+/* CompressMidCore in sylz.pas, same output byte for byte. */
+void sylzc_compress_mid(sylzc_mid *st)
+{
+    const uint8_t *src = st->src;
+    intptr_t n = st->n;
+    uint16_t *tl = st->tl, *ts = st->ts;
+    int hashLog = (int)st->hashLog;
+    sylzc_emit e = st->e;
+    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit;
+
+    if (n < 12 + 1)
+        goto done;
+    mflimit = n - 12;
+    pos = 0;
+    while (pos < mflimit) {
+        dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
+        if (dist > 0)
+            ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
+        else {
+            dist = mid_cand(ts, mid_hash_short(src + pos, hashLog), src, pos);
+            if (dist == 0) {
+                pos += 1 + ((pos - anchor) >> st->skip);
+                continue;
+            }
+        }
+        len = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+        if (st->lazy) {
+            /* both tables one byte later, while that finds a longer match */
+            while (len < st->lazyEnough && pos + 1 < mflimit) {
+                k = pos + 1;
+                dist2 = mid_cand(tl, mid_hash_long(src + k, hashLog), src, k);
+                dshort = mid_cand(ts, mid_hash_short(src + k, hashLog), src, k);
+                if (dist2 == 0)
+                    dist2 = dshort;
+                if (dist2 == 0)
+                    break;
+                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                if (len2 <= len)
+                    break;
+                pos = k;
+                len = len2;
+                dist = dist2;
+            }
+        } else if (len < st->nextBelow && pos + 1 < mflimit) {
+            /* a short match: a long one one byte later? */
+            k = pos + 1;
+            dist2 = mid_cand(tl, mid_hash_long(src + k, hashLog), src, k);
+            if (dist2 > 0) {
+                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                if (len2 > len) {
+                    pos = k;
+                    len = len2;
+                    dist = dist2;
+                }
+            }
+        }
+        while (pos > anchor && pos > dist && src[pos - 1] == src[pos - 1 - dist]) {
+            pos--;
+            len++;
+        }
+        emit_sequence(&e, src + anchor, pos - anchor, dist, len);
+        mend = pos + len;
+        if (mend < mflimit) {
+            tl[mid_hash_long(src + pos + 1, hashLog)] = (uint16_t)(pos + 1);
+            ts[mid_hash_short(src + pos + 2, hashLog)] = (uint16_t)(pos + 2);
+            tl[mid_hash_long(src + mend - 2, hashLog)] = (uint16_t)(mend - 2);
+            ts[mid_hash_short(src + mend - 1, hashLog)] = (uint16_t)(mend - 1);
+        }
+        pos = mend;
+        anchor = pos;
+    }
+done:
+    st->anchor = anchor;
+    st->e = e;
+}
+
+/* ── levels 4-8: the hash-chain search ────────────────────────────────── */
+
+#define HC_HASHLOG 16
+#define HC_MAXDIST 65535
+
+/* THcState in sylz.pas */
+typedef struct {
+    const uint8_t *src, *iend;
+    uint16_t *head, *chain;
+    intptr_t nextToInsert;
+    intptr_t pos, lowLimit, longest;   /* in; longest in/out */
+    intptr_t mpos, spos;               /* out */
+    intptr_t attempts;
+} sylzc_hc;
+
+/* HcSearchPas in sylz.pas: insert the positions before pos, then the
+   longest match through pos among `attempts` chain candidates, which may
+   start before pos down to lowLimit. Same results. */
+void sylzc_hc_search(sylzc_hc *s)
+{
+    const uint8_t *src = s->src, *iend = s->iend;
+    uint16_t *head = s->head, *chain = s->chain;
+    intptr_t pos = s->pos, lowLimit = s->lowLimit, longest = s->longest;
+    intptr_t i, d, cand, tries;
+
+    for (i = s->nextToInsert; i < pos; i++) {
+        uint32_t h = hash4(read32(src + i), HC_HASHLOG);
+        d = fast_dist(i, head[h]);
+        if (d > i || d > HC_MAXDIST)
+            d = 0;                     /* 0 terminates the chain */
+        chain[i & 0xFFFF] = (uint16_t)d;
+        head[h] = (uint16_t)i;
+    }
+    s->nextToInsert = pos;
+
+    const uint8_t *ip = src + pos;
+    uint32_t first = read32(ip);
+    d = fast_dist(pos, head[hash4(first, HC_HASHLOG)]);
+    cand = (d > pos || d > HC_MAXDIST) ? -1 : pos - d;
+    tries = s->attempts;
+    while (tries > 0 && cand >= 0 && pos - cand <= HC_MAXDIST) {
+        if (read32(src + cand) == first) {
+            intptr_t fwd = MINMATCH + count_match(ip + MINMATCH, src + cand + MINMATCH, iend);
+            intptr_t back = 0;
+            while (pos - back > lowLimit && cand - back > 0
+                   && src[pos - back - 1] == src[cand - back - 1])
+                back++;
+            if (fwd + back > longest) {
+                longest = fwd + back;
+                s->mpos = cand - back;
+                s->spos = pos - back;
+            }
+        }
+        tries--;
+        d = chain[cand & 0xFFFF];
+        if (d == 0)
+            break;
+        cand -= d;
+    }
+    s->longest = longest;
+}
+
+/* ── levels 9-10: the binary tree ─────────────────────────────────────── */
+
+#define BT_HASHLOG 16
+#define BT_WINDOW  65536
+#define OPT_MAXCAND 64
+
+/* TBtState in sylz.pas */
+typedef struct {
+    const uint8_t *src, *iend;
+    uint32_t *head, *son;
+    intptr_t nextToInsert;
+    intptr_t cut, maxLen;
+    intptr_t pos;
+    int32_t *cands;
+    intptr_t count;               /* out */
+} sylzc_bt;
+
+/* BtInsertPas in sylz.pas: insert pos into the tree; with cands, record
+   every match longer than the previous one as (length, distance). */
+void sylzc_bt_insert(sylzc_bt *b)
+{
+    const uint8_t *src = b->src;
+    intptr_t pos = b->pos;
+    const uint8_t *cur = src + pos;
+    int32_t *cands = b->cands;
+    intptr_t lenLimit = b->iend - cur, count = 0;
+    if (lenLimit > b->maxLen)
+        lenLimit = b->maxLen;
+    uint32_t h = hash4(read32(cur), BT_HASHLOG);
+    intptr_t curMatch = (intptr_t)b->head[h] - 1;
+    b->head[h] = (uint32_t)(pos + 1);
+    uint32_t *ptr1 = b->son + ((pos & (BT_WINDOW - 1)) << 1);
+    uint32_t *ptr0 = ptr1 + 1;
+    intptr_t len0 = 0, len1 = 0, best = MINMATCH - 1, cut = b->cut;
+    for (;;) {
+        intptr_t delta = pos - curMatch;
+        if (curMatch < 0 || cut == 0 || delta >= BT_WINDOW) {
+            *ptr0 = 0;
+            *ptr1 = 0;
+            break;
+        }
+        cut--;
+        uint32_t *pair = b->son + ((curMatch & (BT_WINDOW - 1)) << 1);
+        const uint8_t *pb = cur - delta;
+        intptr_t len = len0 < len1 ? len0 : len1;
+        if (pb[len] == cur[len]) {
+            len++;
+            while (len < lenLimit && pb[len] == cur[len])
+                len++;
+            if (len > best) {
+                best = len;
+                if (cands && count < OPT_MAXCAND) {
+                    cands[2 * count] = (int32_t)len;
+                    cands[2 * count + 1] = (int32_t)delta;
+                    count++;
+                }
+                if (len >= lenLimit) {
+                    *ptr1 = pair[0];
+                    *ptr0 = pair[1];
+                    break;
+                }
+            }
+        }
+        if (pb[len] < cur[len]) {
+            *ptr1 = (uint32_t)(curMatch + 1);
+            ptr1 = pair + 1;
+            curMatch = (intptr_t)*ptr1 - 1;
+            len1 = len;
+        } else {
+            *ptr0 = (uint32_t)(curMatch + 1);
+            ptr0 = pair;
+            curMatch = (intptr_t)*ptr0 - 1;
+            len0 = len;
+        }
+    }
+    b->count = count;
+}

@@ -88,6 +88,19 @@ the assembler and Pascal. x86_64, compress MB/s, silesia level 0 / 1:
 assembler 486 / 452, C 420 / 403, Pascal 304 / 302; mixed: 688 / 648, 605
 / 564, 440 / 408.
 
+Levels 2-3 (sylzc_compress_mid), the hash-chain search of 4-8
+(sylzc_hc_search) and the binary tree of 9-10 (sylzc_bt_insert) in C:
+same bytes as assembler and Pascal on silesia and zpaq-std's sample.
+x86_64 compress MB/s (asm / C / Pascal), silesia: level 2 274 / 253 /
+179, 3 204 / 184 / 141, 4 85 / 73 / 61, 6 48 / 44 / 37, 8 24 / 22 / 20, 9
+8.2 / 6.5 / 6.0, 10 6.7 / 5.6 / 5.0.
+
+Windows 7 32-bit (VM), mozilla, compress Pascal -> C: level 0 186 -> 258
+MB/s, 1 171 -> 291, 2 147 -> 157, 3 107 -> 131, 4 43 -> 58, 6 26 -> 36, 8
+11.0 -> 18.5, 9 5.9 -> 6.7; decode 830-1130 -> 1130-1680 MB/s. Same
+output. Every level of 32-bit Windows and arm64 now runs C where x86_64
+runs assembler.
+
 Build: build-c.sh compiles sylzc.c with the target's compiler (gcc,
 x86_64/i686-w64-mingw32-gcc, aarch64-linux-gnu-gcc; -fPIC with -Cg),
 freestanding (no libc, no builtins, no loop-to-memset, no stack
