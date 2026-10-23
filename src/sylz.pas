@@ -153,10 +153,18 @@ function SylzCompressCtx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
 const
   { SylzCompressEx flags }
   SYLZ_ENTROPY = 1;   { format v3: Huffman-code the literals where it pays }
+  { With SYLZ_ENTROPY the levels are 0..SYLZ_EC_MAXLEVEL, level N parsing
+    as format v2's level N + SYLZ_EC_SHIFT: v2's levels 0 and 1 leave so
+    many literals that, Huffman-coded, they decode slower than level 2's
+    parse and compress worse (silesia.tar: 40.11% / 1655 MB/s, 39.21% /
+    1795, against 38.80% / 2209). }
+  SYLZ_EC_SHIFT = 2;
+  SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL - SYLZ_EC_SHIFT;
 
 { SylzCompressCtx with flags. Without SYLZ_ENTROPY the output is format v2
   (what SylzCompress writes); with it, format v3 if that is smaller, else
-  v2. SylzDecompress reads both. }
+  v2, and levels go 0..SYLZ_EC_MAXLEVEL (see SYLZ_EC_SHIFT). SylzDecompress
+  reads both. }
 function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer; flags: Integer): SizeInt;
 
@@ -2843,6 +2851,12 @@ begin
     Exit(-1);
   if level < SYLZ_MINLEVEL then
     level := SYLZ_MINLEVEL;
+  if flags and SYLZ_ENTROPY <> 0 then
+  begin
+    if level > SYLZ_EC_MAXLEVEL then
+      level := SYLZ_EC_MAXLEVEL;
+    Inc(level, SYLZ_EC_SHIFT);
+  end;
   if level > SYLZ_MAXLEVEL then
     level := SYLZ_MAXLEVEL;
   if ctx.scratchSize < n + SCRATCH_SLACK then

@@ -75,7 +75,9 @@ begin
   WriteLn('  -LEVEL    0 (fastest) .. ', SYLZ_MAXLEVEL, ' (best ratio), default ', SYLZ_DEFLEVEL,
     ': 0-1 single hash, 2-3 two hashes, 4-8 hash chains, 9-10 optimal parsing');
   WriteLn('  -ec       extra compression: entropy-coded literals (sylz format v3,');
-  WriteLn('            experimental), smaller, slower to decode');
+  WriteLn('            experimental), smaller, slower to decode; levels 0 .. ', SYLZ_EC_MAXLEVEL,
+    ',');
+  WriteLn('            level N parsing as -', SYLZ_EC_SHIFT, ' + N does');
   WriteLn('  -b MIB    block size in MiB, default ', DEFAULT_BLOCK shr 20);
 end;
 
@@ -328,6 +330,8 @@ begin
   end;
   if inPath = '' then
     Die('missing INPUT (syc -h for help)');
+  if (flags and SYLZ_ENTROPY <> 0) and (level > SYLZ_EC_MAXLEVEL) then
+    Die(Format('with -ec the levels are -%d..-%d', [SYLZ_MINLEVEL, SYLZ_EC_MAXLEVEL]));
 
   try
     if cmd = 'c' then
