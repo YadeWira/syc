@@ -1994,7 +1994,7 @@ const
 
 type
   TOptNode = record
-    cost: Single;
+    cost: Int32;    { in quarter bytes, relative to the window's start }
     ll: Int32;      { pending literals at this node }
     ml: Int32;      { 0: reached by a literal, else by a match of ml bytes }
     dist: Int32;
@@ -2018,18 +2018,22 @@ const
   BT_WINDOW = 65536;           { cyclic: son pairs of the last 64 KiB }
 
 type
+  { Fixed field order: BtInsertX64 reads it by offset. }
   TBtState = record
-    src, iend: PByte;
-    head: PUInt32;             { root per hash: position + 1, 0 = none }
-    son: PUInt32;              { two links per cyclic position }
-    nextToInsert: SizeInt;
-    cut, maxLen: SizeInt;
+    src, iend: PByte;          {  0,  8 }
+    head: PUInt32;             { 16: root per hash: position + 1, 0 = none }
+    son: PUInt32;              { 24: two links per cyclic position }
+    nextToInsert: SizeInt;     { 32 }
+    cut, maxLen: SizeInt;      { 40, 48 }
+    pos: SizeInt;              { 56: BtInsertX64's arguments }
+    cands: PInt32;             { 64 }
+    count: SizeInt;            { 72: out }
   end;
   PBtState = ^TBtState;
 
 { Inserts pos; with cands <> nil, records every match longer than the
   previous one, shortest first, as (length, distance) pairs. }
-function BtInsert(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
+function BtInsertPas(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
 var
   cur, pb: PByte;
   h: UInt32;
@@ -2104,6 +2108,181 @@ begin
   end;
 end;
 
+{$ifdef SYLZ_ASM_X64}
+{ BtInsertPas in x86_64 assembler, same results (tests check it).
+  Registers: rdi cur, r8 son, r9 length limit, r10 ptr0, r11 ptr1, r12
+  len0, r13 len1, r14 longest so far, r15 cut, rbx candidate, rbp count
+  (a plain value: FPC reads [rbp + n] as a frame access, so never an
+  address), rsi pair, rdx candidate bytes, rcx length; rax scratch.
+  Stack: [rsp] state, [rsp+8] pos, [rsp+16] cands. }
+procedure BtInsertX64(st: PBtState); assembler; nostackframe;
+asm
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  push qword ptr [rax + 64]       { [rsp+16] cands }
+  push qword ptr [rax + 56]       { [rsp+8] pos }
+  push rax                        { [rsp] state }
+  mov rdi, [rax]
+  add rdi, [rax + 56]             { cur = src + pos }
+  mov r9, [rax + 8]
+  sub r9, rdi                     { iend - cur }
+  cmp r9, [rax + 48]
+  jbe @limOk
+  mov r9, [rax + 48]
+@limOk:
+  mov r8, [rax + 24]              { son }
+  mov r15, [rax + 40]             { cut }
+  mov ecx, [rdi]
+  imul ecx, ecx, -1640531535
+  shr ecx, 32 - BT_HASHLOG
+  mov rdx, [rax + 16]             { head }
+  mov ebx, [rdx + rcx * 4]
+  sub rbx, 1                      { candidate, -1 = none }
+  mov rsi, [rsp + 8]
+  lea eax, [rsi + 1]
+  mov [rdx + rcx * 4], eax        { head = pos + 1 }
+  and esi, BT_WINDOW - 1
+  lea r11, [r8 + rsi * 8]         { ptr1 = son[2 * cyc] }
+  lea r10, [r11 + 4]              { ptr0 = son[2 * cyc + 1] }
+  xor r12d, r12d
+  xor r13d, r13d
+  mov r14d, SYLZ_MINMATCH - 1
+  xor ebp, ebp
+
+@loop:
+  test rbx, rbx
+  js @stop
+  test r15, r15
+  jz @stop
+  mov rax, [rsp + 8]
+  sub rax, rbx                    { delta }
+  cmp rax, BT_WINDOW
+  jae @stop
+  sub r15, 1
+  mov esi, ebx
+  and esi, BT_WINDOW - 1
+  lea rsi, [r8 + rsi * 8]         { pair }
+  mov rdx, rdi
+  sub rdx, rax                    { pb = cur - delta }
+  mov rcx, r12
+  cmp r13, rcx
+  cmovb rcx, r13                  { len = min(len0, len1) }
+  movzx eax, byte ptr [rdx + rcx]
+  cmp al, [rdi + rcx]
+  jne @cmpOrder
+  add rcx, 1
+@ext8:
+  lea rax, [rcx + 8]
+  cmp rax, r9
+  ja @ext1
+  mov rax, [rdx + rcx]
+  xor rax, [rdi + rcx]
+  jnz @extDiff
+  add rcx, 8
+  jmp @ext8
+@extDiff:
+  bsf rax, rax
+  shr eax, 3
+  add rcx, rax
+  jmp @extDone
+@ext1:
+  cmp rcx, r9
+  jae @extDone
+  movzx eax, byte ptr [rdx + rcx]
+  cmp al, [rdi + rcx]
+  jne @extDone
+  add rcx, 1
+  jmp @ext1
+@extDone:
+  cmp rcx, r14
+  jbe @cmpOrder
+  mov r14, rcx                    { a longer match }
+  mov rax, [rsp + 16]
+  test rax, rax
+  jz @noRecord
+  cmp rbp, OPT_MAXCAND
+  jae @noRecord
+  mov [rax + rbp * 8], ecx        { length }
+  push rcx
+  mov rcx, [rsp + 16]             { pos (one push deeper) }
+  sub rcx, rbx
+  mov [rax + rbp * 8 + 4], ecx    { distance }
+  pop rcx
+  add rbp, 1
+@noRecord:
+  cmp rcx, r9
+  jb @cmpOrder
+  { as long as allowed: the new node takes over the old one's subtrees }
+  mov eax, [rsi]
+  mov [r11], eax
+  mov eax, [rsi + 4]
+  mov [r10], eax
+  jmp @done
+@cmpOrder:
+  movzx eax, byte ptr [rdx + rcx]
+  cmp al, [rdi + rcx]
+  jae @right
+  lea eax, [rbx + 1]
+  mov [r11], eax                  { ptr1^ = candidate + 1 }
+  lea r11, [rsi + 4]
+  mov ebx, [r11]
+  sub rbx, 1
+  mov r13, rcx
+  jmp @loop
+@right:
+  lea eax, [rbx + 1]
+  mov [r10], eax                  { ptr0^ = candidate + 1 }
+  mov r10, rsi
+  mov ebx, [r10]
+  sub rbx, 1
+  mov r12, rcx
+  jmp @loop
+@stop:
+  mov dword ptr [r10], 0
+  mov dword ptr [r11], 0
+@done:
+  pop rax
+  mov [rax + 72], rbp
+  add rsp, 16
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+end;
+{$endif}
+
+function BtInsert(var b: TBtState; pos: SizeInt; cands: PInt32): Integer; inline;
+begin
+{$ifdef SYLZ_ASM_X64}
+  if SylzUseAsm then
+  begin
+    b.pos := pos;
+    b.cands := cands;
+    BtInsertX64(@b);
+    Result := Integer(b.count);
+  end
+  else
+{$endif}
+    Result := BtInsertPas(b, pos, cands);
+end;
+
 function BtFindAll(var b: TBtState; pos: SizeInt; cands: PInt32): Integer;
 begin
   while b.nextToInsert < pos do
@@ -2127,16 +2306,32 @@ end;
   and comparing nodes with different runs is fair. Charging the literal
   extension to the match that ends a run instead made a match after a long
   run look prohibitive, and the parse then never ended a run. }
-function LitRunCost(ll: SizeInt; const p: TSylzOptParams): Single; inline;
+{ Prices are integers in quarter bytes (OPT_SCALE): the penalties are
+  multiples of a quarter, so the sums are exact, as they were in Single,
+  and the DP picks the same path, without the float code FPC compiled
+  poorly. }
+const
+  OPT_SCALE = 4;
+  OPT_MTAB_COLS = 64;   { match lengths priced from a table: MINMATCH .. +63 }
+
+type
+  TOptPrices = record
+    seq, esc, short: Int32;    { penalties, in quarter bytes }
+  end;
+
+{ The price of growing a literal run of ll to ll + 1. }
+function LitStep(ll: SizeInt; const q: TOptPrices): Int32; inline;
 begin
-  if ll <= EXACT_LL then
-    Result := ll
+  if ll < EXACT_LL then
+    Result := OPT_SCALE
+  else if ll = EXACT_LL then   { the run becomes an extension and an escape }
+    Result := OPT_SCALE * (1 + ExtBytes(ll + 1)) + q.esc
   else
-    Result := ll + ExtBytes(ll) + p.pEsc;
+    Result := OPT_SCALE * (1 + ExtBytes(ll + 1) - ExtBytes(ll));
 end;
 
 { The match's share of a sequence: ll is the pending run, already priced. }
-function MatchCost(ll, ml, dist: SizeInt; const p: TSylzOptParams): Single; inline;
+function MatchCost(ll, ml, dist: SizeInt; const q: TOptPrices): Int32; inline;
 var
   m: SizeInt;
 begin
@@ -2144,16 +2339,16 @@ begin
   if ll <= EXACT_LL then
   begin
     if (m <= EXACT_M) and (ExactCode[ll, m] <> 255) then
-      Result := 3 + p.pSeq
+      Result := OPT_SCALE * 3 + q.seq
     else
-      Result := 3 + ExtBytes(m) + p.pSeq + p.pEsc;   { ESC_ML }
+      Result := OPT_SCALE * (3 + ExtBytes(m)) + q.seq + q.esc;   { ESC_ML }
   end
   else if m <= EXACT_M then
-    Result := 3 + p.pSeq                             { ESC_LL, paid by the run }
+    Result := OPT_SCALE * 3 + q.seq                             { ESC_LL, paid by the run }
   else
-    Result := 3 + ExtBytes(m) + p.pSeq;              { ESC_BOTH }
+    Result := OPT_SCALE * (3 + ExtBytes(m)) + q.seq;            { ESC_BOTH }
   if dist < 16 then
-    Result := Result + p.pShort;
+    Inc(Result, q.short);
 end;
 
 function CompressOptCore(src: PByte; n: SizeInt; var e: TEmit; var b: TBtState;
@@ -2164,9 +2359,21 @@ var
   iend: PByte;
   limit, anchor, start, w, i, j, k, c, ml, len, dist, prevLen, npath, t,
     pos, forcedLen, forcedDist: SizeInt;
-  cost, tc: Single;
+  cost, tc, base: Int32;
   forced: Boolean;
+  q: TOptPrices;
+  ll: SizeInt;
+  { match prices without the short-offset penalty, by pending run (row
+    EXACT_LL + 1: any longer run) and length - MINMATCH }
+  mtab: array[0..EXACT_LL + 1, 0..OPT_MTAB_COLS - 1] of Int32;
+  row: PInt32;
 begin
+  q.seq := Round(p.pSeq * OPT_SCALE);
+  q.esc := Round(p.pEsc * OPT_SCALE);
+  q.short := Round(p.pShort * OPT_SCALE);
+  for i := 0 to EXACT_LL + 1 do
+    for j := 0 to OPT_MTAB_COLS - 1 do
+      mtab[i, j] := MatchCost(i, j + SYLZ_MINMATCH, 16, q);
   nodes := POptNode(work);
   cands := PInt32(work + OPT_NODES_BYTES);
   path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
@@ -2181,11 +2388,11 @@ begin
       w := OPT_WINDOW;
       if start + w > limit then
         w := limit - start;
-      nodes[0].cost := LitRunCost(start - anchor, p);
+      nodes[0].cost := 0;
       nodes[0].ll := Int32(start - anchor);
       nodes[0].ml := 0;
       for i := 1 to w do
-        nodes[i].cost := 1e30;
+        nodes[i].cost := High(Int32);
       forced := False;
       forcedLen := 0;
       forcedDist := 0;
@@ -2193,7 +2400,7 @@ begin
       while i < w do
       begin
         cost := nodes[i].cost;
-        tc := cost - LitRunCost(nodes[i].ll, p) + LitRunCost(nodes[i].ll + 1, p);
+        tc := cost + LitStep(nodes[i].ll, q);
         if tc < nodes[i + 1].cost then
         begin
           nodes[i + 1].cost := tc;
@@ -2212,10 +2419,18 @@ begin
             Break;
           end;
           prevLen := SYLZ_MINMATCH - 1;
+          ll := nodes[i].ll;
+          if ll > EXACT_LL then
+            row := @mtab[EXACT_LL + 1, 0]
+          else
+            row := @mtab[ll, 0];
           for c := 0 to k - 1 do
           begin
             len := cands[2 * c];
             dist := cands[2 * c + 1];
+            base := cost;
+            if dist < 16 then
+              Inc(base, q.short);
             ml := prevLen;
             while ml < len do
             begin
@@ -2227,7 +2442,10 @@ begin
               j := i + ml;
               if j > w then
                 Break;
-              tc := cost + MatchCost(nodes[i].ll, ml, dist, p);
+              if ml < SYLZ_MINMATCH + OPT_MTAB_COLS then
+                tc := base + row[ml - SYLZ_MINMATCH]
+              else
+                tc := cost + MatchCost(ll, ml, dist, q);
               if tc < nodes[j].cost then
               begin
                 nodes[j].cost := tc;

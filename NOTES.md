@@ -88,6 +88,16 @@ tree insert (63%, Pascal) and the DP (33%) at every position dominate.
 Skipping inside long matches (skipLen 32-64) cost 0.03-0.2 points for
 little speed.
 
+Then, same output (checked byte for byte on both corpora): the tree in
+x86-64 assembler (BtInsertX64), the DP's prices as integers in quarter
+bytes (the penalties are multiples of a quarter, so the sums are exact as
+they were in Single; each window starts at cost 0 and literals are priced
+by their step, so no overflow on 512 MiB blocks), and match prices from a
+table per pending run (the inner loop was MatchCost with an ExactCode
+lookup for each of up to 36 lengths per candidate). Cycles, silesia.tar
+(compress + one decode): level 9 118.5 G -> 90.9 G (1.30x), level 10
+146.5 G -> 106.7 G (1.37x). Integer prices alone: DP -4.5%.
+
 ## Levels 4-8: lz4hc's parse (2026-10-22)
 
 At the same attempts, lz4hc -3 (4 attempts) made 38.38% where sylz's
