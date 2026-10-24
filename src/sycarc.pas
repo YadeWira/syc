@@ -100,6 +100,14 @@ begin
   Result := False;
 end;
 
+{ path is root or under it ('' holds everything) }
+function Under(const root, path: string): Boolean;
+begin
+  Result := (root = '') or (path = root)
+    or ((Length(path) > Length(root)) and (path[Length(root) + 1] = '/')
+        and (CompareByte(path[1], root[1], Length(root)) = 0));
+end;
+
 function SpoolToTemp(const prefix: array of Byte; s: TStream): string;
 var
   f: TFileStream;
@@ -189,21 +197,28 @@ end;
 
 { ── entries ────────────────────────────────────────────────────────────── }
 
+{ by path, then version (l --all) }
+function CompareEntries(const a, b: TEntry): Integer;
+begin
+  Result := ComparePaths(a.path, b.path);
+  if Result = 0 then
+    Result := Ord(a.ver > b.ver) - Ord(a.ver < b.ver);
+end;
+
 procedure SortEntries(var a: TEntries; lo, hi: SizeInt);
 var
   i, j: SizeInt;
-  pivot: string;
-  tmp: TEntry;
+  pivot, tmp: TEntry;
 begin
   while lo < hi do
   begin
-    pivot := a[(lo + hi) div 2].path;
+    pivot := a[(lo + hi) div 2];
     i := lo;
     j := hi;
     repeat
-      while ComparePaths(a[i].path, pivot) < 0 do
+      while CompareEntries(a[i], pivot) < 0 do
         Inc(i);
-      while ComparePaths(a[j].path, pivot) > 0 do
+      while CompareEntries(a[j], pivot) > 0 do
         Dec(j);
       if i <= j then
       begin
@@ -275,6 +290,7 @@ type
     status: Integer;
     prm: TCdcParams;
     arcFull, tmpFull: string;   { never added to themselves }
+    unreadPaths: array of string;   { could not be read: not deleted }
     entries: TEntries;
     count: SizeInt;
     { output }
@@ -307,6 +323,7 @@ type
     constructor Create(const aOpts: TOptions);
     destructor Destroy; override;
     procedure AddEntry(const local, stored: string; const m: TMeta);
+    function Unread(const path: string): Boolean;
     procedure Walk(const local, stored: string);
     procedure WriteSlot(s: SizeInt);
     procedure Submit;
@@ -346,6 +363,16 @@ begin
   Inc(count);
 end;
 
+function TAdder.Unread(const path: string): Boolean;
+var
+  i: SizeInt;
+begin
+  for i := 0 to High(unreadPaths) do
+    if Under(unreadPaths[i], path) then
+      Exit(True);
+  Result := False;
+end;
+
 procedure TAdder.Walk(const local, stored: string);
 var
   m: TMeta;
@@ -359,6 +386,8 @@ begin
   begin
     Warn(opts, local + ': cannot read, skipped');
     status := Max(status, EXIT_WARN);
+    SetLength(unreadPaths, Length(unreadPaths) + 1);
+    unreadPaths[High(unreadPaths)] := stored;
     Exit;
   end;
   if m.kind <> ET_DIR then
@@ -380,6 +409,8 @@ begin
           begin
             Warn(opts, local + ': cannot list, skipped');
             status := Max(status, EXIT_WARN);
+            SetLength(unreadPaths, Length(unreadPaths) + 1);
+            unreadPaths[High(unreadPaths)] := stored;
             Exit;
           end;
           for i := 0 to names.Count - 1 do
@@ -525,6 +556,8 @@ begin
     begin
       Warn(opts, entries[ei].local + ': cannot open, skipped');
       status := Max(status, EXIT_WARN);
+      SetLength(unreadPaths, Length(unreadPaths) + 1);
+      unreadPaths[High(unreadPaths)] := entries[ei].path;
       Exit(False);
     end;
   end;
@@ -613,170 +646,18 @@ begin
     fout.WriteBuffer(b.data[0], b.len);
     Inc(pos, 4 + BLOCKHDR_SIZE + b.len);
   end;
+  { the version's bytes are on the disk before the commit that makes it
+    count, and the commit before syc a reports success }
+  if fout is TFileStream then
+    FileFlush(TFileStream(fout).Handle);
   Move(COMMIT_MAGIC[1], commit[0], 4);
   PInt64(@commit[4])^ := NtoLE(vstart);
   PInt64(@commit[12])^ := NtoLE(istart);
   PUInt32(@commit[20])^ := NtoLE(crc32(0, @commit[0], 20));
   fout.WriteBuffer(commit, COMMIT_SIZE);
   Inc(pos, COMMIT_SIZE);
-end;
-
-function AddCommand(const opts: TOptions): Integer;
-var
-  a: TAdder;
-  arcPath, tmpPath, local, stored, keep: string;
-  toStdout: Boolean;
-  i, j, k: SizeInt;
-  hdr: array[0..HEADER_SIZE - 1] of Byte;
-  vhead: array[0..VHEAD_SIZE - 1] of Byte;
-begin
-  arcPath := opts.operands[0];
-  toStdout := arcPath = '-';
-  if not toStdout and FileExists(arcPath) then
-    Fail(EXIT_USAGE, arcPath + ': exists; adding a version to an archive comes in a later syc');
-  if toStdout and IsTerminal(1) then
-    Fail(EXIT_USAGE, 'an archive is not written to a terminal');
-  tmpPath := '';
-  a := TAdder.Create(opts);
-  try
-    a.status := EXIT_OK;
-    if not toStdout then
-    begin
-      a.arcFull := ExpandFileName(arcPath);
-      a.tmpFull := a.arcFull + TMP_SUFFIX;
-    end;
-
-    { what goes in, sorted by path, each path once }
-    for i := 1 to High(opts.operands) do
-    begin
-      try
-        stored := StoredPath(opts.operands[i]);
-      except
-        on E: EConvertError do
-          Fail(EXIT_USAGE, E.Message);
-      end;
-      if opts.cdDir <> '' then
-        local := IncludeTrailingPathDelimiter(opts.cdDir) + opts.operands[i]
-      else
-        local := opts.operands[i];
-      a.Walk(local, stored);
-    end;
-    SetLength(a.entries, a.count);
-    if a.count > 1 then
-      SortEntries(a.entries, 0, a.count - 1);
-    k := 0;
-    for i := 0 to a.count - 1 do
-      if (k = 0) or (a.entries[i].path <> a.entries[k - 1].path) then
-      begin
-        a.entries[k] := a.entries[i];
-        Inc(k);
-      end;
-    SetLength(a.entries, k);
-    a.count := k;
-    if k = 0 then
-    begin
-      Warn(opts, 'nothing to add: no archive written');
-      Result := EXIT_WARN;
-      a.Free;
-      Exit;
-    end;
-
-    { header, version 1, then the files' data }
-    if toStdout then
-      a.fout := StdStream(1)
-    else
-    begin
-      tmpPath := arcPath + TMP_SUFFIX;
-      a.fout := TFileStream.Create(tmpPath, fmCreate);
-    end;
-    try
-      Move(ARC_MAGIC[1], hdr[0], 4);
-      hdr[4] := ARC_FMT;
-      hdr[5] := CDC_MIN_LOG;
-      hdr[6] := CDC_AVG_LOG;
-      hdr[7] := CDC_MAX_LOG;
-      a.fout.WriteBuffer(hdr, HEADER_SIZE);
-      Move(VHEAD_MAGIC[1], vhead[0], 4);
-      PUInt32(@vhead[4])^ := NtoLE(UInt32(1));
-      PInt64(@vhead[8])^ := NtoLE(UnixNow);
-      a.fout.WriteBuffer(vhead, VHEAD_SIZE);
-      a.pos := HEADER_SIZE + VHEAD_SIZE;
-
-      a.blockSize := SizeInt(opts.blockMiB) shl 20;
-      a.pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);
-      for i := 0 to a.pipe.Slots - 1 do
-        a.pipe.jobs[i].Reserve(a.blockSize, SylzBound(a.blockSize));
-      a.slot := 0;
-      a.pool := TTaskPool.Create(opts.threads);
-      SetLength(a.batch, 8 shl 20);
-      SetLength(a.refCount, a.count);
-      for i := 0 to a.count - 1 do
-      begin
-        case a.entries[i].kind of
-          ET_FILE:
-            if a.AddFile(i) then
-              Inc(a.nFiles)
-            else
-              a.entries[i].kind := ET_OTHER;   { left out below }
-          ET_DIR: Inc(a.nDirs);
-          ET_SYMLINK: Inc(a.nLinks);
-        end;
-        if a.entries[i].kind <> ET_OTHER then
-          Note(opts, a.entries[i].path);
-      end;
-      a.FlushBatch;
-      j := 0;
-      for i := 0 to a.count - 1 do
-        if a.entries[i].kind <> ET_OTHER then
-        begin
-          SetLength(a.entries[i].refs, a.refCount[i]);
-          a.entries[j] := a.entries[i];
-          Inc(j);
-        end;
-      SetLength(a.entries, j);
-      a.Submit;
-      while a.blocksWritten < a.blocksSubmitted do
-        a.WriteSlot(a.blocksWritten mod a.pipe.Slots);
-      WriteU32(a.fout, 0);
-      Inc(a.pos, 4);
-      SetLength(a.idx.blocks, a.nBlocks);
-      SetLength(a.idx.frags, a.nFrags);
-      a.idx.entries := a.entries;
-      a.WriteIndexAndCommit(HEADER_SIZE);
-    finally
-      a.fout.Free;
-      a.fout := nil;
-    end;
-    if tmpPath <> '' then
-    begin
-      if not ReplaceFile(tmpPath, arcPath) then
-      begin
-        keep := tmpPath;
-        tmpPath := '';
-        Fail(EXIT_FATAL, 'cannot create ' + arcPath + '; the archive is in ' + keep);
-      end;
-      tmpPath := '';
-    end;
-    if opts.verbosity <> vQuiet then
-      WriteLn(StdErr, Format('%s: %d files, %d directories, %d links; %d -> %d bytes (%.2f%%), '
-        + '%d bytes in repeated fragments', [arcPath, a.nFiles, a.nDirs, a.nLinks, a.totalIn,
-        a.pos, a.pos * 100.0 / Max(a.totalIn, 1), a.dupBytes]));
-    Result := a.status;
-  except
-    on E: Exception do
-    begin
-      if tmpPath <> '' then
-        SysUtils.DeleteFile(tmpPath);
-      a.Free;
-      a := nil;
-      if E is ESycError then
-        raise;
-      if E is EOutOfMemory then
-        Fail(EXIT_FATAL, arcPath + ': out of memory');
-      Fail(EXIT_FATAL, arcPath + ': ' + E.Message);
-    end;
-  end;
-  a.Free;
+  if fout is TFileStream then
+    FileFlush(TFileStream(fout).Handle);
 end;
 
 { ── reading ────────────────────────────────────────────────────────────── }
@@ -810,7 +691,8 @@ type
     fragOff: array of UInt32;     { offset in its block }
     fragBlock: array of UInt32;   { its block, in blocks[] }
     damaged: Boolean;             { bytes after the last good commit }
-    constructor Open(const path, aName: string);
+    allowEmpty: Boolean;          { an archive with no complete version is not an error }
+    constructor Open(const path, aName: string; aAllowEmpty: Boolean = False);
     destructor Destroy; override;
     procedure Corrupt(const msg: string);
     function ReadAt(at: Int64; p: Pointer; n: SizeInt): Boolean;
@@ -848,7 +730,7 @@ begin
     and (istart + 4 + BLOCKHDR_SIZE <= at);
 end;
 
-constructor TArchive.Open(const path, aName: string);
+constructor TArchive.Open(const path, aName: string; aAllowEmpty: Boolean);
 var
   hdr: array[0..HEADER_SIZE - 1] of Byte;
   at, vstart, istart: Int64;
@@ -858,6 +740,7 @@ var
 begin
   inherited Create;
   name := aName;
+  allowEmpty := aAllowEmpty;
   try
     fs := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
   except
@@ -964,7 +847,7 @@ begin
     at := versions[n - 1].commitPos + COMMIT_SIZE;
   end;
   damaged := True;
-  if n = 0 then
+  if (n = 0) and not allowEmpty then
     Corrupt('no complete version (an interrupted syc a?)');
 end;
 
@@ -1159,6 +1042,303 @@ begin
   end;
 end;
 
+{ ── syc a ──────────────────────────────────────────────────────────────── }
+
+{ the same as the archive has it: nothing to store again }
+function SameMeta(const a, b: TMeta): Boolean;
+begin
+  Result := (a.kind = b.kind) and (a.mtime = b.mtime) and (a.attrKind = b.attrKind)
+    and (a.attrs = b.attrs) and (a.uid = b.uid) and (a.gid = b.gid);
+  if Result and (a.kind = ET_FILE) then
+    Result := a.size = b.size;
+  if Result and (a.kind = ET_SYMLINK) then
+    Result := a.target = b.target;
+end;
+
+{ A new archive, or a new version at the end of one: only what changed
+  since the last version (new or modified entries, and deletions under the
+  PATHs given), its new fragments deduplicated against every version. The
+  old versions are never rewritten: an interrupted syc a leaves bytes
+  after the last commit, which readers ignore and the next syc a cuts. }
+function AddCommand(const opts: TOptions): Integer;
+var
+  a: TAdder;
+  arc: TArchive;
+  arcPath, tmpPath, local, keep: string;
+  toStdout, appending: Boolean;
+  roots: array of string;
+  prev, changed: TEntries;
+  i, j, k, nChanged, nDeleted, nSame: SizeInt;
+  c: Integer;
+  goodEnd, vstart: Int64;
+  vnum: UInt32;
+  hdr: array[0..HEADER_SIZE - 1] of Byte;
+  vhead: array[0..VHEAD_SIZE - 1] of Byte;
+  fs: TFileStream;
+begin
+  arcPath := opts.operands[0];
+  toStdout := arcPath = '-';
+  appending := not toStdout and FileExists(arcPath);
+  if toStdout and IsTerminal(1) then
+    Fail(EXIT_USAGE, 'an archive is not written to a terminal');
+  tmpPath := '';
+  arc := nil;
+  a := TAdder.Create(opts);
+  try
+  try
+    a.status := EXIT_OK;
+    if not toStdout then
+    begin
+      a.arcFull := ExpandFileName(arcPath);
+      a.tmpFull := a.arcFull + TMP_SUFFIX;
+    end;
+
+    { the archive so far: its last state, its fragments for dedup }
+    prev := nil;
+    goodEnd := 0;
+    vnum := 1;
+    if appending then
+    begin
+      arc := TArchive.Open(arcPath, arcPath, True);
+      a.prm := arc.prm;
+      prev := arc.State(Length(arc.versions));
+      for i := 0 to High(arc.versions) do
+        with arc.versions[i] do
+          for j := 0 to High(idx.frags) do
+            DedupAdd(a.dedup, idx.frags[j].hash, firstFrag + j);
+      a.nextFrag := Length(arc.fragSize) + 1;
+      vnum := Length(arc.versions) + 1;
+      if Length(arc.versions) > 0 then
+        goodEnd := arc.versions[High(arc.versions)].commitPos + COMMIT_SIZE
+      else
+        goodEnd := HEADER_SIZE;
+      if goodEnd < arc.size then
+      begin
+        WriteLn(StdErr, Format('syc: %s: %d bytes after the last complete version (an interrupted '
+          + 'syc a) are cut', [arcPath, arc.size - goodEnd]));
+      end;
+      FreeAndNil(arc);
+    end;
+
+    { what is there now, sorted by path, each path once }
+    SetLength(roots, Length(opts.operands) - 1);
+    for i := 1 to High(opts.operands) do
+    begin
+      try
+        roots[i - 1] := StoredPath(opts.operands[i]);
+      except
+        on E: EConvertError do
+          Fail(EXIT_USAGE, E.Message);
+      end;
+      if opts.cdDir <> '' then
+        local := IncludeTrailingPathDelimiter(opts.cdDir) + opts.operands[i]
+      else
+        local := opts.operands[i];
+      a.Walk(local, roots[i - 1]);
+    end;
+    SetLength(a.entries, a.count);
+    if a.count > 1 then
+      SortEntries(a.entries, 0, a.count - 1);
+    k := 0;
+    for i := 0 to a.count - 1 do
+      if (k = 0) or (a.entries[i].path <> a.entries[k - 1].path) then
+      begin
+        a.entries[k] := a.entries[i];
+        Inc(k);
+      end;
+    SetLength(a.entries, k);
+    a.count := k;
+
+    { against the last version: changed or new entries, and deletions of
+      what was under the PATHs and is gone (not of what could not be read
+      or is excluded: a.failed, Excluded) }
+    SetLength(changed, a.count + Length(prev));
+    nChanged := 0;
+    nDeleted := 0;
+    nSame := 0;
+    i := 0;
+    j := 0;
+    while (i < a.count) or (j < Length(prev)) do
+    begin
+      if i >= a.count then
+        c := 1
+      else if j >= Length(prev) then
+        c := -1
+      else
+        c := ComparePaths(a.entries[i].path, prev[j].path);
+      if c < 0 then
+      begin
+        changed[nChanged] := a.entries[i];
+        Inc(nChanged);
+        Inc(i);
+      end
+      else if c > 0 then
+      begin
+        if not opts.noDelete and not Excluded(opts.excludes, prev[j].path)
+           and not a.Unread(prev[j].path) then
+          for k := 0 to High(roots) do
+            if Under(roots[k], prev[j].path) then
+            begin
+              changed[nChanged] := Default(TEntry);
+              changed[nChanged].path := prev[j].path;
+              changed[nChanged].kind := ET_DELETED;
+              Inc(nChanged);
+              Inc(nDeleted);
+              Break;
+            end;
+        Inc(j);
+      end
+      else
+      begin
+        if SameMeta(a.entries[i].meta, prev[j].meta) then
+          Inc(nSame)
+        else
+        begin
+          changed[nChanged] := a.entries[i];
+          Inc(nChanged);
+        end;
+        Inc(i);
+        Inc(j);
+      end;
+    end;
+    SetLength(changed, nChanged);
+    a.entries := changed;
+    a.count := nChanged;
+    if a.count = 0 then
+    begin
+      if appending then
+      begin
+        if opts.verbosity <> vQuiet then
+          WriteLn(StdErr, Format('%s: no changes (%d entries unchanged), no version added',
+            [arcPath, nSame]));
+        Exit(a.status);
+      end;
+      Warn(opts, 'nothing to add: no archive written');
+      Exit(Max(a.status, EXIT_WARN));
+    end;
+
+    { where the version goes: a new file (renamed into place when whole),
+      stdout, or the end of the archive }
+    if toStdout then
+      a.fout := StdStream(1)
+    else if appending then
+    begin
+      fs := TFileStream.Create(arcPath, fmOpenReadWrite or fmShareDenyWrite);
+      a.fout := fs;
+      fs.Size := goodEnd;
+      fs.Position := goodEnd;
+    end
+    else
+    begin
+      tmpPath := arcPath + TMP_SUFFIX;
+      a.fout := TFileStream.Create(tmpPath, fmCreate);
+    end;
+    try
+      if not appending then
+      begin
+        Move(ARC_MAGIC[1], hdr[0], 4);
+        hdr[4] := ARC_FMT;
+        hdr[5] := CDC_MIN_LOG;
+        hdr[6] := CDC_AVG_LOG;
+        hdr[7] := CDC_MAX_LOG;
+        a.fout.WriteBuffer(hdr, HEADER_SIZE);
+        goodEnd := HEADER_SIZE;
+      end;
+      vstart := goodEnd;
+      Move(VHEAD_MAGIC[1], vhead[0], 4);
+      PUInt32(@vhead[4])^ := NtoLE(vnum);
+      PInt64(@vhead[8])^ := NtoLE(UnixNow);
+      a.fout.WriteBuffer(vhead, VHEAD_SIZE);
+      a.pos := vstart + VHEAD_SIZE;
+
+      a.blockSize := SizeInt(opts.blockMiB) shl 20;
+      a.pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);
+      for i := 0 to a.pipe.Slots - 1 do
+        a.pipe.jobs[i].Reserve(a.blockSize, SylzBound(a.blockSize));
+      a.slot := 0;
+      a.pool := TTaskPool.Create(opts.threads);
+      SetLength(a.batch, 8 shl 20);
+      SetLength(a.refCount, a.count);
+      for i := 0 to a.count - 1 do
+      begin
+        case a.entries[i].kind of
+          ET_FILE:
+            if a.AddFile(i) then
+              Inc(a.nFiles)
+            else
+              a.entries[i].kind := ET_OTHER;   { left out below }
+          ET_DIR: Inc(a.nDirs);
+          ET_SYMLINK: Inc(a.nLinks);
+        end;
+        if a.entries[i].kind = ET_DELETED then
+          Note(opts, a.entries[i].path + ' (deleted)')
+        else if a.entries[i].kind <> ET_OTHER then
+          Note(opts, a.entries[i].path);
+      end;
+      a.FlushBatch;
+      j := 0;
+      for i := 0 to a.count - 1 do
+        if a.entries[i].kind <> ET_OTHER then
+        begin
+          SetLength(a.entries[i].refs, a.refCount[i]);
+          a.entries[j] := a.entries[i];
+          Inc(j);
+        end;
+      SetLength(a.entries, j);
+      a.Submit;
+      while a.blocksWritten < a.blocksSubmitted do
+        a.WriteSlot(a.blocksWritten mod a.pipe.Slots);
+      WriteU32(a.fout, 0);
+      Inc(a.pos, 4);
+      SetLength(a.idx.blocks, a.nBlocks);
+      SetLength(a.idx.frags, a.nFrags);
+      a.idx.entries := a.entries;
+      a.WriteIndexAndCommit(vstart);
+    except
+      { an append that fails leaves the archive as it was }
+      if appending then
+        try
+          TFileStream(a.fout).Size := goodEnd;
+        except
+        end;
+      raise;
+    end;
+    FreeAndNil(a.fout);
+    if tmpPath <> '' then
+    begin
+      if not ReplaceFile(tmpPath, arcPath) then
+      begin
+        keep := tmpPath;
+        tmpPath := '';
+        Fail(EXIT_FATAL, 'cannot create ' + arcPath + '; the archive is in ' + keep);
+      end;
+      tmpPath := '';
+    end;
+    if opts.verbosity <> vQuiet then
+      WriteLn(StdErr, Format('%s: version %d: %d files, %d directories, %d links added or changed, '
+        + '%d deleted, %d unchanged; %d bytes read, %d written, %d in repeated fragments',
+        [arcPath, vnum, a.nFiles, a.nDirs, a.nLinks, nDeleted, nSame, a.totalIn, a.pos - vstart,
+         a.dupBytes]));
+    Result := a.status;
+  except
+    on E: Exception do
+    begin
+      if tmpPath <> '' then
+        SysUtils.DeleteFile(tmpPath);
+      arc.Free;
+      FreeAndNil(a.fout);
+      if E is ESycError then
+        raise;
+      if E is EOutOfMemory then
+        Fail(EXIT_FATAL, arcPath + ': out of memory');
+      Fail(EXIT_FATAL, arcPath + ': ' + E.Message);
+    end;
+  end;
+  finally
+    a.Free;
+  end;
+end;
+
 { ── syc l ──────────────────────────────────────────────────────────────── }
 
 function ModeString(const e: TEntry): string;
@@ -1213,7 +1393,7 @@ var
   tmp, line: string;
   st: TEntries;
   filters: array of string;
-  i: SizeInt;
+  i, n, v, upTo: SizeInt;
   shown: Int64;
 begin
   Result := EXIT_OK;
@@ -1223,13 +1403,39 @@ begin
   a := OpenArchive(opts.operands[0], tmp);
   try
     WarnDamaged(a, Result);
-    st := a.State(VersionsUntil(a, opts.untilSpec));
+    upTo := VersionsUntil(a, opts.untilSpec);
+    if opts.allVersions then
+    begin
+      { every entry of every version, by path then version }
+      n := 0;
+      for v := 0 to upTo - 1 do
+        Inc(n, Length(a.versions[v].idx.entries));
+      SetLength(st, n);
+      n := 0;
+      for v := 0 to upTo - 1 do
+        for i := 0 to High(a.versions[v].idx.entries) do
+        begin
+          st[n] := a.versions[v].idx.entries[i];
+          st[n].ver := v + 1;
+          Inc(n);
+        end;
+      if n > 1 then
+        SortEntries(st, 0, n - 1);
+    end
+    else
+      st := a.State(upTo);
     shown := 0;
     for i := 0 to High(st) do
     begin
       if not Selected(filters, st[i].path) or Excluded(opts.excludes, st[i].path) then
         Continue;
       line := st[i].path;
+      if st[i].kind = ET_DELETED then
+      begin
+        WriteLn(Format('%5d  %s', [st[i].ver, line + '  (deleted)']));
+        Inc(shown);
+        Continue;
+      end;
       if st[i].kind = ET_DIR then
         line := line + '/'
       else if st[i].kind = ET_SYMLINK then
@@ -1237,6 +1443,8 @@ begin
       if opts.longList then
         line := Format('%s %14d  %s  %s', [ModeString(st[i]), st[i].meta.size,
           FormatTime(st[i].meta.mtime div 1000000000, False), line]);
+      if opts.allVersions then
+        line := Format('%5d  %s', [st[i].ver, line]);
       WriteLn(line);
       Inc(shown);
     end;

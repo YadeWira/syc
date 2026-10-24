@@ -52,6 +52,7 @@ type
     meta: TMeta;      { kind, size, mtime, attrs, uid/gid, target }
     refs: array of Int64;   { fragment numbers, files only }
     local: string;    { syc a: the file it comes from (not stored) }
+    ver: SizeInt;     { syc l --all: the version it is from (not stored) }
   end;
   TEntries = array of TEntry;
 

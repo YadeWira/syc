@@ -14,7 +14,7 @@ uses
   SysUtils, sylz, sycblocks;
 
 const
-  SYC_VERSION   = '0.3.1';
+  SYC_VERSION   = '0.3.2';
   STREAM_SUFFIX = '.sylz';
   DEFAULT_STREAM_BLOCK_MIB = 4;
   DEFAULT_ARCHIVE_BLOCK_MIB = 16;
@@ -36,7 +36,8 @@ type
     verbosity: TVerbosity;
     cdDir: string;           { -C }
     excludes: array of string;   { -X }
-    noDedup: Boolean;
+    noDedup, noDelete: Boolean;
+    allVersions: Boolean;    { l --all }
     longList: Boolean;       { l -l }
     untilSpec: string;       { -u: a version number or a date; '' latest }
     noPerms, noOwner: Boolean;
@@ -98,7 +99,7 @@ end;
 
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
-    oCd, oExclude, oNoDedup, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
+    oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
     oQuiet, oVerbose, oHelp);
 
   TOptDef = record
@@ -109,7 +110,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..18] of TOptDef = (
+  OPTION_DEFS: array[0..20] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
@@ -121,6 +122,8 @@ const
     (id: oCd;      short: 'C';  long: 'cd';         value: True;  cmds: 'a'),
     (id: oExclude; short: 'X';  long: 'exclude';    value: True;  cmds: 'axl'),
     (id: oNoDedup; short: '';   long: 'no-dedup';   value: False; cmds: 'a'),
+    (id: oNoDelete; short: '';  long: 'no-delete';  value: False; cmds: 'a'),
+    (id: oAll;     short: '';   long: 'all';        value: False; cmds: 'l'),
     (id: oLong;    short: 'l';  long: 'long';       value: False; cmds: 'l'),
     (id: oSkip;    short: '';   long: 'skip';       value: False; cmds: 'x'),
     (id: oUntil;   short: 'u';  long: 'until';      value: True;  cmds: 'xl'),
@@ -138,7 +141,7 @@ begin
   WriteLn('syc ', SYC_VERSION, ' — sylz compressor. Tuned for modest hardware.');
   WriteLn;
   WriteLn('Archives (.syc: files and directories, versions, deduplicated):');
-  WriteLn('  syc a [options] ARCHIVE PATH...   add PATHs: a new archive (- is stdout)');
+  WriteLn('  syc a [options] ARCHIVE PATH...   add PATHs: a new archive, or a new version');
   WriteLn('  syc x [options] ARCHIVE [FILTER...]   extract');
   WriteLn('  syc l [options] ARCHIVE [FILTER...]   list');
   WriteLn('  syc i ARCHIVE                     versions, sizes, deduplication');
@@ -175,8 +178,10 @@ begin
   case cmd of
     'a':
       begin
-        WriteLn('syc a [options] ARCHIVE PATH...   add files and directories (recursively)');
-        WriteLn('                                  to a new ARCHIVE; - writes it to stdout');
+        WriteLn('syc a [options] ARCHIVE PATH...   add files and directories (recursively):');
+        WriteLn('                                  a new ARCHIVE, or a new version at the end');
+        WriteLn('                                  of an existing one with what changed since');
+        WriteLn('                                  its last version; - writes a new one to stdout');
         WriteLn;
         LevelUsage;
         WriteLn('  -b, --block-size MIB   solid block size, default ', DEFAULT_ARCHIVE_BLOCK_MIB,
@@ -188,6 +193,9 @@ begin
         WriteLn('                         a name, ** across directories; a PATTERN');
         WriteLn('                         without / matches names, with / whole paths');
         WriteLn('  --no-dedup             store repeated fragments again');
+        WriteLn('  --no-delete            what is gone from under the PATHs stays in the new');
+        WriteLn('                         version (by default it is marked deleted; older');
+        WriteLn('                         versions keep it either way: syc x -u)');
         WriteLn('  -q, --quiet / -v, --verbose');
         WriteLn;
         WriteLn('Paths are stored relative: a leading / or drive letter is dropped, and');
@@ -219,6 +227,7 @@ begin
         WriteLn;
         WriteLn('  -l, --long             permissions, size, date');
         WriteLn('  -u, --until V          as of version V (a number or a date, as in syc x)');
+        WriteLn('  --all                  every version of each path, deletions included');
         WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
         WriteLn('  -q, --quiet / -v, --verbose');
       end;
@@ -419,6 +428,8 @@ begin
           opts.excludes[High(opts.excludes)] := value;
         end;
       oNoDedup: opts.noDedup := True;
+      oNoDelete: opts.noDelete := True;
+      oAll: opts.allVersions := True;
       oLong: opts.longList := True;
       oSkip: opts.skipExisting := True;
       oUntil:

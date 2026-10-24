@@ -66,6 +66,29 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Archiver stage 6: versions (2026-10-24)
+
+- `syc a` on an existing archive appends a version with what changed
+  since the last one: an entry whose metadata (type, size, mtime,
+  attributes, owner, link target) matches is left out without reading
+  the file; new fragments are deduplicated against every version (the
+  table is filled from the indexes). Deletions: what was under one of the
+  PATHs and is gone, unless excluded (-X), unreadable this time, or
+  --no-delete. No change: no version written (exit 0).
+- Like zpaq, a file changed without a new size or mtime is not seen.
+- The append writes in place after the last good commit (cutting what an
+  interrupted syc a left), flushes the data and index before the commit
+  and the commit after it; a failure truncates back. tests/arctest.sh
+  cuts the last version at 7 points (and a manual run at 27 more): `t`
+  says 1, the next `a` cuts and appends, the archive checks clean.
+- An archive cut down to its 8-byte header takes a first version.
+- `l --all`: every entry of every version, by path then version.
+- 338 MB tree (silesia + mixed), 4 threads: first `a` 2.69 s; again with
+  nothing changed 0.02 s; one 51 MB file with a byte appended 0.39 s, 22.8
+  kB written (the rest found in repeated fragments).
+- Windows 10 (x86-64, 32-bit): versions, -u, deletions, the no-change run,
+  the cut version recovered.
+
 ## Archiver stage 5: syc x (2026-10-24)
 
 - **Order**: what happens to each entry (write, replace, skip) is decided

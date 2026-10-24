@@ -104,8 +104,54 @@ mkdir -p ev/tree
 ln -s /tmp ev/tree/samples
 check "x through a symlinked directory" 1 "$SYC" x -q -o ev t1.syc tree/samples
 
+# versions: change, add, delete; each version extracts as it was
+rm -rf vt snap1 snap2 ov1 ov2 ov3
+cp -a tree vt
+check "a version 1" 0 "$SYC" a -q v.syc vt
+cp -a vt snap1
+sleep 1
+printf 'more\n' >> vt/copy
+rm -r vt/emptydir
+echo new > vt/new
+check "a version 2" 0 "$SYC" a -q -t 2 v.syc vt
+cp -a vt snap2
+check "a, no changes" 0 "$SYC" a -q v.syc vt
+"$SYC" i v.syc > out.txt
+[ "$(grep -c '^ *[0-9]' out.txt)" = 2 ] || { echo "FAIL: a with no changes added a version"; fail=1; }
+check "x -u 1" 0 "$SYC" x -q -u 1 -o ov1 v.syc
+treecmp snap1 ov1/vt || fail=1
+check "x (version 2)" 0 "$SYC" x -q -o ov2 v.syc
+treecmp snap2 ov2/vt || fail=1
+check "l --all" 0 "$SYC" l --all v.syc vt/emptydir
+grep -q '2  vt/emptydir  (deleted)' out.txt || { echo "FAIL: l --all does not show the deletion"; cat out.txt; fail=1; }
+rm vt/new
+check "a --no-delete" 0 "$SYC" a -q --no-delete v.syc vt
+check "x (version 3 kept vt/new)" 0 "$SYC" x -q -o ov3 v.syc vt/new
+
+# an interrupted append: the next syc a cuts it and the archive is whole
+cp v.syc base.syc
+echo later > vt/later
+"$SYC" a -q v.syc vt
+python3 - "$SYC" <<'PY' || fail=1
+import os, subprocess, sys
+syc = sys.argv[1]
+base, full = os.path.getsize('base.syc'), os.path.getsize('v.syc')
+data = open('v.syc', 'rb').read()
+bad = 0
+for n in sorted(set([base + 1, base + 16, base + 17, full - 25, full - 24, full - 1, (base + full) // 2])):
+    open('cut.syc', 'wb').write(data[:n])
+    r1 = subprocess.run([syc, 't', '-q', 'cut.syc'], capture_output=True).returncode
+    r2 = subprocess.run([syc, 'a', '-q', 'cut.syc', 'vt'], capture_output=True).returncode
+    r3 = subprocess.run([syc, 't', '-q', 'cut.syc'], capture_output=True).returncode
+    r4 = subprocess.run([syc, 'l', 'cut.syc', 'vt/later'], capture_output=True).returncode
+    if (r1, r2, r3, r4) != (1, 0, 0, 0):
+        print('FAIL: cut at %d: t %d, a %d, t %d, l %d' % (n, r1, r2, r3, r4)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+
 # refusals
-check "existing archive" 2 "$SYC" a t1.syc tree
+echo notanarchive > fake.syc
+check "a on a file that is not an archive" 3 "$SYC" a fake.syc tree
 check "path with .." 2 "$SYC" a x.syc ../tree
 check "nothing to add" 1 "$SYC" a x.syc -X '*' tree
 [ ! -e x.syc ] || { echo "FAIL: nothing to add wrote an archive"; fail=1; }
