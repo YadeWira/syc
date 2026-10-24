@@ -67,8 +67,11 @@ function IsLink(const path: string): Boolean;
   time and owner, never permissions. False when something could not be
   set. }
 function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean): Boolean;
-{ creates symlink path -> target; False when it cannot (Windows: not yet) }
-function MakeSymlink(const target, path: string): Boolean;
+{ creates symlink path -> m.target; False when it cannot. Windows: a link
+  to a directory needs to say so (m's directory attribute, else whether
+  the target is one now), and creating one needs developer mode or the
+  privilege for it. }
+function MakeSymlink(const m: TMeta; const path: string): Boolean;
 { removes a file or a symlink (not a directory) }
 function RemoveFile(const path: string): Boolean;
 
@@ -114,6 +117,7 @@ function PathExists(const path: string): Boolean;
 var
   st: Stat;
 begin
+  FillChar(st, SizeOf(st), 0);
   Result := fpLStat(path, st) = 0;
 end;
 
@@ -121,6 +125,7 @@ function IsLink(const path: string): Boolean;
 var
   st: Stat;
 begin
+  FillChar(st, SizeOf(st), 0);
   Result := (fpLStat(path, st) = 0) and fpS_ISLNK(st.st_mode);
 end;
 
@@ -148,9 +153,9 @@ begin
     Result := False;
 end;
 
-function MakeSymlink(const target, path: string): Boolean;
+function MakeSymlink(const m: TMeta; const path: string): Boolean;
 begin
-  Result := fpSymlink(PChar(target), PChar(path)) = 0;
+  Result := fpSymlink(PChar(m.target), PChar(path)) = 0;
 end;
 
 function RemoveFile(const path: string): Boolean;
@@ -163,6 +168,7 @@ var
   st: Stat;
 begin
   m := Default(TMeta);
+  FillChar(st, SizeOf(st), 0);
   if fpLStat(path, st) <> 0 then
     Exit(False);
   if fpS_ISREG(st.st_mode) then
@@ -221,6 +227,65 @@ begin
   Result := (Int64(ft.dwHighDateTime) shl 32 or ft.dwLowDateTime - 116444736000000000) * 100;
 end;
 
+const
+  IO_REPARSE_TAG_SYMLINK     = DWORD($A000000C);
+  IO_REPARSE_TAG_MOUNT_POINT = DWORD($A0000003);
+  FSCTL_GET_REPARSE_POINT    = $000900A8;
+  FILE_FLAG_OPEN_REPARSE_POINT = $00200000;
+  SYMLINK_FLAG_RELATIVE      = 1;
+  SYMBOLIC_LINK_FLAG_DIRECTORY = 1;
+  SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 2;   { Windows 10 1703+, developer mode }
+
+function CreateSymbolicLinkW(link, target: PWideChar; flags: DWORD): BOOLEAN;
+  stdcall; external 'kernel32' name 'CreateSymbolicLinkW';
+
+{ a reparse point's tag, and a symlink's target as it was given (its print
+  name); False when path is not one or cannot be read }
+function ReadReparse(const path: string; out tag: DWORD; out target: string): Boolean;
+var
+  h: THandle;
+  buf: array[0..16 * 1024 - 1] of Byte;
+  got: DWORD;
+  printOff, printLen: Word;
+  w: UnicodeString;
+begin
+  Result := False;
+  tag := 0;
+  target := '';
+  h := CreateFileW(PWideChar(UnicodeString(path)), 0, FILE_SHARE_READ or FILE_SHARE_WRITE
+    or FILE_SHARE_DELETE, nil, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT or FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if h = INVALID_HANDLE_VALUE then
+    Exit;
+  try
+    got := 0;
+    if not DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nil, 0, @buf, SizeOf(buf), got, nil)
+       or (got < 8) then
+      Exit;
+    tag := PDWORD(@buf[0])^;
+    Result := True;
+    { REPARSE_DATA_BUFFER, symlink: tag, length, reserved, substitute name
+      offset/length, print name offset/length, flags, path buffer }
+    if (tag = IO_REPARSE_TAG_SYMLINK) and (got >= 20) then
+    begin
+      printOff := PWord(@buf[12])^;
+      printLen := PWord(@buf[14])^;
+      if 20 + printOff + printLen <= got then
+      begin
+        SetLength(w, printLen div 2);
+        if printLen > 0 then
+          Move(buf[20 + printOff], w[1], printLen);
+        target := UTF8Encode(w);
+        { a relative target is stored with "/", as on Unix }
+        if PDWORD(@buf[16])^ and SYMLINK_FLAG_RELATIVE <> 0 then
+          target := StringReplace(target, '\', '/', [rfReplaceAll]);
+      end;
+    end;
+  finally
+    CloseHandle(h);
+  end;
+end;
+
 function NsToFileTime(ns: Int64): TFileTime;
 var
   v: Int64;
@@ -235,12 +300,17 @@ begin
   Result := GetFileAttributesW(PWideChar(UnicodeString(path))) <> INVALID_FILE_ATTRIBUTES;
 end;
 
+{ symlinks and junctions: other reparse points (cloud placeholders,
+  deduplicated files) are ordinary files and directories }
 function IsLink(const path: string): Boolean;
 var
-  a: DWORD;
+  a, tag: DWORD;
+  target: string;
 begin
   a := GetFileAttributesW(PWideChar(UnicodeString(path)));
-  Result := (a <> INVALID_FILE_ATTRIBUTES) and (a and FILE_ATTRIBUTE_REPARSE_POINT <> 0);
+  Result := (a <> INVALID_FILE_ATTRIBUTES) and (a and FILE_ATTRIBUTE_REPARSE_POINT <> 0)
+    and ReadReparse(path, tag, target)
+    and ((tag = IO_REPARSE_TAG_SYMLINK) or (tag = IO_REPARSE_TAG_MOUNT_POINT));
 end;
 
 function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean): Boolean;
@@ -257,6 +327,8 @@ begin
   flags := FILE_ATTRIBUTE_NORMAL;
   if m.kind = ET_DIR then
     flags := FILE_FLAG_BACKUP_SEMANTICS;   { opens a directory }
+  if m.kind = ET_SYMLINK then
+    flags := FILE_FLAG_OPEN_REPARSE_POINT or FILE_FLAG_BACKUP_SEMANTICS;   { the link, not its target }
   h := CreateFileW(PWideChar(w), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ or FILE_SHARE_WRITE,
     nil, OPEN_EXISTING, flags, 0);
   if h = INVALID_HANDLE_VALUE then
@@ -268,7 +340,7 @@ begin
       Result := False;
     CloseHandle(h);
   end;
-  if (m.attrKind = AK_WINDOWS) and not noPerms then
+  if (m.attrKind = AK_WINDOWS) and not noPerms and (m.kind <> ET_SYMLINK) then
   begin
     if m.kind = ET_DIR then
       flags := m.attrs or FILE_ATTRIBUTE_DIRECTORY
@@ -284,9 +356,29 @@ begin
     SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_READONLY);
 end;
 
-function MakeSymlink(const target, path: string): Boolean;
+function MakeSymlink(const m: TMeta; const path: string): Boolean;
+var
+  target, full: string;
+  flags: DWORD;
 begin
-  Result := False;
+  target := StringReplace(m.target, '/', '\', [rfReplaceAll]);
+  if m.attrKind = AK_WINDOWS then
+    flags := Ord(m.attrs and FILE_ATTRIBUTE_DIRECTORY <> 0) * SYMBOLIC_LINK_FLAG_DIRECTORY
+  else
+  begin
+    { from Unix: a directory link if its target is a directory now }
+    if (Length(target) >= 2) and ((target[1] = '\') or (target[2] = ':')) then
+      full := target
+    else
+      full := ExtractFilePath(path) + target;
+    flags := Ord(DirectoryExists(full)) * SYMBOLIC_LINK_FLAG_DIRECTORY;
+  end;
+  Result := CreateSymbolicLinkW(PWideChar(UnicodeString(path)), PWideChar(UnicodeString(target)),
+    flags or SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE);
+  { before Windows 10 1703 the extra flag is an invalid parameter }
+  if not Result and (GetLastError = ERROR_INVALID_PARAMETER) then
+    Result := CreateSymbolicLinkW(PWideChar(UnicodeString(path)), PWideChar(UnicodeString(target)),
+      flags);
 end;
 
 function RemoveFile(const path: string): Boolean;
@@ -302,13 +394,22 @@ function GetMeta(const path: string; out m: TMeta): Boolean;
 var
   data: TWin32FileAttributeData;
   w: UnicodeString;
+  tag: DWORD;
+  target: string;
 begin
   m := Default(TMeta);
   w := UnicodeString(path);
   if not GetFileAttributesExW(PWideChar(w), GetFileExInfoStandard, @data) then
     Exit(False);
-  if data.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT <> 0 then
-    m.kind := ET_OTHER   { symlinks and junctions: not stored yet }
+  tag := 0;
+  if (data.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT <> 0)
+     and ReadReparse(path, tag, target) and (tag = IO_REPARSE_TAG_SYMLINK) then
+  begin
+    m.kind := ET_SYMLINK;
+    m.target := target;
+  end
+  else if tag = IO_REPARSE_TAG_MOUNT_POINT then
+    m.kind := ET_OTHER   { a junction: not followed, not stored }
   else if data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
     m.kind := ET_DIR
   else
@@ -320,6 +421,10 @@ begin
   m.attrKind := AK_WINDOWS;
   m.attrs := data.dwFileAttributes and (FILE_ATTRIBUTE_READONLY or FILE_ATTRIBUTE_HIDDEN
     or FILE_ATTRIBUTE_SYSTEM or FILE_ATTRIBUTE_ARCHIVE);
+  { a symlink keeps whether it points to a directory: Windows makes the two
+    kinds differently }
+  if m.kind = ET_SYMLINK then
+    m.attrs := m.attrs or (data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY);
   Result := True;
 end;
 

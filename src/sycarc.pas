@@ -1965,7 +1965,7 @@ begin
             x.status := Max(x.status, EXIT_WARN);
             Continue;
           end;
-          if not MakeSymlink(sel[i].meta.target, local) then
+          if not MakeSymlink(sel[i].meta, local) then
           begin
             WriteLn(StdErr, 'syc: ', local, ': cannot create the symlink');
             x.status := Max(x.status, EXIT_WARN);

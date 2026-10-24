@@ -66,6 +66,30 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Archiver stage 7: symlinks on Windows (2026-10-24)
+
+- Stored: a reparse point tagged as a symlink (its print name, read with
+  FSCTL_GET_REPARSE_POINT; a relative target with "/" as on Unix), and
+  whether it points to a directory (the directory attribute kept in its
+  Windows attributes: Windows makes the two kinds differently).
+  Junctions are skipped (not followed either); other reparse points
+  (cloud placeholders, deduplicated files) are ordinary files and
+  directories, for IsLink too.
+- Made with CreateSymbolicLinkW, asking for an unprivileged link
+  (developer mode, Windows 10 1703+) and without that flag where it is an
+  invalid parameter; without the privilege it fails with a warning (exit
+  1). A link from a Unix archive is a directory link if its target is a
+  directory once everything else is extracted. Times are set on the link
+  itself (FILE_FLAG_OPEN_REPARSE_POINT), attributes are not.
+- Windows 10, x86-64 and 32-bit: file and directory symlinks stored and
+  made again, Linux links (to a file, a directory, dangling) made on
+  Windows and read through; the Windows archive's links made on Linux.
+- With that the metadata of the plan is all there: times, Unix mode and
+  owner (restored as root only; not tested as root yet), Windows
+  attributes, symlinks, empty directories. Not stored: hard links (as
+  separate files, deduplicated), extended attributes, ACLs, alternate
+  streams, devices, sockets and FIFOs.
+
 ## Archiver stage 6: versions (2026-10-24)
 
 - `syc a` on an existing archive appends a version with what changed
