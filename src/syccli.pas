@@ -14,7 +14,7 @@ uses
   SysUtils, sylz, sycblocks;
 
 const
-  SYC_VERSION   = '0.2.14';
+  SYC_VERSION   = '0.3.0';
   STREAM_SUFFIX = '.sylz';
   DEFAULT_STREAM_BLOCK_MIB = 4;
 
