@@ -1,20 +1,35 @@
 { syc — the command line: parses it (syccli) and runs the command.
 
-    syc c / d / t     one file or stdin as a .sylz stream (sycstream) }
+    syc a / l / i     archives (sycarc)
+    syc c / d / t     one file or stdin as a .sylz stream (sycstream); t
+                      checks archives too }
 program syc;
 
 {$mode objfpc}{$H+}
 
 uses
   {$ifdef unix}cthreads,{$endif}
-  SysUtils, sycblocks, syccli, sycstream;
+  {$ifdef windows}Windows,{$endif}
+  SysUtils, sycblocks, syccli, sycstream, sycarc;
 
 var
   opts: TOptions;
 begin
+{$ifdef windows}
+  { strings are UTF-8, as the archive stores paths: file names, the
+    command line and the console go through it instead of the ANSI code
+    page, which cannot hold most names }
+  SetMultiByteConversionCodePage(CP_UTF8);
+  SetMultiByteFileSystemCodePage(CP_UTF8);
+  SetMultiByteRTLFileSystemCodePage(CP_UTF8);
+  SetConsoleOutputCP(CP_UTF8);
+{$endif}
   try
     ParseCommandLine(opts);
-    ExitCode := RunStreamCommand(opts);
+    if opts.cmd in ['a', 'l', 'i'] then
+      ExitCode := RunArchiveCommand(opts)
+    else
+      ExitCode := RunStreamCommand(opts);
   except
     on E: ESycError do
     begin

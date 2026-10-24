@@ -18,7 +18,7 @@ unit sycstream;
 interface
 
 uses
-  SysUtils, Classes, Math, sylz, sycblocks, syccli;
+  SysUtils, Classes, Math, sylz, sycblocks, syccli, sycarc;
 
 { runs syc c, d or t on every operand; returns the exit code }
 function RunStreamCommand(const opts: TOptions): Integer;
@@ -199,10 +199,14 @@ function RunOne(const opts: TOptions; const input: string): Integer;
 var
   fromStdin, toStdout: Boolean;
   inName, outPath, tmpPath, keep: string;
-  fin, fout: TStream;
+  fin, fout, pre: TStream;
   total, written: Int64;
+  magic: array of Byte;
+  got: SizeInt;
+  arcPath: string;
 begin
   Result := EXIT_OK;
+  SetLength(magic, 4);
   fromStdin := (input = '') or (input = '-');
   if fromStdin then
     inName := '(stdin)'
@@ -268,7 +272,39 @@ begin
         fout := TFileStream.Create(tmpPath, fmCreate);
       end;
 
-      if opts.cmd = 'c' then
+      if opts.cmd = 't' then
+      begin
+        { an archive or a stream: by the first 4 bytes }
+        got := ReadFull(fin, @magic[0], 4);
+        if (got = 4) and (CompareByte(magic[0], 'SYCA', 4) = 0) then
+        begin
+          if fromStdin then
+          begin
+            tmpPath := SpoolToTemp(magic, fin);
+            arcPath := tmpPath;
+          end
+          else
+            arcPath := input;
+          FreeAndNil(fin);
+          try
+            Result := TestArchive(opts, arcPath, inName);
+          finally
+            if fromStdin then
+            begin
+              SysUtils.DeleteFile(tmpPath);
+              tmpPath := '';
+            end;
+          end;
+          Exit;
+        end;
+        pre := TPrefixStream.Create(Copy(magic, 0, got), fin);
+        try
+          Decompress(pre, nil, inName, opts.threads, total);
+        finally
+          pre.Free;
+        end;
+      end
+      else if opts.cmd = 'c' then
         Compress(fin, fout, opts, total, written)
       else
         Decompress(fin, fout, inName, opts.threads, total);
@@ -290,7 +326,7 @@ begin
       tmpPath := '';
     end;
     if opts.removeInput and not fromStdin and not toStdout and (opts.cmd <> 't') then
-      if not DeleteFile(input) then
+      if not SysUtils.DeleteFile(input) then
       begin
         WriteLn(StdErr, 'syc: ', input, ': cannot delete');
         Result := EXIT_WARN;
@@ -308,7 +344,7 @@ begin
     on E: Exception do
     begin
       if tmpPath <> '' then
-        DeleteFile(tmpPath);
+        SysUtils.DeleteFile(tmpPath);
       if E is ESycError then
         raise;
       if E is EOutOfMemory then

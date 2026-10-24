@@ -17,21 +17,26 @@ const
   SYC_VERSION   = '0.3.0';
   STREAM_SUFFIX = '.sylz';
   DEFAULT_STREAM_BLOCK_MIB = 4;
+  DEFAULT_ARCHIVE_BLOCK_MIB = 16;
 
 type
   TVerbosity = (vQuiet, vNormal, vVerbose);
 
   TOptions = record
-    cmd: Char;               { 'c', 'd', 't' }
+    cmd: Char;               { 'a', 'l', 'i', 'c', 'd', 't' }
     level: Integer;
     flags: Integer;          { SYLZ_ENTROPY with -ec }
-    blockMiB: Integer;
+    blockMiB: Integer;       { the command's default unless -b }
     threads: Integer;
     outPath: string;         { -o; '' when not given }
     toStdout: Boolean;       { -O }
     force: Boolean;
     removeInput: Boolean;    { --rm }
     verbosity: TVerbosity;
+    cdDir: string;           { -C }
+    excludes: array of string;   { -X }
+    noDedup: Boolean;
+    longList: Boolean;       { l -l }
     operands: array of string;
   end;
 
@@ -41,9 +46,56 @@ procedure ParseCommandLine(out opts: TOptions);
 
 implementation
 
+{$ifdef windows}
+uses
+  Windows;
+
+function CommandLineToArgvW(cmd: PWideChar; out argc: LongInt): PPWideChar;
+  stdcall; external 'shell32.dll' name 'CommandLineToArgvW';
+
+var
+  args: array of string;   { UTF-8; ParamStr would give the ANSI code page's }
+
+procedure LoadArgs;
+var
+  argv: PPWideChar;
+  argc, i: LongInt;
+begin
+  argv := CommandLineToArgvW(GetCommandLineW, argc);
+  SetLength(args, argc);
+  for i := 0 to argc - 1 do
+    args[i] := UTF8Encode(UnicodeString(argv[i]));
+  LocalFree(HLOCAL(argv));
+end;
+
+function CmdArgCount: Integer;
+begin
+  if args = nil then
+    LoadArgs;
+  Result := Length(args) - 1;
+end;
+
+function CmdArg(i: Integer): string;
+begin
+  if args = nil then
+    LoadArgs;
+  Result := args[i];
+end;
+{$else}
+function CmdArgCount: Integer;
+begin
+  Result := ParamCount;
+end;
+
+function CmdArg(i: Integer): string;
+begin
+  Result := ParamStr(i);
+end;
+{$endif}
+
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
-    oQuiet, oVerbose, oHelp);
+    oCd, oExclude, oNoDedup, oLong, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
     id: TOptId;
@@ -53,31 +105,42 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..10] of TOptDef = (
-    (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'c'),
-    (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'c'),
-    (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'c'),
-    (id: oThreads; short: 't';  long: 'threads';    value: True;  cmds: 'cdt'),
+  OPTION_DEFS: array[0..14] of TOptDef = (
+    (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
+    (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
+    (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
+    (id: oThreads; short: 't';  long: 'threads';    value: True;  cmds: 'acdt'),
     (id: oOut;     short: 'o';  long: 'out';        value: True;  cmds: 'cd'),
     (id: oStdout;  short: 'O';  long: 'stdout';     value: False; cmds: 'cd'),
     (id: oForce;   short: 'f';  long: 'force';      value: False; cmds: 'cd'),
     (id: oRm;      short: '';   long: 'rm';         value: False; cmds: 'cd'),
-    (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'cdt'),
-    (id: oVerbose; short: 'v';  long: 'verbose';    value: False; cmds: 'cdt'),
-    (id: oHelp;    short: 'h';  long: 'help';       value: False; cmds: 'cdt')
+    (id: oCd;      short: 'C';  long: 'cd';         value: True;  cmds: 'a'),
+    (id: oExclude; short: 'X';  long: 'exclude';    value: True;  cmds: 'al'),
+    (id: oNoDedup; short: '';   long: 'no-dedup';   value: False; cmds: 'a'),
+    (id: oLong;    short: 'l';  long: 'long';       value: False; cmds: 'l'),
+    (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'alicdt'),
+    (id: oVerbose; short: 'v';  long: 'verbose';    value: False; cmds: 'alicdt'),
+    (id: oHelp;    short: 'h';  long: 'help';       value: False; cmds: 'alicdt')
   );
 
-  COMMANDS = 'cdt';
+  COMMANDS = 'alicdt';
 
 procedure Usage;
 begin
   WriteLn('syc ', SYC_VERSION, ' — sylz compressor. Tuned for modest hardware.');
   WriteLn;
+  WriteLn('Archives (.syc: files and directories, versions, deduplicated):');
+  WriteLn('  syc a [options] ARCHIVE PATH...   add PATHs: a new archive (- is stdout)');
+  WriteLn('  syc l [options] ARCHIVE [FILTER...]   list');
+  WriteLn('  syc i ARCHIVE                     versions, sizes, deduplication');
+  WriteLn;
+  WriteLn('One file (.sylz stream):');
   WriteLn('  syc c [options] [FILE...]     compress each FILE to FILE', STREAM_SUFFIX,
     ' (none or -: stdin to stdout)');
   WriteLn('  syc d [options] [FILE...]     decompress each FILE', STREAM_SUFFIX,
     ' to FILE (none or -: stdin to stdout)');
-  WriteLn('  syc t [options] [FILE...]     test: decompress and check, write nothing');
+  WriteLn;
+  WriteLn('  syc t [options] [FILE...]     test archives and streams: check, write nothing');
   WriteLn('  syc h [CMD]                   help (also syc CMD -h)');
   WriteLn('  syc -V, --version');
   WriteLn;
@@ -85,23 +148,63 @@ begin
   WriteLn('3 corrupt data, 4 I/O error or out of memory.');
 end;
 
+procedure LevelUsage;
+begin
+  WriteLn('  -0 .. -', SYLZ_MAXLEVEL, ', --level N');
+  WriteLn('              level: 0 fastest .. ', SYLZ_MAXLEVEL, ' best ratio, default ',
+    SYLZ_DEFLEVEL);
+  WriteLn('              (0-1 single hash, 2-3 two hashes, 4-8 hash chains,');
+  WriteLn('              9-10 optimal parsing)');
+  WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v3),');
+  WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
+    ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do,');
+  WriteLn('              9-10 price literals by their Huffman codes');
+end;
+
 procedure CmdUsage(cmd: Char);
 begin
   case cmd of
+    'a':
+      begin
+        WriteLn('syc a [options] ARCHIVE PATH...   add files and directories (recursively)');
+        WriteLn('                                  to a new ARCHIVE; - writes it to stdout');
+        WriteLn;
+        LevelUsage;
+        WriteLn('  -b, --block-size MIB   solid block size, default ', DEFAULT_ARCHIVE_BLOCK_MIB,
+          ', 1..', MAX_BLOCK shr 20);
+        WriteLn('  -t, --threads N        blocks compressed N at a time, default 1');
+        WriteLn('                         (the archive is the same whatever N)');
+        WriteLn('  -C, --cd DIR           PATHs are relative to DIR (stored without it)');
+        WriteLn('  -X, --exclude PATTERN  skip what matches (repeatable): * and ? within');
+        WriteLn('                         a name, ** across directories; a PATTERN');
+        WriteLn('                         without / matches names, with / whole paths');
+        WriteLn('  --no-dedup             store repeated fragments again');
+        WriteLn('  -q, --quiet / -v, --verbose');
+        WriteLn;
+        WriteLn('Paths are stored relative: a leading / or drive letter is dropped, and');
+        WriteLn('a path with .. is refused (use -C).');
+      end;
+    'l':
+      begin
+        WriteLn('syc l [options] ARCHIVE [FILTER...]   list the files (a FILTER is a path,');
+        WriteLn('                                      a directory with everything in it,');
+        WriteLn('                                      or a pattern as in -X)');
+        WriteLn;
+        WriteLn('  -l, --long             permissions, size, date');
+        WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
+        WriteLn('  -q, --quiet / -v, --verbose');
+      end;
+    'i':
+      begin
+        WriteLn('syc i ARCHIVE   each version: date, entries, data added, stored size,');
+        WriteLn('                deduplication');
+      end;
     'c':
       begin
         WriteLn('syc c [options] [FILE...]   compress: FILE -> FILE', STREAM_SUFFIX,
           '; no FILE or -: stdin -> stdout');
         WriteLn;
-        WriteLn('  -0 .. -', SYLZ_MAXLEVEL, ', --level N');
-        WriteLn('              level: 0 fastest .. ', SYLZ_MAXLEVEL, ' best ratio, default ',
-          SYLZ_DEFLEVEL);
-        WriteLn('              (0-1 single hash, 2-3 two hashes, 4-8 hash chains,');
-        WriteLn('              9-10 optimal parsing)');
-        WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v3),');
-        WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
-          ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do,');
-        WriteLn('              9-10 price literals by their Huffman codes');
+        LevelUsage;
         WriteLn('  -b, --block-size MIB   block size, default ', DEFAULT_STREAM_BLOCK_MIB,
           ', 1..', MAX_BLOCK shr 20);
         WriteLn('  -t, --threads N        blocks compressed N at a time, default 1');
@@ -126,8 +229,10 @@ begin
       end;
     't':
       begin
-        WriteLn('syc t [options] [FILE...]   decompress and check every block, write');
-        WriteLn('                            nothing; no FILE or -: stdin');
+        WriteLn('syc t [options] [FILE...]   check archives (.syc) and streams (', STREAM_SUFFIX, '),');
+        WriteLn('                            write nothing; no FILE or -: stdin');
+        WriteLn('                            (every block''s CRC-32; in an archive also the');
+        WriteLn('                            index and each fragment''s BLAKE2s-256)');
         WriteLn;
         WriteLn('  -t, --threads N        blocks checked N at a time, default 1');
         WriteLn('  -q, --quiet / -v, --verbose');
@@ -154,20 +259,20 @@ var
 begin
   opts := Default(TOptions);
   opts.level := SYLZ_DEFLEVEL;
-  opts.blockMiB := DEFAULT_STREAM_BLOCK_MIB;
+  opts.blockMiB := 0;
   opts.threads := 1;
   opts.verbosity := vNormal;
 
-  if ParamCount < 1 then
+  if CmdArgCount < 1 then
   begin
     Usage;
     Halt(EXIT_USAGE);
   end;
-  arg := ParamStr(1);
+  arg := CmdArg(1);
   if (arg = '-h') or (arg = '--help') or (arg = 'h') then
   begin
-    if (ParamCount >= 2) and (Length(ParamStr(2)) = 1) and (Pos(ParamStr(2)[1], COMMANDS) > 0) then
-      CmdUsage(ParamStr(2)[1])
+    if (CmdArgCount >= 2) and (Length(CmdArg(2)) = 1) and (Pos(CmdArg(2)[1], COMMANDS) > 0) then
+      CmdUsage(CmdArg(2)[1])
     else
       Usage;
     Halt(EXIT_OK);
@@ -183,9 +288,9 @@ begin
 
   noMore := False;
   i := 2;
-  while i <= ParamCount do
+  while i <= CmdArgCount do
   begin
-    arg := ParamStr(i);
+    arg := CmdArg(i);
     Inc(i);
     if noMore or (arg = '-') or (Length(arg) < 2) or (arg[1] <> '-') then
     begin
@@ -251,9 +356,9 @@ begin
       UsageError(Format('syc %s does not take %s', [opts.cmd, shown]));
     if OPTION_DEFS[k].value and not hasValue then
     begin
-      if i > ParamCount then
+      if i > CmdArgCount then
         UsageError(shown + ' needs a value');
-      value := ParamStr(i);
+      value := CmdArg(i);
       Inc(i);
     end
     else if hasValue and not OPTION_DEFS[k].value then
@@ -274,6 +379,19 @@ begin
       oStdout: opts.toStdout := True;
       oForce: opts.force := True;
       oRm: opts.removeInput := True;
+      oCd:
+        begin
+          if value = '' then
+            UsageError(shown + ' needs a directory');
+          opts.cdDir := value;
+        end;
+      oExclude:
+        begin
+          SetLength(opts.excludes, Length(opts.excludes) + 1);
+          opts.excludes[High(opts.excludes)] := value;
+        end;
+      oNoDedup: opts.noDedup := True;
+      oLong: opts.longList := True;
       oQuiet: opts.verbosity := vQuiet;
       oVerbose: opts.verbosity := vVerbose;
       oHelp:
@@ -294,6 +412,19 @@ begin
   begin
     opts.outPath := '';
     opts.toStdout := True;
+  end;
+  if opts.blockMiB = 0 then
+    if opts.cmd = 'a' then
+      opts.blockMiB := DEFAULT_ARCHIVE_BLOCK_MIB
+    else
+      opts.blockMiB := DEFAULT_STREAM_BLOCK_MIB;
+  case opts.cmd of
+    'a': if Length(opts.operands) < 2 then
+           UsageError('syc a needs an ARCHIVE and at least one PATH');
+    'l': if Length(opts.operands) < 1 then
+           UsageError('syc l needs an ARCHIVE');
+    'i': if Length(opts.operands) <> 1 then
+           UsageError('syc i takes one ARCHIVE');
   end;
 end;
 

@@ -49,6 +49,10 @@ has no sylz counterpart.
 - `src/blake2s.pas`, `src/syccdc.pas` — the archive's fragment hash and
   cutter; `tests/sycdedup.pas` tests them, `tools/syc_cdc_ref.py` is the
   reference written from the wiki's spec
+- `src/sycarc.pas` — the archiver (`a`, `l`, `i`, `t` on archives);
+  `src/sycfmt.pas` — its format, the index encoded/decoded and checked;
+  `src/sycfs.pas` — paths, directory listings, metadata, globs;
+  `tests/arctest.sh` — the archiver end to end, with damage
 - `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output;
   `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`,
   `SYLZ_NOASM=1` uses the Pascal paths only
@@ -61,6 +65,36 @@ has no sylz counterpart.
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## Archiver stage 4: syc a (one version), l, i, t (2026-10-24)
+
+- **Reading** goes back from the last commit; an end that is not a commit
+  falls back to a forward scan to the last whole version (warning, exit
+  1). Every count in an index is bounded by the bytes left, a varint over
+  the range is an error (a 2^63 count turned negative passed the first
+  bound check), file sizes are checked against their fragments and the
+  blocks must lead exactly to the index. tests/arctest.sh: 200 random
+  byte flips all found by `t` (exit 3), `l`/`i` exit 0 or 3, 100
+  truncations exit 3, junk after the commit exit 1.
+- **stdin** (`l -`, `i -`, `t -`) goes through a temporary file: a
+  forward pass cannot know where fragments are before the index.
+- **Same archive whatever -t** (version time masked): fragments are hashed
+  in parallel in 8 MiB batches, then deduplicated and packed in order.
+- silesia (directory, 212 MB), CPUs 20-23: `a -1` 1.63 s with 1 thread,
+  1.03 with 2, 0.97 with 4 (`c -1` on silesia.tar: 0.71 / 0.37); `t` 0.81
+  / 0.43 / 0.31 s once each block's fragments are hashed by the thread that
+  decoded it (0.73 with 4 threads when the main thread hashed). Size: the
+  archive 94.55 MB against the tar's stream 94.50 MB at -1. What stays
+  serial in `a`: reading and cutting (~0.25 s) and the batch's hashing
+  wait; overlapping the next batch's cutting with this one's hashing, and
+  SIMD BLAKE2s, are what is left.
+- **Windows**: FPC 3.2's strings are in the ANSI code page, so a name
+  like ñandú-日本.txt could not be opened. syc now sets the conversion,
+  file-system and console code pages to UTF-8 and reads its command line
+  with CommandLineToArgvW; checked on Windows 10 (x86-64 and 32-bit).
+  Reparse points (symlinks, junctions) are skipped until stage 7.
+- `sycblocks`: TJob.post (work done on the job's thread after its block,
+  here the hash check) and TTaskPool (a parallel for).
 
 ## The archive's dedup pieces: BLAKE2s and the cutter (2026-10-24)
 

@@ -141,16 +141,21 @@ Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/
 
 ## Use
 
-The command line is being built in stages (see the wiki's Roadmap):
-`c`, `d` and `t` work today; the archiver commands (`a`, `x`, `l`, `i`)
-come next. File formats stay provisional until 1.0.
+The command line is being built in stages (see the wiki's Roadmap). The
+archiver writes and checks archives, but **cannot extract yet** (`x` is
+the next stage). File formats stay provisional until 1.0.
 
 ```sh
+out/syc a backup.syc docs/ photos/   # a new archive: deduplicated, solid blocks
+out/syc l -l backup.syc              # list (filters: paths, directories, globs)
+out/syc i backup.syc                 # versions, sizes, deduplication
+out/syc t backup.syc                 # check everything, write nothing
+
 out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads)
 out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)
 out/syc t file.sylz        # check it, write nothing
 tar c dir | out/syc c > dir.tar.sylz       # no FILE: stdin -> stdout
-out/syc h c                # every option of a command
+out/syc h a                # every option of a command
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
 

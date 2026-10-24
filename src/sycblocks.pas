@@ -46,9 +46,25 @@ function IsTerminal(std: Integer): Boolean;
 function StdStream(std: Integer): THandleStream;
 
 type
+  { reads prefix first, then inner (not owned): for an input whose first
+    bytes were read to see what it is }
+  TPrefixStream = class(TStream)
+  private
+    prefix: array of Byte;
+    at: SizeInt;
+    inner: TStream;
+  public
+    constructor Create(const aPrefix: array of Byte; aInner: TStream);
+    function Read(var Buffer; Count: LongInt): LongInt; override;
+  end;
+
   { One block's work, done by a worker thread (or the main one with one
     thread). Compress: raw[0..n) -> payload[0..c) and its crc. Decompress:
     payload (stored or a sylz block) -> raw[0..n), checked against sum. }
+  TJob = class;
+  { run by the job's thread after its block is done (and ok) }
+  TJobPost = procedure(job: TJob) of object;
+
   TJob = class
     raw, payload: PByte;
     rawCap, payCap: SizeInt;
@@ -58,6 +74,9 @@ type
     ok: Boolean;
     ctx: TSylzCtx;
     dctx: TSylzDCtx;
+    post: TJobPost;
+    tag: Int64;          { the caller's: which block this is }
+    failed: Int64;       { set by post: what it found wrong (0: nothing) }
     constructor Create;
     destructor Destroy; override;
     procedure Reserve(rawSize, paySize: SizeInt);
@@ -93,9 +112,37 @@ type
     constructor Create(aThreads: Integer; aDecompressing: Boolean; aLevel, aFlags: Integer);
     destructor Destroy; override;
     function Slots: Integer;
+    procedure SetPost(p: TJobPost);
     procedure Start(slot: Integer);    { slot's job is ready: work on it }
     procedure Finish(slot: Integer);   { wait until slot's job is done }
     procedure RunJob(job: TJob);
+  end;
+
+  { Runs proc(0) .. proc(count - 1) on N threads (the calling one among
+    them) and returns when all are done; the order is not defined. }
+  TParallelProc = procedure(i: SizeInt) of object;
+
+  TTaskPool = class;
+
+  TPoolThread = class(TThread)
+  public
+    pool: TTaskPool;
+    index: Integer;
+    constructor Create(aPool: TTaskPool; aIndex: Integer);
+    procedure Execute; override;
+  end;
+
+  TTaskPool = class
+    threads: array of TPoolThread;
+    startEv, doneEv: array of PRTLEvent;
+    proc: TParallelProc;
+    count: LongInt;
+    next: LongInt;
+    stopping, failed: Boolean;
+    constructor Create(n: Integer);
+    destructor Destroy; override;
+    procedure Run(aCount: SizeInt; aProc: TParallelProc);
+    procedure Work;
   end;
 
 implementation
@@ -237,6 +284,35 @@ end;
 function StdStream(std: Integer): THandleStream;
 begin
   Result := THandleStream.Create(StdHandle(std));
+end;
+
+constructor TPrefixStream.Create(const aPrefix: array of Byte; aInner: TStream);
+var
+  i: Integer;
+begin
+  inherited Create;
+  SetLength(prefix, Length(aPrefix));
+  for i := 0 to High(aPrefix) do
+    prefix[i] := aPrefix[i];
+  inner := aInner;
+end;
+
+function TPrefixStream.Read(var Buffer; Count: LongInt): LongInt;
+var
+  n: LongInt;
+begin
+  n := 0;
+  if at < Length(prefix) then
+  begin
+    n := Length(prefix) - at;
+    if n > Count then
+      n := Count;
+    Move(prefix[at], Buffer, n);
+    Inc(at, n);
+    if n = Count then
+      Exit(n);
+  end;
+  Result := n + inner.Read(PByte(@Buffer)[n], Count - n);
 end;
 
 { ── the pipeline ───────────────────────────────────────────────────────── }
@@ -387,9 +463,118 @@ begin
       job.DoDecompress
     else
       job.DoCompress(level, flags);
+    job.failed := 0;
+    if job.ok and Assigned(job.post) then
+      job.post(job);
   except
     job.ok := False;   { out of memory }
   end;
+end;
+
+procedure TPipeline.SetPost(p: TJobPost);
+var
+  i: Integer;
+begin
+  for i := 0 to High(jobs) do
+    jobs[i].post := p;
+end;
+
+{ ── the task pool ──────────────────────────────────────────────────────── }
+
+constructor TPoolThread.Create(aPool: TTaskPool; aIndex: Integer);
+begin
+  pool := aPool;
+  index := aIndex;
+  inherited Create(False);
+end;
+
+procedure TPoolThread.Execute;
+begin
+  while True do
+  begin
+    RTLEventWaitFor(pool.startEv[index]);
+    if pool.stopping then
+      Break;
+    try
+      pool.Work;
+    except
+      pool.failed := True;
+    end;
+    RTLEventSetEvent(pool.doneEv[index]);
+  end;
+end;
+
+constructor TTaskPool.Create(n: Integer);
+var
+  i: Integer;
+begin
+  inherited Create;
+  SetLength(threads, n - 1);
+  SetLength(startEv, n - 1);
+  SetLength(doneEv, n - 1);
+  for i := 0 to n - 2 do
+  begin
+    startEv[i] := RTLEventCreate;
+    doneEv[i] := RTLEventCreate;
+    threads[i] := TPoolThread.Create(Self, i);
+  end;
+end;
+
+destructor TTaskPool.Destroy;
+var
+  i: Integer;
+begin
+  stopping := True;
+  for i := 0 to High(threads) do
+    RTLEventSetEvent(startEv[i]);
+  for i := 0 to High(threads) do
+  begin
+    threads[i].WaitFor;
+    threads[i].Free;
+    RTLEventDestroy(startEv[i]);
+    RTLEventDestroy(doneEv[i]);
+  end;
+  inherited Destroy;
+end;
+
+procedure TTaskPool.Work;
+var
+  i: LongInt;
+begin
+  while True do
+  begin
+    i := InterLockedIncrement(next) - 1;
+    if i >= count then
+      Break;
+    proc(i);
+  end;
+end;
+
+procedure TTaskPool.Run(aCount: SizeInt; aProc: TParallelProc);
+var
+  i: Integer;
+begin
+  if aCount <= 0 then
+    Exit;
+  proc := aProc;
+  count := aCount;
+  next := 0;
+  if (Length(threads) = 0) or (aCount = 1) then
+  begin
+    Work;
+    Exit;
+  end;
+  for i := 0 to High(threads) do
+    RTLEventSetEvent(startEv[i]);
+  failed := False;
+  try
+    Work;
+  finally
+    for i := 0 to High(threads) do
+      RTLEventWaitFor(doneEv[i]);
+  end;
+  if failed then
+    raise EOutOfMemory.Create('out of memory');
 end;
 
 procedure TPipeline.Start(slot: Integer);
