@@ -49,7 +49,7 @@ has no sylz counterpart.
 - `src/blake2s.pas`, `src/syccdc.pas` — the archive's fragment hash and
   cutter; `tests/sycdedup.pas` tests them, `tools/syc_cdc_ref.py` is the
   reference written from the wiki's spec
-- `src/sycarc.pas` — the archiver (`a`, `l`, `i`, `t` on archives);
+- `src/sycarc.pas` — the archiver (`a`, `x`, `l`, `i`, `t` on archives);
   `src/sycfmt.pas` — its format, the index encoded/decoded and checked;
   `src/sycfs.pas` — paths, directory listings, metadata, globs;
   `tests/arctest.sh` — the archiver end to end, with damage
@@ -65,6 +65,35 @@ has no sylz counterpart.
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## Archiver stage 5: syc x (2026-10-24)
+
+- **Order**: what happens to each entry (write, replace, skip) is decided
+  first; then the blocks the written files need, in path order, are
+  decoded ahead by the pipeline (each fragment's hash checked on the
+  decoding thread) and the main thread writes. A block needed again later
+  (dedup across files) is decoded again: memory stays at 2N blocks.
+- **Safety**: stored paths have no `..` (checked when the index is read);
+  no file is written through a symlink: a directory on the way that is a
+  symlink skips the entry (exit 1), and the archive's own symlinks are
+  made after every file. Files go to NAME.syc-partial and are renamed;
+  a corrupt block stops with exit 3 and no partial file left.
+- **Metadata**: Unix mode, mtime to the ns (libc utimensat, also on
+  symlinks), owner when root (lchown); directories last, deepest first.
+  Windows: times (directories too) and attributes (read-only, hidden,
+  system, archive), the read-only one after the times. Symlinks are not
+  made on Windows yet (warning, exit 1).
+- Windows: ReplaceFile used MoveFileEx's ANSI version, so a Unicode name
+  could not be renamed into place (in `x`, and in `c`/`d` too); now
+  MoveFileExW.
+- silesia (212 MB, tmpfs, CPUs 20-23): `x` 0.90 s with 1 thread, 0.46 s
+  with 4; `d` of the tar's stream 0.35 / 0.31 s. The difference is the
+  BLAKE2s check of every fragment, which `d` (CRC-32 only) does not do.
+- tests/arctest.sh compares the extracted tree with the original
+  (contents, types, permissions, mtime in ns, link targets) after `x`,
+  `x -t 4` of an `-ec` archive, `x -` from stdin, and `x -f`; Windows 10
+  checked by hand (x86-64 and 32-bit: contents, times, attributes,
+  Unicode names, `-f` over read-only files).
 
 ## Archiver stage 4: syc a (one version), l, i, t (2026-10-24)
 

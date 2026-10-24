@@ -256,7 +256,8 @@ end;
 function ReplaceFile(const src, dst: string): Boolean;
 begin
 {$ifdef windows}
-  Result := MoveFileEx(PChar(src), PChar(dst), MOVEFILE_REPLACE_EXISTING);
+  Result := MoveFileExW(PWideChar(UnicodeString(src)), PWideChar(UnicodeString(dst)),
+    MOVEFILE_REPLACE_EXISTING);
 {$else}
   Result := RenameFile(src, dst);
 {$endif}

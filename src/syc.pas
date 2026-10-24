@@ -1,6 +1,6 @@
 { syc — the command line: parses it (syccli) and runs the command.
 
-    syc a / l / i     archives (sycarc)
+    syc a / x / l / i archives (sycarc)
     syc c / d / t     one file or stdin as a .sylz stream (sycstream); t
                       checks archives too }
 program syc;
@@ -26,7 +26,7 @@ begin
 {$endif}
   try
     ParseCommandLine(opts);
-    if opts.cmd in ['a', 'l', 'i'] then
+    if opts.cmd in ['a', 'x', 'l', 'i'] then
       ExitCode := RunArchiveCommand(opts)
     else
       ExitCode := RunStreamCommand(opts);

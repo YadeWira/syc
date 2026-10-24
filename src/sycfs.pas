@@ -58,6 +58,20 @@ function GlobMatch(const pattern, path: string): Boolean;
 { bytewise comparison, the archive's order of paths }
 function ComparePaths(const a, b: string): Integer;
 
+{ path exists (as anything, a dangling symlink included) }
+function PathExists(const path: string): Boolean;
+{ path is a symlink (or on Windows a reparse point) }
+function IsLink(const path: string): Boolean;
+{ Sets what m holds on path: the times; the permissions or attributes
+  unless noPerms; the owner when root and not noOwner. A symlink gets its
+  time and owner, never permissions. False when something could not be
+  set. }
+function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean): Boolean;
+{ creates symlink path -> target; False when it cannot (Windows: not yet) }
+function MakeSymlink(const target, path: string): Boolean;
+{ removes a file or a symlink (not a directory) }
+function RemoveFile(const path: string): Boolean;
+
 implementation
 
 function ComparePaths(const a, b: string): Integer;
@@ -81,6 +95,68 @@ begin
 end;
 
 {$ifdef unix}
+
+type
+  TTimeSpec = record
+    sec, nsec: PtrInt;   { time_t and long on the Linux targets syc builds }
+  end;
+
+const
+  AT_FDCWD = -100;
+  AT_SYMLINK_NOFOLLOW = $100;
+
+function utimensat(dirfd: LongInt; path: PChar; times: Pointer; flags: LongInt): LongInt;
+  cdecl; external 'c' name 'utimensat';
+function lchown(path: PChar; owner, group: UInt32): LongInt;
+  cdecl; external 'c' name 'lchown';
+
+function PathExists(const path: string): Boolean;
+var
+  st: Stat;
+begin
+  Result := fpLStat(path, st) = 0;
+end;
+
+function IsLink(const path: string): Boolean;
+var
+  st: Stat;
+begin
+  Result := (fpLStat(path, st) = 0) and fpS_ISLNK(st.st_mode);
+end;
+
+function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean): Boolean;
+var
+  ts: array[0..1] of TTimeSpec;
+begin
+  Result := True;
+  if (m.attrKind = AK_UNIX) and not noOwner and (fpGetEUid = 0) then
+    if lchown(PChar(path), m.uid, m.gid) <> 0 then
+      Result := False;
+  { after chown, which may clear the setuid bits }
+  if (m.attrKind = AK_UNIX) and not noPerms and (m.kind <> ET_SYMLINK) then
+    if fpChmod(path, m.attrs and $FFF) <> 0 then
+      Result := False;
+  ts[0].sec := m.mtime div 1000000000;   { atime: the same }
+  ts[0].nsec := m.mtime mod 1000000000;
+  if ts[0].nsec < 0 then
+  begin
+    Inc(ts[0].nsec, 1000000000);
+    Dec(ts[0].sec);
+  end;
+  ts[1] := ts[0];
+  if utimensat(AT_FDCWD, PChar(path), @ts, AT_SYMLINK_NOFOLLOW) <> 0 then
+    Result := False;
+end;
+
+function MakeSymlink(const target, path: string): Boolean;
+begin
+  Result := fpSymlink(PChar(target), PChar(path)) = 0;
+end;
+
+function RemoveFile(const path: string): Boolean;
+begin
+  Result := fpUnlink(path) = 0;
+end;
 
 function GetMeta(const path: string; out m: TMeta): Boolean;
 var
@@ -143,6 +219,83 @@ end;
 function FileTimeToNs(const ft: TFileTime): Int64;
 begin
   Result := (Int64(ft.dwHighDateTime) shl 32 or ft.dwLowDateTime - 116444736000000000) * 100;
+end;
+
+function NsToFileTime(ns: Int64): TFileTime;
+var
+  v: Int64;
+begin
+  v := ns div 100 + 116444736000000000;
+  Result.dwLowDateTime := DWORD(v);
+  Result.dwHighDateTime := DWORD(v shr 32);
+end;
+
+function PathExists(const path: string): Boolean;
+begin
+  Result := GetFileAttributesW(PWideChar(UnicodeString(path))) <> INVALID_FILE_ATTRIBUTES;
+end;
+
+function IsLink(const path: string): Boolean;
+var
+  a: DWORD;
+begin
+  a := GetFileAttributesW(PWideChar(UnicodeString(path)));
+  Result := (a <> INVALID_FILE_ATTRIBUTES) and (a and FILE_ATTRIBUTE_REPARSE_POINT <> 0);
+end;
+
+function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean): Boolean;
+var
+  w: UnicodeString;
+  h: THandle;
+  ft: TFileTime;
+  flags: DWORD;
+begin
+  Result := True;
+  w := UnicodeString(path);
+  { a read-only file refuses new times: attributes go last }
+  SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_NORMAL);
+  flags := FILE_ATTRIBUTE_NORMAL;
+  if m.kind = ET_DIR then
+    flags := FILE_FLAG_BACKUP_SEMANTICS;   { opens a directory }
+  h := CreateFileW(PWideChar(w), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ or FILE_SHARE_WRITE,
+    nil, OPEN_EXISTING, flags, 0);
+  if h = INVALID_HANDLE_VALUE then
+    Result := False
+  else
+  begin
+    ft := NsToFileTime(m.mtime);
+    if not SetFileTime(h, nil, nil, @ft) then
+      Result := False;
+    CloseHandle(h);
+  end;
+  if (m.attrKind = AK_WINDOWS) and not noPerms then
+  begin
+    if m.kind = ET_DIR then
+      flags := m.attrs or FILE_ATTRIBUTE_DIRECTORY
+    else
+      flags := m.attrs;
+    if flags = 0 then
+      flags := FILE_ATTRIBUTE_NORMAL;
+    if not SetFileAttributesW(PWideChar(w), flags) then
+      Result := False;
+  end
+  else if (m.attrKind = AK_UNIX) and not noPerms and (m.attrs and $92 = 0) and (m.kind = ET_FILE) then
+    { no write permission for anyone: read-only }
+    SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_READONLY);
+end;
+
+function MakeSymlink(const target, path: string): Boolean;
+begin
+  Result := False;
+end;
+
+function RemoveFile(const path: string): Boolean;
+var
+  w: UnicodeString;
+begin
+  w := UnicodeString(path);
+  SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_NORMAL);
+  Result := DeleteFileW(PWideChar(w));
 end;
 
 function GetMeta(const path: string; out m: TMeta): Boolean;

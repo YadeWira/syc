@@ -1,7 +1,9 @@
 #!/bin/sh
-# arctest — the archiver end to end: syc a, l, i, t on a tree, the same
-# archive whatever the threads, refusals and exit codes, and damage: every
-# byte flip found by syc t (exit 3), truncations and trailing junk.
+# arctest — the archiver end to end: syc a, x, l, i, t on a tree, the same
+# archive whatever the threads, the tree back exactly (contents, types,
+# permissions, times to the ns, symlinks), overwrite rules, refusals and
+# exit codes, and damage: every byte flip found by syc t (exit 3),
+# truncations and trailing junk.
 # Usage: tests/arctest.sh SAMPLES-DIR WORK-DIR   (WORK-DIR: new or empty;
 #        SAMPLES-DIR is copied, never written)
 set -e
@@ -29,6 +31,35 @@ cp "$first" tree/copy
 : > tree/empty
 mkdir tree/emptydir
 ln -s copy tree/link
+chmod 600 tree/copy
+chmod 700 tree/emptydir
+touch -d '2001-02-03 04:05:06.123456789' tree/copy
+
+# the same tree: types, contents, permissions, mtime (ns), link targets
+treecmp() {
+  python3 - "$1" "$2" <<'PY'
+import os, stat, sys
+def walk(root):
+    out = {}
+    for dp, dns, fns in os.walk(root):
+        for n in dns + fns:
+            p = os.path.join(dp, n)
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                v = ('link', os.readlink(p), st.st_mtime_ns)
+            elif stat.S_ISDIR(st.st_mode):
+                v = ('dir', stat.S_IMODE(st.st_mode), st.st_mtime_ns)
+            else:
+                v = ('file', stat.S_IMODE(st.st_mode), st.st_mtime_ns, open(p, 'rb').read())
+            out[os.path.relpath(p, root)] = v
+    return out
+a, b = walk(sys.argv[1]), walk(sys.argv[2])
+bad = [k for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)]
+for k in bad[:10]:
+    print('FAIL: differs after extraction:', k)
+sys.exit(1 if bad else 0)
+PY
+}
 
 # version time (bytes 16..23) masked: the rest must match
 masked() { python3 -c "import sys;d=bytearray(open(sys.argv[1],'rb').read());d[16:24]=bytes(8);sys.stdout.buffer.write(d)" "$1"; }
@@ -49,6 +80,29 @@ check "l -l filter" 0 "$SYC" l -l t1.syc tree/copy
 check "l no match" 1 "$SYC" l t1.syc nothing/here
 check "i" 0 "$SYC" i t1.syc
 check "i from stdin" 0 sh -c "'$SYC' i - < t1.syc"
+
+# extraction
+rm -rf o1 o4 os of ev
+check "x" 0 "$SYC" x -q -o o1 t1.syc
+treecmp tree o1/tree || fail=1
+check "x -t 4 (-ec archive)" 0 "$SYC" x -q -t 4 -o o4 te.syc
+treecmp tree o4/tree || fail=1
+check "x from stdin" 0 sh -c "'$SYC' x -q -o os - < ts.syc"
+treecmp tree os/tree || fail=1
+check "x over existing files" 1 "$SYC" x -q -o o1 t1.syc
+check "x --skip" 0 "$SYC" x -q --skip -o o1 t1.syc
+check "x -f" 0 "$SYC" x -q -f -o o1 t1.syc
+treecmp tree o1/tree || fail=1
+check "x -O one file" 0 sh -c "'$SYC' x -O t1.syc tree/copy > copy.out"
+cmp -s copy.out tree/copy || { echo "FAIL: x -O"; fail=1; }
+check "x -O several" 2 "$SYC" x -O t1.syc tree
+check "x filter" 0 "$SYC" x -q -o of t1.syc tree/emptydir tree/copy
+got=$(cd of && find . | sort | tr '\n' ' ')
+[ "$got" = ". ./tree ./tree/copy ./tree/emptydir " ] || { echo "FAIL: x filter extracted: $got"; fail=1; }
+check "x -u 2 of 1 version" 2 "$SYC" x -o ou t1.syc -u 2
+mkdir -p ev/tree
+ln -s /tmp ev/tree/samples
+check "x through a symlinked directory" 1 "$SYC" x -q -o ev t1.syc tree/samples
 
 # refusals
 check "existing archive" 2 "$SYC" a t1.syc tree

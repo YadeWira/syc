@@ -17,7 +17,7 @@ interface
 uses
   SysUtils, Classes, syccli;
 
-{ syc a, l, i; returns the exit code }
+{ syc a, x, l, i; returns the exit code }
 function RunArchiveCommand(const opts: TOptions): Integer;
 { syc t on one archive (a seekable file); returns the exit code. name is
   the one to print. }
@@ -808,6 +808,7 @@ type
     blocks: array of TArcBlock;
     fragSize: array of UInt32;    { [frag - 1] }
     fragOff: array of UInt32;     { offset in its block }
+    fragBlock: array of UInt32;   { its block, in blocks[] }
     damaged: Boolean;             { bytes after the last good commit }
     constructor Open(const path, aName: string);
     destructor Destroy; override;
@@ -815,7 +816,7 @@ type
     function ReadAt(at: Int64; p: Pointer; n: SizeInt): Boolean;
     procedure ScanForward;
     procedure LoadVersion(k: SizeInt);
-    function State: TEntries;
+    function State(upTo: SizeInt): TEntries;
   end;
 
 procedure TArchive.Corrupt(const msg: string);
@@ -1029,6 +1030,7 @@ begin
   nf := Length(v^.idx.frags);
   SetLength(fragSize, firstFrag - 1 + nf);
   SetLength(fragOff, firstFrag - 1 + nf);
+  SetLength(fragBlock, firstFrag - 1 + nf);
   v^.firstBlock := Length(blocks);
   SetLength(blocks, Length(blocks) + Length(v^.idx.blocks));
   p := v^.vstart + VHEAD_SIZE;
@@ -1046,6 +1048,7 @@ begin
     begin
       fragSize[blk^.firstFrag - 1 + j] := v^.idx.frags[f + j].size;
       fragOff[blk^.firstFrag - 1 + j] := blockRaw;
+      fragBlock[blk^.firstFrag - 1 + j] := v^.firstBlock + i;
       Inc(blockRaw, v^.idx.frags[f + j].size);
     end;
     if blockRaw > MAX_BLOCK then
@@ -1071,13 +1074,57 @@ begin
   end;
 end;
 
-function TArchive.State: TEntries;
+function TArchive.State(upTo: SizeInt): TEntries;
 var
   i: SizeInt;
 begin
   Result := nil;
-  for i := 0 to High(versions) do
+  for i := 0 to upTo - 1 do
     Result := ApplyVersion(Result, versions[i].idx.entries);
+end;
+
+{ -u: how many versions make the state asked for (all without it) }
+function VersionsUntil(a: TArchive; const spec: string): SizeInt;
+var
+  n, y, mo, d, h, mi, sec: Integer;
+  t: Int64;
+  ok: Boolean;
+begin
+  Result := Length(a.versions);
+  if spec = '' then
+    Exit;
+  if TryStrToInt(spec, n) then
+  begin
+    if (n < 1) or (n > Length(a.versions)) then
+      Fail(EXIT_USAGE, Format('%s has versions 1..%d, not %s', [a.name, Length(a.versions), spec]));
+    Exit(n);
+  end;
+  { YYYY-MM-DD[THH:MM[:SS]], local time }
+  h := 23;
+  mi := 59;
+  sec := 59;
+  ok := (Length(spec) in [10, 16, 19]) and (spec[5] = '-') and (spec[8] = '-')
+    and TryStrToInt(Copy(spec, 1, 4), y) and TryStrToInt(Copy(spec, 6, 2), mo)
+    and TryStrToInt(Copy(spec, 9, 2), d);
+  if ok and (Length(spec) >= 16) then
+    ok := (spec[11] in ['T', ' ']) and (spec[14] = ':') and TryStrToInt(Copy(spec, 12, 2), h)
+      and TryStrToInt(Copy(spec, 15, 2), mi);
+  if ok and (Length(spec) = 16) then
+    sec := 59;
+  if ok and (Length(spec) = 19) then
+    ok := (spec[17] = ':') and TryStrToInt(Copy(spec, 18, 2), sec);
+  ok := ok and (mo in [1..12]) and (d in [1..31]) and (h in [0..23]) and (mi in [0..59])
+    and (sec in [0..59]);
+  if not ok then
+    Fail(EXIT_USAGE, '-u takes a version number or a date YYYY-MM-DD[THH:MM[:SS]], not "' + spec + '"');
+  t := Round((EncodeDate(y, mo, d) + EncodeTime(h, mi, sec, 0) - UnixDateDelta) * 86400)
+    + Int64(GetLocalTimeOffset) * 60;
+  Result := 0;
+  while (Result < Length(a.versions)) and (a.versions[Result].time <= t) do
+    Inc(Result);
+  if Result = 0 then
+    Fail(EXIT_USAGE, Format('%s: no version as of %s (the first is from %s)',
+      [a.name, spec, FormatTime(a.versions[0].time, True)]));
 end;
 
 { opens ARCHIVE, from stdin through a temporary copy }
@@ -1176,7 +1223,7 @@ begin
   a := OpenArchive(opts.operands[0], tmp);
   try
     WarnDamaged(a, Result);
-    st := a.State;
+    st := a.State(VersionsUntil(a, opts.untilSpec));
     shown := 0;
     for i := 0 to High(st) do
     begin
@@ -1246,7 +1293,7 @@ begin
         WriteLn(Format('%7d  %s  %6d %6d %6d %8d %15d %15d %15d',
           [vnum, FormatTime(time, True), files, dirs, links, deleted, added, newData, stored]));
       end;
-    st := a.State;
+    st := a.State(Length(a.versions));
     totalFiles := 0;
     totalSize := 0;
     for i := 0 to High(st) do
@@ -1381,10 +1428,368 @@ begin
   end;
 end;
 
+{ ── syc x ──────────────────────────────────────────────────────────────── }
+
+type
+  TAction = (acSkip, acWrite, acReplace);
+
+  { where a file goes that cannot be created: its blocks are still read
+    in their turn }
+  TDiscard = class(TStream)
+    function Write(const Buffer; Count: LongInt): LongInt; override;
+  end;
+
+  { Files are written in path order. The blocks they need, in that order
+    (a block needed again later is decoded again: memory stays at 2N
+    blocks), are decoded ahead by the pipeline, each fragment's hash
+    checked on the thread that decoded it. }
+  TExtractor = class
+    opts: TOptions;
+    a: TArchive;
+    status: Integer;
+    outDir: string;
+    pipe: TPipeline;
+    hc: THashCheck;
+    access: array of SizeInt;     { block numbers, in the order used }
+    nAccess, cur: SizeInt;
+    nFiles, nDirs, nLinks, bytesOut: Int64;
+    procedure StartAccess(k: SizeInt);
+    function JobFor(blk: SizeInt): TJob;
+    procedure WriteFile(const e: TEntry; s: TStream);
+    function SafeParents(const stored: string): Boolean;
+  end;
+
+function TDiscard.Write(const Buffer; Count: LongInt): LongInt;
+begin
+  Result := Count;
+end;
+
+procedure TExtractor.StartAccess(k: SizeInt);
+var
+  w: array[0..BLOCKHDR_SIZE - 1] of Byte;
+  rawLen, packedField, payLen: UInt32;
+  job: TJob;
+  blk: ^TArcBlock;
+begin
+  if k >= nAccess then
+    Exit;
+  blk := @a.blocks[access[k]];
+  if not a.ReadAt(blk^.pos, @w, BLOCKHDR_SIZE) then
+    a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
+  rawLen := LEtoN(PUInt32(@w[0])^);
+  packedField := LEtoN(PUInt32(@w[4])^);
+  payLen := packedField and $7FFFFFFF;
+  if (Int64(rawLen) <> blk^.rawLen) or (BLOCKHDR_SIZE + Int64(payLen) <> blk^.bytes)
+     or ((packedField and $80000000 <> 0) and (payLen <> rawLen)) then
+    a.Corrupt(Format('the block at offset %d does not match the index', [blk^.pos]));
+  job := pipe.jobs[k mod pipe.Slots];
+  job.Reserve(rawLen, payLen);
+  if not a.ReadAt(blk^.pos + BLOCKHDR_SIZE, job.payload, payLen) then
+    a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
+  job.n := rawLen;
+  job.payLen := payLen;
+  job.stored := packedField and $80000000 <> 0;
+  job.sum := LEtoN(PUInt32(@w[8])^);
+  job.tag := access[k];
+  pipe.Start(k mod pipe.Slots);
+end;
+
+{ the decoded block blk: the next access, by construction }
+function TExtractor.JobFor(blk: SizeInt): TJob;
+var
+  s: SizeInt;
+begin
+  if (cur < 0) or (access[cur] <> blk) then
+  begin
+    Inc(cur);
+    if (cur >= nAccess) or (access[cur] <> blk) then
+      Fail(EXIT_FATAL, 'internal error: blocks out of order');
+    { the previous access's slot is free: the next block ahead goes in }
+    if cur > 0 then
+      StartAccess(cur - 1 + pipe.Slots);
+    s := cur mod pipe.Slots;
+    pipe.Finish(s);
+    if not pipe.jobs[s].ok then
+      a.Corrupt(Format('the block at offset %d: corrupt data or checksum mismatch',
+        [a.blocks[blk].pos]));
+    if pipe.jobs[s].failed <> 0 then
+      a.Corrupt(Format('fragment %d (block at offset %d): hash mismatch',
+        [pipe.jobs[s].failed, a.blocks[blk].pos]));
+  end;
+  Result := pipe.jobs[cur mod pipe.Slots];
+end;
+
+procedure TExtractor.WriteFile(const e: TEntry; s: TStream);
+var
+  i: SizeInt;
+  f: SizeInt;
+  job: TJob;
+begin
+  for i := 0 to High(e.refs) do
+  begin
+    f := e.refs[i] - 1;
+    job := JobFor(a.fragBlock[f]);
+    s.WriteBuffer(job.raw[a.fragOff[f]], a.fragSize[f]);
+  end;
+  Inc(bytesOut, e.meta.size);
+end;
+
+{ no directory on the way to stored is a symlink: writing through one
+  could leave the output directory }
+function TExtractor.SafeParents(const stored: string): Boolean;
+var
+  k: Integer;
+begin
+  for k := 1 to Length(stored) do
+    if (stored[k] = '/') and IsLink(LocalPath(outDir, Copy(stored, 1, k - 1))) then
+      Exit(False);
+  Result := True;
+end;
+
+function ExtractCommand(const opts: TOptions): Integer;
+var
+  x: TExtractor;
+  tmp, local, part: string;
+  st, sel: TEntries;
+  act: array of TAction;
+  filters: array of string;
+  i, n, k, b, last: SizeInt;
+  fout: TStream;
+  exists: Boolean;
+begin
+  x := TExtractor.Create;
+  x.opts := opts;
+  x.status := EXIT_OK;
+  x.outDir := opts.outPath;
+  SetLength(filters, Length(opts.operands) - 1);
+  for i := 1 to High(opts.operands) do
+    filters[i - 1] := StoredPath(opts.operands[i]);
+  x.a := OpenArchive(opts.operands[0], tmp);
+  try
+    WarnDamaged(x.a, x.status);
+    st := x.a.State(VersionsUntil(x.a, opts.untilSpec));
+    n := 0;
+    SetLength(sel, Length(st));
+    for i := 0 to High(st) do
+      if Selected(filters, st[i].path) and not Excluded(opts.excludes, st[i].path) then
+      begin
+        sel[n] := st[i];
+        Inc(n);
+      end;
+    SetLength(sel, n);
+    if (Length(filters) > 0) and (n = 0) then
+    begin
+      WriteLn(StdErr, 'syc: nothing matches');
+      Exit(Max(x.status, EXIT_WARN));
+    end;
+
+    { what happens to each: decided before any block is read, since the
+      blocks are decoded in the order the written files need them }
+    SetLength(act, n);
+    if opts.toStdout then
+    begin
+      k := -1;
+      for i := 0 to n - 1 do
+        if sel[i].kind = ET_FILE then
+          if k < 0 then
+            k := i
+          else
+            Fail(EXIT_USAGE, '-O writes one file, and the filters select more');
+      if k < 0 then
+        Fail(EXIT_USAGE, '-O writes one file, and the filters select none');
+      for i := 0 to n - 1 do
+        act[i] := acSkip;
+      act[k] := acWrite;
+    end
+    else
+      for i := 0 to n - 1 do
+      begin
+        act[i] := acWrite;
+        local := LocalPath(x.outDir, sel[i].path);
+        if not x.SafeParents(sel[i].path) then
+        begin
+          WriteLn(StdErr, 'syc: ', local, ': a directory on the way is a symlink, skipped');
+          x.status := Max(x.status, EXIT_WARN);
+          act[i] := acSkip;
+          Continue;
+        end;
+        if sel[i].kind = ET_DIR then
+          Continue;   { an existing directory is merged into }
+        exists := PathExists(local);
+        if not exists then
+          Continue;
+        if DirectoryExists(local) and not IsLink(local) then
+        begin
+          WriteLn(StdErr, 'syc: ', local, ': a directory is in the way, skipped');
+          x.status := Max(x.status, EXIT_WARN);
+          act[i] := acSkip;
+        end
+        else if opts.force then
+          act[i] := acReplace
+        else
+        begin
+          act[i] := acSkip;
+          if not opts.skipExisting then
+          begin
+            WriteLn(StdErr, 'syc: ', local, ' exists, skipped (-f replaces, --skip is silent)');
+            x.status := Max(x.status, EXIT_WARN);
+          end;
+        end;
+      end;
+
+    { the blocks, in the order the files to write need them }
+    last := -1;
+    for i := 0 to n - 1 do
+      if (act[i] <> acSkip) and (sel[i].kind = ET_FILE) then
+        for k := 0 to High(sel[i].refs) do
+        begin
+          b := x.a.fragBlock[sel[i].refs[k] - 1];
+          if b <> last then
+          begin
+            if x.nAccess = Length(x.access) then
+              SetLength(x.access, Max(64, 2 * x.nAccess));
+            x.access[x.nAccess] := b;
+            Inc(x.nAccess);
+            last := b;
+          end;
+        end;
+    x.hc := THashCheck.Create;
+    x.hc.a := x.a;
+    x.pipe := TPipeline.Create(opts.threads, True, 0, 0);
+    x.pipe.SetPost(@x.hc.Check);
+    x.cur := -1;
+    for k := 0 to x.pipe.Slots - 1 do
+      x.StartAccess(k);
+
+    if opts.toStdout then
+    begin
+      fout := StdStream(1);
+      try
+        for i := 0 to n - 1 do
+          if act[i] = acWrite then
+            x.WriteFile(sel[i], fout);
+      finally
+        fout.Free;
+      end;
+    end
+    else
+    begin
+      { files and directories; symlinks once nothing more is written }
+      for i := 0 to n - 1 do
+      begin
+        if act[i] = acSkip then
+          Continue;
+        local := LocalPath(x.outDir, sel[i].path);
+        case sel[i].kind of
+          ET_DIR:
+            begin
+              if not ForceDirectories(local) then
+              begin
+                WriteLn(StdErr, 'syc: ', local, ': cannot create the directory');
+                x.status := Max(x.status, EXIT_WARN);
+              end;
+              Inc(x.nDirs);
+            end;
+          ET_FILE:
+            begin
+              part := ExtractFileDir(local);
+              if (part <> '') and not ForceDirectories(part) then
+              begin
+                WriteLn(StdErr, 'syc: ', part, ': cannot create the directory');
+                Fail(EXIT_FATAL, 'cannot go on: the files under it would be out of order');
+              end;
+              try
+                fout := TFileStream.Create(local + TMP_SUFFIX, fmCreate);
+              except
+                on EFCreateError do
+                begin
+                  WriteLn(StdErr, 'syc: ', local, ': cannot create, skipped');
+                  x.status := Max(x.status, EXIT_WARN);
+                  fout := TDiscard.Create;
+                  try
+                    x.WriteFile(sel[i], fout);
+                  finally
+                    fout.Free;
+                  end;
+                  Continue;
+                end;
+              end;
+              try
+                x.WriteFile(sel[i], fout);
+              except
+                fout.Free;
+                fout := nil;
+                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                raise;
+              end;
+              fout.Free;
+              if (act[i] = acReplace) and not RemoveFile(local) then
+              begin
+                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                WriteLn(StdErr, 'syc: ', local, ': cannot replace it');
+                x.status := Max(x.status, EXIT_WARN);
+                Continue;
+              end;
+              if not ReplaceFile(local + TMP_SUFFIX, local) then
+              begin
+                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                WriteLn(StdErr, 'syc: ', local, ': cannot create it (from ', local + TMP_SUFFIX, ')');
+                x.status := Max(x.status, EXIT_WARN);
+                Continue;
+              end;
+              if not ApplyMeta(local, sel[i].meta, opts.noPerms, opts.noOwner) then
+                Note(opts, local + ': some metadata could not be set');
+              Note(opts, local);
+              Inc(x.nFiles);
+            end;
+        end;
+      end;
+      for i := 0 to n - 1 do
+        if (act[i] <> acSkip) and (sel[i].kind = ET_SYMLINK) then
+        begin
+          local := LocalPath(x.outDir, sel[i].path);
+          part := ExtractFileDir(local);
+          if part <> '' then
+            ForceDirectories(part);
+          if (act[i] = acReplace) and not RemoveFile(local) then
+          begin
+            WriteLn(StdErr, 'syc: ', local, ': cannot replace it');
+            x.status := Max(x.status, EXIT_WARN);
+            Continue;
+          end;
+          if not MakeSymlink(sel[i].meta.target, local) then
+          begin
+            WriteLn(StdErr, 'syc: ', local, ': cannot create the symlink');
+            x.status := Max(x.status, EXIT_WARN);
+            Continue;
+          end;
+          ApplyMeta(local, sel[i].meta, opts.noPerms, opts.noOwner);
+          Inc(x.nLinks);
+        end;
+      { directories last, deepest first: writing in them changed their times }
+      for i := n - 1 downto 0 do
+        if (act[i] <> acSkip) and (sel[i].kind = ET_DIR) then
+          ApplyMeta(LocalPath(x.outDir, sel[i].path), sel[i].meta, opts.noPerms, opts.noOwner);
+      if opts.verbosity <> vQuiet then
+        WriteLn(StdErr, Format('%s: %d files, %d directories, %d links extracted (%d bytes)',
+          [x.a.name, x.nFiles, x.nDirs, x.nLinks, x.bytesOut]));
+    end;
+    Result := x.status;
+  finally
+    x.pipe.Free;
+    x.hc.Free;
+    x.a.Free;
+    x.Free;
+    if tmp <> '' then
+      SysUtils.DeleteFile(tmp);
+  end;
+end;
+
 function RunArchiveCommand(const opts: TOptions): Integer;
 begin
   case opts.cmd of
     'a': Result := AddCommand(opts);
+    'x': Result := ExtractCommand(opts);
     'l': Result := ListCommand(opts);
     'i': Result := InfoCommand(opts);
   else
