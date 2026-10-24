@@ -32,8 +32,21 @@ function CdcCut(const prm: TCdcParams; p: PByte; n: SizeInt): SizeInt;
 var
   { gear[b]: the hash's 64-bit value for byte b }
   gear: array[0..255] of UInt64;
+  { the C loop (when built in); False: the Pascal one }
+  CdcUseC: Boolean = {$ifdef SYLZ_PUREPASCAL}False{$else}True{$endif};
+
+{ the Pascal loop, the reference: CdcCut is it or its C copy }
+function CdcCutPas(const prm: TCdcParams; p: PByte; n: SizeInt): SizeInt;
 
 implementation
+
+{$ifndef SYLZ_PUREPASCAL}
+uses
+  sylz;   { links sylzc.o }
+
+function sylzc_cdc_cut(p: PByte; n, minSize, avgSize, maxSize: SizeInt;
+  strictShift, looseShift: LongInt; g: PUInt64): SizeInt; cdecl; external name 'sylzc_cdc_cut';
+{$endif}
 
 function CdcParams(minLog, avgLog, maxLog: Integer): TCdcParams;
 begin
@@ -48,6 +61,16 @@ end;
   avgSize a cut needs avgLog + 2 zero bits at the top of the hash, then
   avgLog - 2. }
 function CdcCut(const prm: TCdcParams; p: PByte; n: SizeInt): SizeInt;
+begin
+{$ifndef SYLZ_PUREPASCAL}
+  if CdcUseC then
+    Exit(sylzc_cdc_cut(p, n, prm.minSize, prm.avgSize, prm.maxSize, prm.strictShift,
+      prm.looseShift, @gear[0]));
+{$endif}
+  Result := CdcCutPas(prm, p, n);
+end;
+
+function CdcCutPas(const prm: TCdcParams; p: PByte; n: SizeInt): SizeInt;
 var
   h: UInt64;
   i, lim, e1: SizeInt;

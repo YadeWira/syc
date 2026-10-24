@@ -1033,6 +1033,35 @@ uint32_t sylzc_crc32(uint32_t crc, const uint8_t *p, intptr_t n, const uint32_t 
     return ~crc;
 }
 
+/* ── the archive's fragment cutter (syccdc.pas) ───────────────────────── */
+
+/* CdcCut in syccdc.pas, the reference: the length of the fragment at p
+   with n > 0 bytes left. FPC's loop ran at ~450-900 MB/s. */
+intptr_t sylzc_cdc_cut(const uint8_t *p, intptr_t n, intptr_t minSize, intptr_t avgSize,
+                       intptr_t maxSize, int strictShift, int looseShift, const uint64_t *gear)
+{
+    uint64_t h = 0;
+    intptr_t i, lim, e1;
+    if (n <= minSize)
+        return n;
+    lim = n < maxSize ? n : maxSize;
+    e1 = avgSize - 1 < lim ? avgSize - 1 : lim;
+    i = minSize;
+    while (i < e1) {
+        h = (h << 1) + gear[p[i]];
+        i++;
+        if ((h >> strictShift) == 0)
+            return i;
+    }
+    while (i < lim) {
+        h = (h << 1) + gear[p[i]];
+        i++;
+        if ((h >> looseShift) == 0)
+            return i;
+    }
+    return lim;
+}
+
 /* ── BLAKE2s (blake2s.pas): the archive's fragment hash ─────────────────── */
 
 /* Compress in blake2s.pas: FPC's code for it ran at ~160 MB/s. n blocks of
@@ -1098,6 +1127,202 @@ void sylzc_blake2s_blocks(uint32_t *h, const uint8_t *p, intptr_t n, uint64_t *t
             h[i] ^= v[i] ^ v[i + 8];
     }
 }
+
+
+/* Many messages at once, four lanes: lane k of every vector is a message
+   of its own. A lane whose message ends takes the next one, so lanes stay
+   busy whatever the lengths; the last message or two finish on the
+   scalar code. GCC's vector extensions: SSE2 on x86, NEON on arm64. The
+   reference is hashing each message on its own (Blake2sMany in
+   blake2s.pas); tests/sycdedup compares them. */
+typedef uint32_t b2s_v4 __attribute__((vector_size(16)));
+
+#define B2S_VROR(x, c) (((x) >> (c)) | ((x) << (32 - (c))))
+#define B2S_VG(a, b, c, d, x, y)                                    \
+    do {                                                            \
+        a += b + (x); d = B2S_VROR(d ^ a, 16);                      \
+        c += d;       b = B2S_VROR(b ^ c, 12);                      \
+        a += b + (y); d = B2S_VROR(d ^ a, 8);                       \
+        c += d;       b = B2S_VROR(b ^ c, 7);                       \
+    } while (0)
+
+static __attribute__((unused)) uint32_t b2s_load32(const uint8_t *p)
+{
+    return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* h after its blocks, then the last (partial or empty) block: the digest */
+static void b2s_finish(uint32_t *h, uint64_t t, const uint8_t *p, intptr_t left, uint8_t *out)
+{
+    uint8_t last[64];
+    intptr_t i, full = left > 0 ? (left - 1) / 64 : 0;
+    sylzc_blake2s_blocks(h, p, full, &t, 0);
+    p += 64 * full;
+    left -= 64 * full;
+    for (i = 0; i < 64; i++)
+        last[i] = i < left ? p[i] : 0;
+    t = t + left - 64;   /* the final block counts its bytes only */
+    sylzc_blake2s_blocks(h, last, 1, &t, 1);
+    for (i = 0; i < 8; i++) {
+        out[4 * i] = (uint8_t)h[i];
+        out[4 * i + 1] = (uint8_t)(h[i] >> 8);
+        out[4 * i + 2] = (uint8_t)(h[i] >> 16);
+        out[4 * i + 3] = (uint8_t)(h[i] >> 24);
+    }
+}
+
+#define B2S_LANES 4
+
+static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
+                          uint8_t *out)
+{
+    static const uint8_t zero[64];
+    b2s_v4 h[8];
+    const uint8_t *p[B2S_LANES];
+    intptr_t left[B2S_LANES], which[B2S_LANES], next = 0;
+    uint64_t t[B2S_LANES];
+    uint8_t pad[B2S_LANES][64];
+    int l, i, active = 0;
+
+    for (l = 0; l < B2S_LANES; l++)
+        which[l] = -1;
+    for (;;) {
+        const uint8_t *blk[B2S_LANES];
+        b2s_v4 m[16], v[16], tlo, thi, fin;
+        int last[B2S_LANES];
+
+        /* idle lanes take the next messages */
+        for (l = 0; l < B2S_LANES; l++)
+            if (which[l] < 0 && next < count) {
+                which[l] = next;
+                p[l] = msg[next];
+                left[l] = len[next];
+                t[l] = 0;
+                for (i = 0; i < 8; i++)
+                    h[i][l] = b2s_iv[i];
+                h[0][l] ^= 0x01010000u ^ 32;
+                next++;
+                active++;
+            }
+        if (active < 2)
+            break;
+        for (l = 0; l < B2S_LANES; l++) {
+            last[l] = 0;
+            if (which[l] < 0)
+                blk[l] = zero;
+            else if (left[l] > 64) {
+                blk[l] = p[l];
+                t[l] += 64;
+            } else {
+                for (i = 0; i < 64; i++)
+                    pad[l][i] = i < left[l] ? p[l][i] : 0;
+                blk[l] = pad[l];
+                t[l] += left[l];
+                last[l] = 1;
+            }
+        }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        /* four words of each lane, then a 4x4 transpose: word i of every
+           lane in m[i] */
+        for (i = 0; i < 16; i += 4) {
+            typedef b2s_v4 b2s_v4u __attribute__((aligned(1), may_alias));
+            const b2s_v4 r0 = *(const b2s_v4u *)(blk[0] + 4 * i);
+            const b2s_v4 r1 = *(const b2s_v4u *)(blk[1] + 4 * i);
+            const b2s_v4 r2 = *(const b2s_v4u *)(blk[2] + 4 * i);
+            const b2s_v4 r3 = *(const b2s_v4u *)(blk[3] + 4 * i);
+            const b2s_v4 t0 = __builtin_shuffle(r0, r1, (b2s_v4){ 0, 4, 1, 5 });
+            const b2s_v4 t1 = __builtin_shuffle(r2, r3, (b2s_v4){ 0, 4, 1, 5 });
+            const b2s_v4 t2 = __builtin_shuffle(r0, r1, (b2s_v4){ 2, 6, 3, 7 });
+            const b2s_v4 t3 = __builtin_shuffle(r2, r3, (b2s_v4){ 2, 6, 3, 7 });
+            m[i] = __builtin_shuffle(t0, t1, (b2s_v4){ 0, 1, 4, 5 });
+            m[i + 1] = __builtin_shuffle(t0, t1, (b2s_v4){ 2, 3, 6, 7 });
+            m[i + 2] = __builtin_shuffle(t2, t3, (b2s_v4){ 0, 1, 4, 5 });
+            m[i + 3] = __builtin_shuffle(t2, t3, (b2s_v4){ 2, 3, 6, 7 });
+        }
+#else
+        for (i = 0; i < 16; i++)
+            m[i] = (b2s_v4){ b2s_load32(blk[0] + 4 * i), b2s_load32(blk[1] + 4 * i),
+                             b2s_load32(blk[2] + 4 * i), b2s_load32(blk[3] + 4 * i) };
+#endif
+        tlo = (b2s_v4){ (uint32_t)t[0], (uint32_t)t[1], (uint32_t)t[2], (uint32_t)t[3] };
+        thi = (b2s_v4){ (uint32_t)(t[0] >> 32), (uint32_t)(t[1] >> 32),
+                        (uint32_t)(t[2] >> 32), (uint32_t)(t[3] >> 32) };
+        fin = (b2s_v4){ last[0] ? ~0u : 0, last[1] ? ~0u : 0, last[2] ? ~0u : 0, last[3] ? ~0u : 0 };
+        for (i = 0; i < 8; i++) {
+            v[i] = h[i];
+            v[i + 8] = (b2s_v4){ b2s_iv[i], b2s_iv[i], b2s_iv[i], b2s_iv[i] };
+        }
+        v[12] ^= tlo;
+        v[13] ^= thi;
+        v[14] ^= fin;
+#define B2S_VROUND(r)                                                                         \
+        B2S_VG(v[0], v[4], v[8],  v[12], m[b2s_sigma[r][0]],  m[b2s_sigma[r][1]]);            \
+        B2S_VG(v[1], v[5], v[9],  v[13], m[b2s_sigma[r][2]],  m[b2s_sigma[r][3]]);            \
+        B2S_VG(v[2], v[6], v[10], v[14], m[b2s_sigma[r][4]],  m[b2s_sigma[r][5]]);            \
+        B2S_VG(v[3], v[7], v[11], v[15], m[b2s_sigma[r][6]],  m[b2s_sigma[r][7]]);            \
+        B2S_VG(v[0], v[5], v[10], v[15], m[b2s_sigma[r][8]],  m[b2s_sigma[r][9]]);            \
+        B2S_VG(v[1], v[6], v[11], v[12], m[b2s_sigma[r][10]], m[b2s_sigma[r][11]]);           \
+        B2S_VG(v[2], v[7], v[8],  v[13], m[b2s_sigma[r][12]], m[b2s_sigma[r][13]]);           \
+        B2S_VG(v[3], v[4], v[9],  v[14], m[b2s_sigma[r][14]], m[b2s_sigma[r][15]]);
+        B2S_VROUND(0) B2S_VROUND(1) B2S_VROUND(2) B2S_VROUND(3) B2S_VROUND(4)
+        B2S_VROUND(5) B2S_VROUND(6) B2S_VROUND(7) B2S_VROUND(8) B2S_VROUND(9)
+#undef B2S_VROUND
+        for (i = 0; i < 8; i++)
+            h[i] ^= v[i] ^ v[i + 8];
+        for (l = 0; l < B2S_LANES; l++) {
+            if (which[l] < 0)
+                continue;
+            if (last[l]) {
+                uint8_t *o = out + 32 * which[l];
+                for (i = 0; i < 8; i++) {
+                    uint32_t w = h[i][l];
+                    o[4 * i] = (uint8_t)w;
+                    o[4 * i + 1] = (uint8_t)(w >> 8);
+                    o[4 * i + 2] = (uint8_t)(w >> 16);
+                    o[4 * i + 3] = (uint8_t)(w >> 24);
+                }
+                which[l] = -1;
+                active--;
+            } else {
+                p[l] += 64;
+                left[l] -= 64;
+            }
+        }
+    }
+    /* a lane still busy (no more messages to share the vectors with) */
+    for (l = 0; l < B2S_LANES; l++)
+        if (which[l] >= 0) {
+            uint32_t hs[8];
+            for (i = 0; i < 8; i++)
+                hs[i] = h[i][l];
+            b2s_finish(hs, t[l], p[l], left[l], out + 32 * which[l]);
+        }
+}
+
+#if defined(__i386__)
+/* 32-bit x86 has 8 vector registers for the 16 vectors of the state: the
+   lanes spill and ran slower than one message at a time (196 MB/s against
+   310, under wine) */
+void sylzc_blake2s_many(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
+                        uint8_t *out)
+{
+    intptr_t k;
+    for (k = 0; k < count; k++) {
+        uint32_t h[8];
+        int i;
+        for (i = 0; i < 8; i++)
+            h[i] = b2s_iv[i];
+        h[0] ^= 0x01010000u ^ 32;
+        b2s_finish(h, 0, msg[k], len[k], out + 32 * k);
+    }
+}
+#else
+void sylzc_blake2s_many(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
+                        uint8_t *out)
+{
+    b2s_many_core(msg, len, count, out);
+}
+#endif
 
 /* ── arm64 Linux: FPC 3.2.2's program startup ─────────────────────────── */
 

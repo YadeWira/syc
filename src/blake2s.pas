@@ -4,7 +4,8 @@
   The block function is C (sylzc_blake2s_blocks in src/sylzc.c, linked
   through the sylz unit) unless SYLZ_PUREPASCAL; the Pascal one below is
   the reference, and tests/sycdedup checks that both agree. Measured on
-  silesia.tar (x86_64): Pascal ~160 MB/s, C (see NOTES.md). }
+  silesia.tar (x86_64): Pascal ~160 MB/s, C (see NOTES.md). Blake2sMany
+  hashes four messages at a time in vector lanes (C). }
 unit blake2s;
 
 {$mode objfpc}{$H+}
@@ -22,6 +23,7 @@ const
 
 type
   TBlake2sDigest = array[0..BLAKE2S_OUTLEN - 1] of Byte;
+  PBlake2sDigest = ^TBlake2sDigest;
 
   TBlake2s = record
     h: array[0..7] of UInt32;
@@ -35,6 +37,9 @@ procedure Blake2sUpdate(var s: TBlake2s; p: PByte; n: SizeInt);
 procedure Blake2sFinal(var s: TBlake2s; out digest: TBlake2sDigest);
 { the hash of p[0..n) in one call }
 procedure Blake2s256(p: PByte; n: SizeInt; out digest: TBlake2sDigest);
+{ the hashes of count messages (msg[k], len[k]) into digests[k]: in C,
+  four at a time in vector lanes; the same as Blake2s256 on each }
+procedure Blake2sMany(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
 
 var
   { the C block function (when built in); False: the Pascal one }
@@ -45,6 +50,8 @@ implementation
 {$ifndef SYLZ_PUREPASCAL}
 procedure sylzc_blake2s_blocks(h: PUInt32; p: PByte; n: SizeInt; t: PUInt64; last: LongInt);
   cdecl; external name 'sylzc_blake2s_blocks';
+procedure sylzc_blake2s_many(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
+  cdecl; external name 'sylzc_blake2s_many';
 {$endif}
 
 const
@@ -219,6 +226,21 @@ begin
   Blake2sInit(s);
   Blake2sUpdate(s, p, n);
   Blake2sFinal(s, digest);
+end;
+
+procedure Blake2sMany(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
+var
+  k: SizeInt;
+begin
+{$ifndef SYLZ_PUREPASCAL}
+  if Blake2sUseC then
+  begin
+    sylzc_blake2s_many(msg, len, count, digests);
+    Exit;
+  end;
+{$endif}
+  for k := 0 to count - 1 do
+    Blake2s256(msg[k], len[k], PBlake2sDigest(digests + k * BLAKE2S_OUTLEN)^);
 end;
 
 end.

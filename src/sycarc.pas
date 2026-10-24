@@ -284,7 +284,24 @@ end;
 
 { ── syc a ──────────────────────────────────────────────────────────────── }
 
+const
+  NUM_BATCHES = 3;
+  BATCH_SIZE = 8 shl 20;
+  HASH_GROUP = 8;   { fragments a hashing task takes: ~110 in a batch }
+
 type
+  { fragments cut from the files, in order, not yet hashed }
+  TBatch = class
+    data: array of Byte;
+    len: SizeInt;
+    frags: array of record
+      off, len, entry: SizeInt;
+    end;
+    hash: array of TBlake2sDigest;
+    n: SizeInt;
+    last: Boolean;   { no more after this one }
+  end;
+
   TAdder = class
     opts: TOptions;
     status: Integer;
@@ -306,16 +323,22 @@ type
     nBlocks, nFrags: SizeInt;
     nextFrag: Int64;
     dedup: TDedupTable;
-    { fragments cut but not yet hashed: hashed N at a time, then stored in
-      order }
+    { Fragments are cut into batches (by a reader thread with -t 2 and up,
+      while the main thread hashes and stores the batch before), hashed N
+      at a time, then stored in order. }
     pool: TTaskPool;
-    batch: array of Byte;
-    batchLen: SizeInt;
-    bFrags: array of record
-      off, len, entry: SizeInt;
-    end;
-    bHash: array of TBlake2sDigest;
-    nb: SizeInt;
+    batches: array[0..NUM_BATCHES - 1] of TBatch;
+    cur: TBatch;                 { the one being hashed }
+    reader: TThread;
+    fullEv, freeEv: array[0..NUM_BATCHES - 1] of PRTLEvent;
+    readError: string;           { the reader thread's exception, if any }
+    { the reader's place: the next entry, the open file, its buffer }
+    rdEntry: SizeInt;
+    rdFile: TFileStream;
+    rdBuf: array of Byte;
+    rdStart, rdLen: SizeInt;
+    rdEof: Boolean;
+    rdTotal: Int64;
     refCount: array of SizeInt;
     prog: TProgress;
     { statistics }
@@ -331,8 +354,9 @@ type
     procedure AddRef(entry: SizeInt; frag: Int64);
     procedure Fragment(p: PByte; n: SizeInt; const h: TBlake2sDigest; entry: SizeInt);
     procedure HashOne(i: SizeInt);
-    procedure FlushBatch;
-    function AddFile(ei: SizeInt): Boolean;
+    procedure FillBatch(b: TBatch);
+    procedure StoreBatch(b: TBatch);
+    procedure ReadAll;
     procedure WriteIndexAndCommit(vstart: Int64);
   end;
 
@@ -346,7 +370,29 @@ begin
 end;
 
 destructor TAdder.Destroy;
+var
+  i: Integer;
 begin
+  if reader <> nil then
+  begin
+    { an error stopped the main thread: let the reader end (terminated
+      first, so that it stops at its next batch instead of reading on) }
+    reader.Terminate;
+    for i := 0 to NUM_BATCHES - 1 do
+      if freeEv[i] <> nil then
+        RTLEventSetEvent(freeEv[i]);
+    reader.WaitFor;
+    reader.Free;
+  end;
+  for i := 0 to NUM_BATCHES - 1 do
+  begin
+    batches[i].Free;
+    if fullEv[i] <> nil then
+      RTLEventDestroy(fullEv[i]);
+    if freeEv[i] <> nil then
+      RTLEventDestroy(freeEv[i]);
+  end;
+  rdFile.Free;
   prog.Free;
   pool.Free;
   pipe.Free;
@@ -523,91 +569,200 @@ begin
   Inc(fragsInBlock);
 end;
 
+{ group i of the batch's fragments (HASH_GROUP of them), hashed together:
+  Blake2sMany works four at a time }
 procedure TAdder.HashOne(i: SizeInt);
+var
+  msg: array[0..HASH_GROUP - 1] of PByte;
+  len: array[0..HASH_GROUP - 1] of SizeInt;
+  k, first, n: SizeInt;
 begin
-  Blake2s256(@batch[bFrags[i].off], bFrags[i].len, bHash[i]);
+  first := i * HASH_GROUP;
+  n := Min(HASH_GROUP, cur.n - first);
+  for k := 0 to n - 1 do
+  begin
+    msg[k] := @cur.data[cur.frags[first + k].off];
+    len[k] := cur.frags[first + k].len;
+  end;
+  Blake2sMany(@msg[0], @len[0], n, @cur.hash[first]);
+end;
+
+{ Cuts files into b from where the last call stopped, until b is full or
+  the files end (b.last). A file that cannot be opened is left out (its
+  entry becomes ET_OTHER); its size is what was read. }
+procedure TAdder.FillBatch(b: TBatch);
+var
+  got, cut: SizeInt;
+  e: ^TEntry;
+begin
+  b.len := 0;
+  b.n := 0;
+  b.last := False;
+  while True do
+  begin
+    if rdFile = nil then
+    begin
+      { the next file }
+      while (rdEntry < count) and (entries[rdEntry].kind <> ET_FILE) do
+        Inc(rdEntry);
+      if rdEntry >= count then
+      begin
+        b.last := True;
+        Exit;
+      end;
+      e := @entries[rdEntry];
+      try
+        rdFile := TFileStream.Create(e^.local, fmOpenRead or fmShareDenyNone);
+      except
+        on EFOpenError do
+        begin
+          Warn(opts, e^.local + ': cannot open, skipped');
+          status := Max(status, EXIT_WARN);
+          e^.kind := ET_OTHER;
+          Inc(rdEntry);
+          Continue;
+        end;
+      end;
+      rdStart := 0;
+      rdLen := 0;
+      rdEof := False;
+      rdTotal := 0;
+    end;
+    { at least maxSize bytes ahead, unless the file ends sooner: a cut
+      never looks further }
+    if (rdLen - rdStart < prm.maxSize) and not rdEof then
+    begin
+      Move(rdBuf[rdStart], rdBuf[0], rdLen - rdStart);
+      rdLen := rdLen - rdStart;
+      rdStart := 0;
+      got := ReadFull(rdFile, @rdBuf[rdLen], Length(rdBuf) - rdLen);
+      prog.Add(got);
+      rdEof := rdLen + got < Length(rdBuf);
+      Inc(rdLen, got);
+    end;
+    if rdStart = rdLen then
+    begin
+      { the file is done: its size is what was read, if it changed
+        meanwhile }
+      entries[rdEntry].meta.size := rdTotal;
+      Inc(totalIn, rdTotal);
+      FreeAndNil(rdFile);
+      Inc(rdEntry);
+      Continue;
+    end;
+    cut := CdcCut(prm, @rdBuf[rdStart], rdLen - rdStart);
+    if b.len + cut > Length(b.data) then
+      Exit;   { full: this fragment starts the next batch }
+    if b.n = Length(b.frags) then
+    begin
+      SetLength(b.frags, Max(256, 2 * b.n));
+      SetLength(b.hash, Length(b.frags));
+    end;
+    Move(rdBuf[rdStart], b.data[b.len], cut);
+    b.frags[b.n].off := b.len;
+    b.frags[b.n].len := cut;
+    b.frags[b.n].entry := rdEntry;
+    Inc(b.n);
+    Inc(b.len, cut);
+    Inc(rdStart, cut);
+    Inc(rdTotal, cut);
+  end;
 end;
 
 { the batch's fragments hashed in parallel, then stored in order: the
   archive does not depend on the number of threads }
-procedure TAdder.FlushBatch;
+procedure TAdder.StoreBatch(b: TBatch);
 var
   i: SizeInt;
 begin
-  pool.Run(nb, @HashOne);
-  for i := 0 to nb - 1 do
-    Fragment(@batch[bFrags[i].off], bFrags[i].len, bHash[i], bFrags[i].entry);
-  nb := 0;
-  batchLen := 0;
+  cur := b;
+  pool.Run((b.n + HASH_GROUP - 1) div HASH_GROUP, @HashOne);
+  for i := 0 to b.n - 1 do
+    Fragment(@b.data[b.frags[i].off], b.frags[i].len, b.hash[i], b.frags[i].entry);
 end;
 
-{ reads and cuts one file into the batch; False when it could not be
-  opened }
-function TAdder.AddFile(ei: SizeInt): Boolean;
-var
-  f: TFileStream;
-  buf: array of Byte;
-  start, len, got, cut: SizeInt;
-  eof: Boolean;
-  total: Int64;
+type
+  { cuts the batches ahead of the main thread, which hashes and stores them }
+  TReaderThread = class(TThread)
+    adder: TAdder;
+    constructor Create(a: TAdder);
+    procedure Execute; override;
+  end;
+
+constructor TReaderThread.Create(a: TAdder);
 begin
-  try
-    f := TFileStream.Create(entries[ei].local, fmOpenRead or fmShareDenyNone);
-  except
-    on EFOpenError do
-    begin
-      Warn(opts, entries[ei].local + ': cannot open, skipped');
-      status := Max(status, EXIT_WARN);
-      SetLength(unreadPaths, Length(unreadPaths) + 1);
-      unreadPaths[High(unreadPaths)] := entries[ei].path;
-      Exit(False);
-    end;
-  end;
-  try
-    SetLength(buf, 4 * prm.maxSize);
-    start := 0;
-    len := 0;
-    eof := False;
-    total := 0;
-    while True do
-    begin
-      { at least maxSize bytes ahead, unless the file ends sooner: a cut
-        never looks further }
-      if (len - start < prm.maxSize) and not eof then
+  adder := a;
+  inherited Create(False);
+end;
+
+procedure TReaderThread.Execute;
+var
+  k: Integer;
+  b: TBatch;
+begin
+  k := 0;
+  repeat
+    RTLEventWaitFor(adder.freeEv[k]);
+    b := adder.batches[k];
+    if Terminated then
+      Break;
+    try
+      adder.FillBatch(b);
+    except
+      on E: Exception do
       begin
-        Move(buf[start], buf[0], len - start);
-        len := len - start;
-        start := 0;
-        got := ReadFull(f, @buf[len], Length(buf) - len);
-        prog.Add(got);
-        eof := len + got < Length(buf);
-        Inc(len, got);
+        adder.readError := E.Message;
+        b.n := 0;
+        b.last := True;
       end;
-      if start = len then
-        Break;
-      cut := CdcCut(prm, @buf[start], len - start);
-      if batchLen + cut > Length(batch) then
-        FlushBatch;
-      if nb = Length(bFrags) then
-      begin
-        SetLength(bFrags, Max(256, 2 * nb));
-        SetLength(bHash, Length(bFrags));
-      end;
-      Move(buf[start], batch[batchLen], cut);
-      bFrags[nb].off := batchLen;
-      bFrags[nb].len := cut;
-      bFrags[nb].entry := ei;
-      Inc(nb);
-      Inc(batchLen, cut);
-      Inc(start, cut);
-      Inc(total, cut);
     end;
-  finally
-    f.Free;
+    RTLEventSetEvent(adder.fullEv[k]);
+    k := (k + 1) mod NUM_BATCHES;
+  until b.last;
+end;
+
+{ every file's data: cut, hashed, stored }
+procedure TAdder.ReadAll;
+var
+  i, k: Integer;
+  b: TBatch;
+begin
+  SetLength(rdBuf, 4 * prm.maxSize);
+  for i := 0 to NUM_BATCHES - 1 do
+  begin
+    batches[i] := TBatch.Create;
+    SetLength(batches[i].data, BATCH_SIZE);
   end;
-  entries[ei].meta.size := total;   { what was read, if the file changed meanwhile }
-  Inc(totalIn, total);
-  Result := True;
+  rdEntry := 0;
+  if opts.threads = 1 then
+  begin
+    { one thread: in turn }
+    repeat
+      FillBatch(batches[0]);
+      StoreBatch(batches[0]);
+    until batches[0].last;
+    Exit;
+  end;
+  for i := 0 to NUM_BATCHES - 1 do
+  begin
+    fullEv[i] := RTLEventCreate;
+    freeEv[i] := RTLEventCreate;
+    RTLEventSetEvent(freeEv[i]);
+  end;
+  reader := TReaderThread.Create(Self);
+  k := 0;
+  repeat
+    RTLEventWaitFor(fullEv[k]);
+    b := batches[k];
+    if readError <> '' then
+      Fail(EXIT_FATAL, readError);
+    StoreBatch(b);
+    if not b.last then
+      RTLEventSetEvent(freeEv[k]);
+    k := (k + 1) mod NUM_BATCHES;
+  until b.last;
+  reader.WaitFor;
+  FreeAndNil(reader);
 end;
 
 procedure TAdder.WriteIndexAndCommit(vstart: Int64);
@@ -1260,21 +1415,17 @@ begin
         a.pipe.jobs[i].Reserve(a.blockSize, SylzBound(a.blockSize));
       a.slot := 0;
       a.pool := TTaskPool.Create(opts.threads);
-      SetLength(a.batch, 8 shl 20);
       SetLength(a.refCount, a.count);
       total := 0;
       for i := 0 to a.count - 1 do
         if a.entries[i].kind = ET_FILE then
           Inc(total, a.entries[i].meta.size);
       a.prog := TProgress.Create(opts.progress, total);
+      a.ReadAll;
       for i := 0 to a.count - 1 do
       begin
         case a.entries[i].kind of
-          ET_FILE:
-            if a.AddFile(i) then
-              Inc(a.nFiles)
-            else
-              a.entries[i].kind := ET_OTHER;   { left out below }
+          ET_FILE: Inc(a.nFiles);
           ET_DIR: Inc(a.nDirs);
           ET_SYMLINK: Inc(a.nLinks);
         end;
@@ -1283,7 +1434,6 @@ begin
         else if a.entries[i].kind <> ET_OTHER then
           Note(opts, a.entries[i].path);
       end;
-      a.FlushBatch;
       a.prog.Finish;
       j := 0;
       for i := 0 to a.count - 1 do
@@ -1547,20 +1697,30 @@ procedure THashCheck.Check(job: TJob);
 var
   blk: ^TArcBlock;
   v: ^TVersion;
-  k: SizeInt;   { fragment numbers fit: every fragment has an entry in memory }
-  h: TBlake2sDigest;
+  first, k, n: SizeInt;   { fragment numbers fit: every fragment has an entry in memory }
+  msg: array of PByte;
+  len: array of SizeInt;
+  h: array of TBlake2sDigest;
 begin
   blk := @a.blocks[job.tag];
   v := @a.versions[blk^.ver];
-  for k := SizeInt(blk^.firstFrag) to SizeInt(blk^.firstFrag + blk^.frags - 1) do
+  first := blk^.firstFrag;
+  n := blk^.frags;
+  SetLength(msg, n);
+  SetLength(len, n);
+  SetLength(h, n);
+  for k := 0 to n - 1 do
   begin
-    Blake2s256(job.raw + a.fragOff[k - 1], a.fragSize[k - 1], h);
-    if CompareByte(h, v^.idx.frags[k - v^.firstFrag].hash, SizeOf(h)) <> 0 then
+    msg[k] := job.raw + a.fragOff[first + k - 1];
+    len[k] := a.fragSize[first + k - 1];
+  end;
+  Blake2sMany(@msg[0], @len[0], n, @h[0]);
+  for k := 0 to n - 1 do
+    if CompareByte(h[k], v^.idx.frags[first + k - v^.firstFrag].hash, SizeOf(TBlake2sDigest)) <> 0 then
     begin
-      job.failed := k;
+      job.failed := first + k;
       Exit;
     end;
-  end;
 end;
 
 function TestArchive(const opts: TOptions; const path, name: string): Integer;

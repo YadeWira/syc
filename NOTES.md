@@ -66,6 +66,43 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Archiver speed: a reader thread, BLAKE2s in four lanes (2026-10-24)
+
+silesia (212 MB), level 1, CPUs 20-23, before -> after:
+
+| | 1 thread | 2 | 4 |
+|---|---|---|---|
+| `a` | 1.63 -> 1.38 s | 1.16 -> 0.75 | 1.02 -> 0.70 |
+| `t` | 0.81 -> 0.51 | | 0.31 -> 0.22 |
+| `x` (tmpfs) | 0.90 -> 0.64 | | 0.46 -> 0.37 |
+
+The archives are the same bytes as before.
+
+- perf (`a -1 -t 4`, a copy built with -Xs-: Debian's fpc.cfg strips by
+  default) showed the main thread at 38% of all samples, doing the
+  cutting (13%), its share of the hashing, Move, the kernel's page
+  clearing (a new 2 MB read buffer per file) and the reads.
+- **Reader thread** (-t 2 and up): reads and cuts into three 8 MiB
+  batches in turn while the main thread hashes (with the pool) and stores
+  the one before. With -t 1 the same code runs in turn on one thread. One
+  read buffer for every file.
+- **Cutter in C**: 806 -> 1240 MB/s (the loop is the hash's dependency
+  chain, a shift, an add and a load a byte). Same cuts as the Pascal one
+  on all of silesia.tar (tests/sycdedup compares them at every cut).
+- **BLAKE2s, four messages at a time** (sylzc_blake2s_many): lane k of
+  each vector is a message of its own; a lane whose message ends takes
+  the next one, the last one or two finish on the scalar code. GCC's
+  vector extensions, so SSE2 on x86-64 and NEON on arm64 from one source.
+  64 KiB messages: 372 -> 765 MB/s; the message loaded with vector loads
+  and a 4x4 transpose 792. Compiled for SSSE3 (pshufb for the 8- and
+  16-bit rotations) it was no faster. On 32-bit x86 the 16 state vectors
+  do not fit its 8 registers: 196 MB/s against 310 one at a time (wine),
+  so i386 hashes one at a time. `a` hashes groups of 8 fragments a task;
+  `t`/`x` hash a block's fragments together on the thread that decoded it.
+- What is left, by CPU share at -t 4: sylz level 1 itself (~30%),
+  BLAKE2s, CRC-32 (8%), the cutter; and the kernel clearing the pages of
+  the pipeline's 2N block buffers on first use.
+
 ## CLI stage 8: progress, help, Usage page (2026-10-24)
 
 - TProgress (sycblocks): one line on stderr rewritten with CR at most 5
