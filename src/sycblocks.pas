@@ -1,0 +1,417 @@
+{ sycblocks — what syc's commands share: CRC-32, the errors and their exit
+  codes, small stream helpers, and the pipeline that compresses or
+  decompresses blocks N at a time. }
+unit sycblocks;
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  {$ifdef windows}Windows,{$endif}
+  {$ifdef unix}termio,{$endif}
+  SysUtils, Classes, sylz;
+
+const
+  MAX_BLOCK   = 512 shl 20;
+  MAX_THREADS = 64;
+  TMP_SUFFIX  = '.syc-partial';
+
+  { exit codes }
+  EXIT_OK      = 0;
+  EXIT_WARN    = 1;   { finished, but some inputs were skipped or unreadable }
+  EXIT_USAGE   = 2;
+  EXIT_CORRUPT = 3;   { a checksum or the data's structure is wrong }
+  EXIT_FATAL   = 4;   { I/O error, out of memory }
+
+type
+  { an error ending a command (or one input of it), with its exit code }
+  ESycError = class(Exception)
+    code: Integer;
+    constructor Create(aCode: Integer; const msg: string);
+  end;
+
+procedure Fail(code: Integer; const msg: string);
+
+function crc32(crc: UInt32; p: PByte; n: SizeInt): UInt32;
+
+procedure WriteU32(s: TStream; v: UInt32);
+function ReadU32(s: TStream): UInt32;
+{ Reads up to n bytes; fewer only at the end of the stream. }
+function ReadFull(s: TStream; p: PByte; n: SizeInt): SizeInt;
+{ Moves src over dst in one step, replacing it. }
+function ReplaceFile(const src, dst: string): Boolean;
+{ handle 0, 1 or 2 is a terminal }
+function IsTerminal(std: Integer): Boolean;
+function StdStream(std: Integer): THandleStream;
+
+type
+  { One block's work, done by a worker thread (or the main one with one
+    thread). Compress: raw[0..n) -> payload[0..c) and its crc. Decompress:
+    payload (stored or a sylz block) -> raw[0..n), checked against sum. }
+  TJob = class
+    raw, payload: PByte;
+    rawCap, payCap: SizeInt;
+    n, c, payLen: SizeInt;
+    stored: Boolean;
+    sum, crc: UInt32;
+    ok: Boolean;
+    ctx: TSylzCtx;
+    dctx: TSylzDCtx;
+    constructor Create;
+    destructor Destroy; override;
+    procedure Reserve(rawSize, paySize: SizeInt);
+    procedure DoCompress(level, flags: Integer);
+    procedure DoDecompress;
+  end;
+
+  { A pipeline of 2N slots: slot k is worked on by thread k mod N, so each
+    thread takes its two slots in turn, while the main thread reads the
+    next blocks into free slots and writes finished ones in order. Workers
+    never wait for a whole batch, so they stay busy: with batches, the
+    decode threads worked in bursts of ~1 ms and their cores never left a
+    low clock (1.6 GHz against 2.7, measured). With one thread no worker
+    runs: the main thread does the jobs itself. }
+  TPipeline = class;
+
+  TWorker = class(TThread)
+  public
+    pipe: TPipeline;
+    index: Integer;
+    constructor Create(aPipe: TPipeline; aIndex: Integer);
+    procedure Execute; override;
+  end;
+
+  TPipeline = class
+    jobs: array of TJob;
+    startEv, doneEv: array of PRTLEvent;
+    busy: array of Boolean;            { started, not yet waited for }
+    workers: array of TWorker;
+    threads: Integer;
+    decompressing: Boolean;
+    level, flags: Integer;
+    constructor Create(aThreads: Integer; aDecompressing: Boolean; aLevel, aFlags: Integer);
+    destructor Destroy; override;
+    function Slots: Integer;
+    procedure Start(slot: Integer);    { slot's job is ready: work on it }
+    procedure Finish(slot: Integer);   { wait until slot's job is done }
+    procedure RunJob(job: TJob);
+  end;
+
+implementation
+
+constructor ESycError.Create(aCode: Integer; const msg: string);
+begin
+  inherited Create(msg);
+  code := aCode;
+end;
+
+procedure Fail(code: Integer; const msg: string);
+begin
+  raise ESycError.Create(code, msg);
+end;
+
+{ ── CRC-32 ─────────────────────────────────────────────────────────────── }
+
+var
+  crcTable: array[0..7, 0..255] of UInt32;
+
+{ CRC-32 (IEEE, reflected, polynomial $EDB88320), as zlib's crc32. Here
+  rather than FPC's crc unit, which the win64 RTL doesn't ship. Slicing by
+  8: eight tables, eight bytes a step (one byte a step ran at a few
+  hundred MB/s and held syc's fast levels back). }
+procedure CrcInit;
+var
+  i, k: Integer;
+  c: UInt32;
+begin
+  for i := 0 to 255 do
+  begin
+    c := i;
+    for k := 1 to 8 do
+      if c and 1 <> 0 then
+        c := (c shr 1) xor $EDB88320
+      else
+        c := c shr 1;
+    crcTable[0, i] := c;
+  end;
+  for i := 0 to 255 do
+    for k := 1 to 7 do
+      crcTable[k, i] := (crcTable[k - 1, i] shr 8) xor crcTable[0, crcTable[k - 1, i] and $FF];
+end;
+
+{$ifndef SYLZ_PUREPASCAL}
+{ sylzc.o comes linked with the sylz unit }
+function sylzc_crc32(crc: UInt32; p: PByte; n: SizeInt; tables: PUInt32): UInt32;
+  cdecl; external name 'sylzc_crc32';
+{$endif}
+
+function crc32(crc: UInt32; p: PByte; n: SizeInt): UInt32;
+var
+  a, b: UInt32;
+begin
+{$ifndef SYLZ_PUREPASCAL}
+  { the C version (sylzc.c), same results: FPC ran this loop at ~1.2 GB/s }
+  Exit(sylzc_crc32(crc, p, n, @crcTable[0, 0]));
+{$endif}
+  crc := not crc;
+  while n >= 8 do
+  begin
+    a := (p[0] or (UInt32(p[1]) shl 8) or (UInt32(p[2]) shl 16) or (UInt32(p[3]) shl 24)) xor crc;
+    b := p[4] or (UInt32(p[5]) shl 8) or (UInt32(p[6]) shl 16) or (UInt32(p[7]) shl 24);
+    crc := crcTable[7, a and $FF] xor crcTable[6, (a shr 8) and $FF]
+       xor crcTable[5, (a shr 16) and $FF] xor crcTable[4, a shr 24]
+       xor crcTable[3, b and $FF] xor crcTable[2, (b shr 8) and $FF]
+       xor crcTable[1, (b shr 16) and $FF] xor crcTable[0, b shr 24];
+    Inc(p, 8);
+    Dec(n, 8);
+  end;
+  while n > 0 do
+  begin
+    crc := crcTable[0, (crc xor p^) and $FF] xor (crc shr 8);
+    Inc(p);
+    Dec(n);
+  end;
+  Result := not crc;
+end;
+
+
+{ ── stream helpers ─────────────────────────────────────────────────────── }
+
+procedure WriteU32(s: TStream; v: UInt32);
+begin
+  v := NtoLE(v);
+  s.WriteBuffer(v, 4);
+end;
+
+function ReadU32(s: TStream): UInt32;
+begin
+  s.ReadBuffer(Result, 4);
+  Result := LEtoN(Result);
+end;
+
+function ReadFull(s: TStream; p: PByte; n: SizeInt): SizeInt;
+var
+  got: SizeInt;
+begin
+  Result := 0;
+  while Result < n do
+  begin
+    got := s.Read(p[Result], n - Result);
+    if got <= 0 then
+      Break;
+    Inc(Result, got);
+  end;
+end;
+
+{ rename does it on Unix; on Windows it fails when dst exists, MoveFileEx
+  doesn't }
+function ReplaceFile(const src, dst: string): Boolean;
+begin
+{$ifdef windows}
+  Result := MoveFileEx(PChar(src), PChar(dst), MOVEFILE_REPLACE_EXISTING);
+{$else}
+  Result := RenameFile(src, dst);
+{$endif}
+end;
+
+function StdHandle(std: Integer): THandle;
+begin
+  case std of
+    0: Result := StdInputHandle;
+    1: Result := StdOutputHandle;
+  else
+    Result := StdErrorHandle;
+  end;
+end;
+
+function IsTerminal(std: Integer): Boolean;
+begin
+{$ifdef windows}
+  Result := GetFileType(StdHandle(std)) = FILE_TYPE_CHAR;
+{$else}
+  Result := IsATTY(StdHandle(std)) = 1;
+{$endif}
+end;
+
+function StdStream(std: Integer): THandleStream;
+begin
+  Result := THandleStream.Create(StdHandle(std));
+end;
+
+{ ── the pipeline ───────────────────────────────────────────────────────── }
+
+constructor TJob.Create;
+begin
+  inherited Create;
+  SylzCtxInit(ctx);
+  SylzDCtxInit(dctx);
+end;
+
+destructor TJob.Destroy;
+begin
+  SylzCtxFree(ctx);
+  SylzDCtxFree(dctx);
+  FreeMem(raw);
+  FreeMem(payload);
+  inherited Destroy;
+end;
+
+procedure TJob.Reserve(rawSize, paySize: SizeInt);
+begin
+  if rawSize > rawCap then
+  begin
+    FreeMem(raw);
+    raw := GetMem(rawSize);
+    rawCap := rawSize;
+  end;
+  if paySize > payCap then
+  begin
+    FreeMem(payload);
+    payload := GetMem(paySize);
+    payCap := paySize;
+  end;
+end;
+
+procedure TJob.DoCompress(level, flags: Integer);
+begin
+  crc := crc32(0, raw, n);
+  c := SylzCompressEx(ctx, raw, n, payload, payCap, level, flags);
+  ok := c >= 0;
+end;
+
+procedure TJob.DoDecompress;
+begin
+  if stored then
+    Move(payload^, raw^, n)
+  else if SylzDecompressCtx(dctx, payload, payLen, raw, n) <> n then
+  begin
+    ok := False;
+    Exit;
+  end;
+  ok := crc32(0, raw, n) = sum;
+end;
+
+constructor TWorker.Create(aPipe: TPipeline; aIndex: Integer);
+begin
+  pipe := aPipe;
+  index := aIndex;
+  inherited Create(False);
+end;
+
+procedure TWorker.Execute;
+var
+  slot: Integer;
+begin
+  slot := index;
+  while True do
+  begin
+    RTLEventWaitFor(pipe.startEv[slot]);
+    if pipe.jobs[slot].n < 0 then
+      Break;   { no more blocks }
+    pipe.RunJob(pipe.jobs[slot]);
+    RTLEventSetEvent(pipe.doneEv[slot]);
+    { this thread's other slot }
+    slot := (slot + pipe.threads) mod pipe.Slots;
+  end;
+end;
+
+constructor TPipeline.Create(aThreads: Integer; aDecompressing: Boolean; aLevel, aFlags: Integer);
+var
+  i: Integer;
+begin
+  inherited Create;
+  threads := aThreads;
+  decompressing := aDecompressing;
+  level := aLevel;
+  flags := aFlags;
+  SetLength(jobs, Slots);
+  SetLength(busy, Slots);
+  SetLength(startEv, Slots);
+  SetLength(doneEv, Slots);
+  for i := 0 to Slots - 1 do
+  begin
+    jobs[i] := TJob.Create;
+    startEv[i] := RTLEventCreate;
+    doneEv[i] := RTLEventCreate;
+  end;
+  if threads > 1 then
+  begin
+    SetLength(workers, threads);
+    for i := 0 to threads - 1 do
+      workers[i] := TWorker.Create(Self, i);
+  end;
+end;
+
+destructor TPipeline.Destroy;
+var
+  i, slot: Integer;
+begin
+  { let the jobs still running end (an error stops the main thread early),
+    then each worker waits on one of its two slots: end both }
+  for i := 0 to High(busy) do
+    if busy[i] then
+      Finish(i);
+  for i := 0 to High(workers) do
+    for slot in [i, i + threads] do
+    begin
+      jobs[slot].n := -1;
+      RTLEventSetEvent(startEv[slot]);
+    end;
+  for i := 0 to High(workers) do
+  begin
+    workers[i].WaitFor;
+    workers[i].Free;
+  end;
+  for i := 0 to Slots - 1 do
+  begin
+    jobs[i].Free;
+    RTLEventDestroy(startEv[i]);
+    RTLEventDestroy(doneEv[i]);
+  end;
+  inherited Destroy;
+end;
+
+function TPipeline.Slots: Integer;
+begin
+  if threads > 1 then
+    Result := 2 * threads
+  else
+    Result := 1;
+end;
+
+procedure TPipeline.RunJob(job: TJob);
+begin
+  try
+    if decompressing then
+      job.DoDecompress
+    else
+      job.DoCompress(level, flags);
+  except
+    job.ok := False;   { out of memory }
+  end;
+end;
+
+procedure TPipeline.Start(slot: Integer);
+begin
+  if threads > 1 then
+  begin
+    busy[slot] := True;
+    RTLEventSetEvent(startEv[slot]);
+  end
+  else
+    RunJob(jobs[slot]);
+end;
+
+procedure TPipeline.Finish(slot: Integer);
+begin
+  if busy[slot] then
+  begin
+    RTLEventWaitFor(doneEv[slot]);
+    busy[slot] := False;
+  end;
+end;
+
+initialization
+  CrcInit;
+end.

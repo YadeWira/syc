@@ -91,7 +91,7 @@ to mode 1.
 
 ## syc -th: threads (2026-10-23)
 
-`-th N` (default 1): blocks are compressed and decompressed N at a time;
+`-th N` (now `-t N` / `--threads N`; default 1): blocks are compressed and decompressed N at a time;
 the output is the same whatever N. A pipeline of 2N slots, slot k worked
 on by thread k mod N, the main thread reading the next blocks into free
 slots and writing finished ones in order.

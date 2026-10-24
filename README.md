@@ -141,14 +141,21 @@ Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/
 
 ## Use
 
-The current command line is minimal and its file format provisional:
-files it writes are not expected to open with later versions.
+The command line is being built in stages (see the wiki's Roadmap):
+`c`, `d` and `t` work today; the archiver commands (`a`, `x`, `l`, `i`)
+come next. File formats stay provisional until 1.0.
 
 ```sh
-out/syc c -1 file          # -> file.sylz (-0 .. -10, -ec, -b MIB block size, -th N threads)
-out/syc d file.sylz        # -> file
+out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads)
+out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)
+out/syc t file.sylz        # check it, write nothing
+tar c dir | out/syc c > dir.tar.sylz       # no FILE: stdin -> stdout
+out/syc h c                # every option of a command
 out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
+
+An existing output is not overwritten without `-f`. Exit status: 0 ok,
+1 an input skipped, 2 usage, 3 corrupt data, 4 I/O error.
 
 Each block carries a CRC32 of its data, checked on decompression.
 
