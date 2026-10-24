@@ -42,7 +42,13 @@ has no sylz counterpart.
 ## Layout
 
 - `src/sylz.pas` — sylz codec; `src/sylzhuf.pas` — its Huffman chunk
-  coder (format v3); `src/syc.pas` — minimal CLI
+  coder (format v3)
+- `src/syc.pas` — the CLI's entry; `src/syccli.pas` — options and help;
+  `src/sycstream.pas` — `c`/`d`/`t` on `.sylz` streams;
+  `src/sycblocks.pas` — CRC-32, errors/exit codes, the block pipeline
+- `src/blake2s.pas`, `src/syccdc.pas` — the archive's fragment hash and
+  cutter; `tests/sycdedup.pas` tests them, `tools/syc_cdc_ref.py` is the
+  reference written from the wiki's spec
 - `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output;
   `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`,
   `SYLZ_NOASM=1` uses the Pascal paths only
@@ -55,6 +61,29 @@ has no sylz counterpart.
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## The archive's dedup pieces: BLAKE2s and the cutter (2026-10-24)
+
+Format: wiki "syc archive format". Fragments cut by a gear hash, FastCDC
+normalization (16 KiB / 64 KiB / 512 KiB), identity BLAKE2s-256.
+
+- The cuts and hashes match `tools/syc_cdc_ref.py` (written from the
+  spec, hashlib's blake2s) on empty, 1000 bytes, exactly the minimum,
+  minimum + 1, 3 MB of zeros, x-ray, samba; x86_64, arm64 (qemu) and
+  win32 (wine) dump the same fragments.
+- silesia.tar: 2807 fragments, mean 73.7 KiB (normalization keeps it
+  near the target; uniform random data 72.3). 100 bytes inserted at 1/3:
+  99.97% of the bytes in fragments found again.
+- First test data was an LCG's low byte, which repeats every 64 KiB: every
+  fragment came out exactly 64 KiB and "100%" found again. The tests use
+  xorshift32 now.
+- Speed, silesia.tar, CPU 20: BLAKE2s in Pascal ~160 MB/s; in C with a
+  loop over the sigma table 332; with the ten rounds unrolled (sigma's
+  indices constant, so m stays in registers) 393. The cutter alone ~900
+  MB/s; cutter + hash 279 MB/s. Hashing is the archiver's own cost per
+  byte (level 1 compresses at ~450 MB/s): SIMD BLAKE2s (SSE2/SSSE3, 4
+  lanes) or hashing on the worker threads are the next steps if `syc a`
+  measures it as the bottleneck.
 
 ## Format v3 frozen, the sylzec plugin (2026-10-23)
 
