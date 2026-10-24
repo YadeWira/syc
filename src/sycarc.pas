@@ -1514,11 +1514,21 @@ begin
   end;
   case e.meta.attrKind of
     AK_UNIX:
-      for i := 0 to 8 do
-        if e.meta.attrs and (1 shl (8 - i)) <> 0 then
-          Result := Result + RWX[i + 1]
-        else
-          Result := Result + '-';
+      begin
+        for i := 0 to 8 do
+          if e.meta.attrs and (1 shl (8 - i)) <> 0 then
+            Result := Result + RWX[i + 1]
+          else
+            Result := Result + '-';
+        { setuid, setgid, sticky over the x of owner, group, others, as ls
+          shows them: lower case when x is set too }
+        if e.meta.attrs and $800 <> 0 then
+          if Result[4] = 'x' then Result[4] := 's' else Result[4] := 'S';
+        if e.meta.attrs and $400 <> 0 then
+          if Result[7] = 'x' then Result[7] := 's' else Result[7] := 'S';
+        if e.meta.attrs and $200 <> 0 then
+          if Result[10] = 'x' then Result[10] := 't' else Result[10] := 'T';
+      end;
     AK_WINDOWS:
       begin
         if e.meta.attrs and 1 <> 0 then Result := Result + 'R' else Result := Result + '-';

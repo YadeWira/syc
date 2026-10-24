@@ -66,6 +66,25 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Verifications left from the CLI stages (2026-10-24)
+
+- **Owner, as root** (sudo, in a scratch directory): files, a directory
+  and a symlink owned by other uids, a setuid file owned by root; `x` as
+  root gives back every owner (the link's with lchown) and the setuid bit
+  (chmod after chown); `--no-owner` as root leaves root; a user extracts
+  them as their own, without an error.
+- **Symlinks on Windows without the right** (Windows 10, developer mode
+  off): run as a temporary standard user (medium integrity) through a
+  scheduled task, its batch logon right granted with secedit and the
+  original policy put back after; each link "cannot create the symlink",
+  files and directories extracted, exit 1. (A process started with other
+  credentials from the SSH session fails with 0xC0000142; the VM's own
+  user has UAC off, so its tasks run elevated.) User, profile (after a
+  restart), task and policy removed or restored.
+- **Progress in a Windows console**: on by default there (stderr is a
+  console), rewritten in place; seen in a screenshot of the VM (`vm shot`).
+- `syc l -l` shows setuid, setgid and sticky as ls does (s/S, t/T).
+
 ## Archiver speed: a reader thread, BLAKE2s in four lanes (2026-10-24)
 
 silesia (212 MB), level 1, CPUs 20-23, before -> after:
@@ -133,7 +152,7 @@ The archives are the same bytes as before.
   made again, Linux links (to a file, a directory, dangling) made on
   Windows and read through; the Windows archive's links made on Linux.
 - With that the metadata of the plan is all there: times, Unix mode and
-  owner (restored as root only; not tested as root yet), Windows
+  owner (restored as root only), Windows
   attributes, symlinks, empty directories. Not stored: hard links (as
   separate files, deduplicated), extended attributes, ACLs, alternate
   streams, devices, sockets and FIFOs.
