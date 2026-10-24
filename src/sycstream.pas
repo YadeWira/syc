@@ -35,7 +35,7 @@ const
   PAYLOAD_MASK = UInt32($7FFFFFFF);
 
 { Compresses fin to fout; returns the bytes read and written. }
-procedure Compress(fin, fout: TStream; const opts: TOptions; out total, written: Int64);
+procedure Compress(fin, fout: TStream; const opts: TOptions; prog: TProgress; out total, written: Int64);
 var
   pipe: TPipeline;
   hdr: array[0..5] of Byte;
@@ -95,6 +95,7 @@ begin
       if blocks >= pipe.Slots then
         WriteSlot(slot);
       pipe.jobs[slot].n := ReadFull(fin, pipe.jobs[slot].raw, blockSize);
+      prog.Add(pipe.jobs[slot].n);
       if pipe.jobs[slot].n < blockSize then
         eof := True;
       if pipe.jobs[slot].n = 0 then
@@ -118,7 +119,8 @@ end;
 
 { Decompresses fin to fout (nil: only checks it); returns the bytes
   written. name is fin's, for the messages. }
-procedure Decompress(fin, fout: TStream; const name: string; threads: Integer; out total: Int64);
+procedure Decompress(fin, fout: TStream; const name: string; threads: Integer; prog: TProgress;
+  out total: Int64);
 var
   pipe: TPipeline;
   job: TJob;
@@ -171,6 +173,7 @@ begin
         job.Reserve(rawLen, payLen);
         if ReadFull(fin, job.payload, payLen) <> SizeInt(payLen) then
           Fail(EXIT_CORRUPT, name + ': truncated');
+        prog.Add(12 + payLen);
         job.n := rawLen;
         job.payLen := payLen;
         job.stored := packedField and STORED_FLAG <> 0;
@@ -200,6 +203,7 @@ var
   fromStdin, toStdout: Boolean;
   inName, outPath, tmpPath, keep: string;
   fin, fout, pre: TStream;
+  prog: TProgress;
   total, written: Int64;
   magic: array of Byte;
   got: SizeInt;
@@ -249,6 +253,7 @@ begin
 
   fin := nil;
   fout := nil;
+  prog := nil;
   tmpPath := '';
   try
     try
@@ -264,6 +269,10 @@ begin
             Exit(EXIT_WARN);
           end;
         end;
+      if fin is TFileStream then
+        prog := TProgress.Create(opts.progress, fin.Size)
+      else
+        prog := TProgress.Create(opts.progress, 0);
       if toStdout then
         fout := StdStream(1)
       else if outPath <> '' then
@@ -299,16 +308,19 @@ begin
         end;
         pre := TPrefixStream.Create(Copy(magic, 0, got), fin);
         try
-          Decompress(pre, nil, inName, opts.threads, total);
+          Decompress(pre, nil, inName, opts.threads, prog, total);
         finally
           pre.Free;
         end;
       end
       else if opts.cmd = 'c' then
-        Compress(fin, fout, opts, total, written)
+        Compress(fin, fout, opts, prog, total, written)
       else
-        Decompress(fin, fout, inName, opts.threads, total);
+        Decompress(fin, fout, inName, opts.threads, prog, total);
     finally
+      if prog <> nil then
+        prog.Finish;
+      FreeAndNil(prog);
       fout.Free;
       fin.Free;
     end;

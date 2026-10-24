@@ -317,6 +317,7 @@ type
     bHash: array of TBlake2sDigest;
     nb: SizeInt;
     refCount: array of SizeInt;
+    prog: TProgress;
     { statistics }
     totalIn, dupBytes: Int64;
     nFiles, nDirs, nLinks: Int64;
@@ -346,6 +347,7 @@ end;
 
 destructor TAdder.Destroy;
 begin
+  prog.Free;
   pool.Free;
   pipe.Free;
   inherited Destroy;
@@ -577,6 +579,7 @@ begin
         len := len - start;
         start := 0;
         got := ReadFull(f, @buf[len], Length(buf) - len);
+        prog.Add(got);
         eof := len + got < Length(buf);
         Inc(len, got);
       end;
@@ -1070,7 +1073,7 @@ var
   prev, changed: TEntries;
   i, j, k, nChanged, nDeleted, nSame: SizeInt;
   c: Integer;
-  goodEnd, vstart: Int64;
+  goodEnd, vstart, total: Int64;
   vnum: UInt32;
   hdr: array[0..HEADER_SIZE - 1] of Byte;
   vhead: array[0..VHEAD_SIZE - 1] of Byte;
@@ -1259,6 +1262,11 @@ begin
       a.pool := TTaskPool.Create(opts.threads);
       SetLength(a.batch, 8 shl 20);
       SetLength(a.refCount, a.count);
+      total := 0;
+      for i := 0 to a.count - 1 do
+        if a.entries[i].kind = ET_FILE then
+          Inc(total, a.entries[i].meta.size);
+      a.prog := TProgress.Create(opts.progress, total);
       for i := 0 to a.count - 1 do
       begin
         case a.entries[i].kind of
@@ -1276,6 +1284,7 @@ begin
           Note(opts, a.entries[i].path);
       end;
       a.FlushBatch;
+      a.prog.Finish;
       j := 0;
       for i := 0 to a.count - 1 do
         if a.entries[i].kind <> ET_OTHER then
@@ -1560,7 +1569,8 @@ var
   pipe: TPipeline;
   hc: THashCheck;
   nb, b, done: SizeInt;
-  checkedBytes: Int64;
+  checkedBytes, total: Int64;
+  prog: TProgress;
 
   { the block in slot s: decoded, its CRC and its fragments' hashes
     checked by the job }
@@ -1577,6 +1587,7 @@ var
     if job.failed <> 0 then
       a.Corrupt(Format('fragment %d (block at offset %d): hash mismatch', [job.failed, blk^.pos]));
     Inc(checkedBytes, job.n);
+    prog.Add(job.n);
     Inc(done);
   end;
 
@@ -1590,6 +1601,7 @@ begin
   Result := EXIT_OK;
   a := TArchive.Open(path, name);
   pipe := nil;
+  prog := nil;
   hc := THashCheck.Create;
   hc.a := a;
   try
@@ -1597,6 +1609,10 @@ begin
     pipe := TPipeline.Create(opts.threads, True, 0, 0);
     pipe.SetPost(@hc.Check);
     nb := Length(a.blocks);
+    total := 0;
+    for b := 0 to nb - 1 do
+      Inc(total, a.blocks[b].rawLen);
+    prog := TProgress.Create(opts.progress, total);
     done := 0;
     checkedBytes := 0;
     for b := 0 to nb - 1 do
@@ -1626,10 +1642,14 @@ begin
     end;
     while done < nb do
       CheckSlot(done mod pipe.Slots);
+    prog.Finish;
     if opts.verbosity <> vQuiet then
       WriteLn(StdErr, Format('%s: ok, %d version(s), %d fragments, %d bytes checked',
         [name, Length(a.versions), Length(a.fragSize), checkedBytes]));
   finally
+    if prog <> nil then
+      prog.Finish;
+    prog.Free;
     pipe.Free;
     hc.Free;
     a.Free;
@@ -1661,6 +1681,7 @@ type
     access: array of SizeInt;     { block numbers, in the order used }
     nAccess, cur: SizeInt;
     nFiles, nDirs, nLinks, bytesOut: Int64;
+    prog: TProgress;
     procedure StartAccess(k: SizeInt);
     function JobFor(blk: SizeInt): TJob;
     procedure WriteFile(const e: TEntry; s: TStream);
@@ -1738,6 +1759,7 @@ begin
     f := e.refs[i] - 1;
     job := JobFor(a.fragBlock[f]);
     s.WriteBuffer(job.raw[a.fragOff[f]], a.fragSize[f]);
+    prog.Add(a.fragSize[f]);
   end;
   Inc(bytesOut, e.meta.size);
 end;
@@ -1764,6 +1786,7 @@ var
   i, n, k, b, last: SizeInt;
   fout: TStream;
   exists: Boolean;
+  total: Int64;
 begin
   x := TExtractor.Create;
   x.opts := opts;
@@ -1866,6 +1889,11 @@ begin
     x.pipe := TPipeline.Create(opts.threads, True, 0, 0);
     x.pipe.SetPost(@x.hc.Check);
     x.cur := -1;
+    total := 0;
+    for i := 0 to n - 1 do
+      if (act[i] <> acSkip) and (sel[i].kind = ET_FILE) then
+        Inc(total, sel[i].meta.size);
+    x.prog := TProgress.Create(opts.progress, total);
     for k := 0 to x.pipe.Slots - 1 do
       x.StartAccess(k);
 
@@ -1974,6 +2002,7 @@ begin
           ApplyMeta(local, sel[i].meta, opts.noPerms, opts.noOwner);
           Inc(x.nLinks);
         end;
+      x.prog.Finish;
       { directories last, deepest first: writing in them changed their times }
       for i := n - 1 downto 0 do
         if (act[i] <> acSkip) and (sel[i].kind = ET_DIR) then
@@ -1984,6 +2013,9 @@ begin
     end;
     Result := x.status;
   finally
+    if x.prog <> nil then
+      x.prog.Finish;
+    x.prog.Free;
     x.pipe.Free;
     x.hc.Free;
     x.a.Free;

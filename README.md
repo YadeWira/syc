@@ -141,8 +141,8 @@ Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/
 
 ## Use
 
-The command line is being built in stages (see the wiki's Roadmap). The
-archive format stays provisional until 1.0.
+Every command and option: [Usage](https://github.com/YadeWira/syc/wiki/Usage) (and `syc h CMD`).
+The archive format stays provisional until 1.0.
 
 ```sh
 out/syc a backup.syc docs/ photos/   # a new archive: deduplicated, solid blocks

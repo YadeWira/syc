@@ -14,7 +14,7 @@ uses
   SysUtils, sylz, sycblocks;
 
 const
-  SYC_VERSION   = '0.3.2';
+  SYC_VERSION   = '0.3.3';
   STREAM_SUFFIX = '.sylz';
   DEFAULT_STREAM_BLOCK_MIB = 4;
   DEFAULT_ARCHIVE_BLOCK_MIB = 16;
@@ -34,6 +34,7 @@ type
     skipExisting: Boolean;   { x --skip }
     removeInput: Boolean;    { --rm }
     verbosity: TVerbosity;
+    progress: Boolean;       { --progress / --no-progress; default: stderr is a terminal }
     cdDir: string;           { -C }
     excludes: array of string;   { -X }
     noDedup, noDelete: Boolean;
@@ -100,7 +101,7 @@ end;
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
-    oQuiet, oVerbose, oHelp);
+    oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
     id: TOptId;
@@ -110,7 +111,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..20] of TOptDef = (
+  OPTION_DEFS: array[0..22] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
@@ -129,6 +130,8 @@ const
     (id: oUntil;   short: 'u';  long: 'until';      value: True;  cmds: 'xl'),
     (id: oNoPerms; short: '';   long: 'no-perms';   value: False; cmds: 'x'),
     (id: oNoOwner; short: '';   long: 'no-owner';   value: False; cmds: 'x'),
+    (id: oProgress; short: '';  long: 'progress';   value: False; cmds: 'axcdt'),
+    (id: oNoProgress; short: ''; long: 'no-progress'; value: False; cmds: 'axcdt'),
     (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'axlicdt'),
     (id: oVerbose; short: 'v';  long: 'verbose';    value: False; cmds: 'axlicdt'),
     (id: oHelp;    short: 'h';  long: 'help';       value: False; cmds: 'axlicdt')
@@ -138,26 +141,25 @@ const
 
 procedure Usage;
 begin
-  WriteLn('syc ', SYC_VERSION, ' — sylz compressor. Tuned for modest hardware.');
+  WriteLn('syc ', SYC_VERSION, ' — sylz archiver and compressor. Tuned for modest hardware.');
   WriteLn;
   WriteLn('Archives (.syc: files and directories, versions, deduplicated):');
-  WriteLn('  syc a [options] ARCHIVE PATH...   add PATHs: a new archive, or a new version');
-  WriteLn('  syc x [options] ARCHIVE [FILTER...]   extract');
-  WriteLn('  syc l [options] ARCHIVE [FILTER...]   list');
-  WriteLn('  syc i ARCHIVE                     versions, sizes, deduplication');
+  WriteLn('  syc a [options] ARCHIVE PATH...      add: a new archive, or a new version');
+  WriteLn('  syc x [options] ARCHIVE [FILTER...]  extract');
+  WriteLn('  syc l [options] ARCHIVE [FILTER...]  list');
+  WriteLn('  syc i ARCHIVE                        versions, sizes, deduplication');
   WriteLn;
-  WriteLn('One file (.sylz stream):');
-  WriteLn('  syc c [options] [FILE...]     compress each FILE to FILE', STREAM_SUFFIX,
-    ' (none or -: stdin to stdout)');
-  WriteLn('  syc d [options] [FILE...]     decompress each FILE', STREAM_SUFFIX,
-    ' to FILE (none or -: stdin to stdout)');
+  WriteLn('One file (.sylz stream; no FILE or -: stdin to stdout):');
+  WriteLn('  syc c [options] [FILE...]            compress each FILE to FILE', STREAM_SUFFIX);
+  WriteLn('  syc d [options] [FILE...]            decompress each FILE', STREAM_SUFFIX, ' to FILE');
   WriteLn;
-  WriteLn('  syc t [options] [FILE...]     test archives and streams: check, write nothing');
-  WriteLn('  syc h [CMD]                   help (also syc CMD -h)');
+  WriteLn('  syc t [options] [FILE...]            check archives and streams, write nothing');
+  WriteLn('  syc h CMD, syc CMD -h                a command''s options');
   WriteLn('  syc -V, --version');
   WriteLn;
-  WriteLn('Exit status: 0 ok, 1 some inputs skipped or unreadable, 2 usage,');
-  WriteLn('3 corrupt data, 4 I/O error or out of memory.');
+  WriteLn('An ARCHIVE of - is stdin (stdout for a new one). Exit status: 0 ok,');
+  WriteLn('1 something skipped or unreadable, 2 usage, 3 corrupt data, 4 I/O error');
+  WriteLn('or out of memory.');
 end;
 
 procedure LevelUsage;
@@ -171,6 +173,12 @@ begin
   WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
     ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do,');
   WriteLn('              9-10 price literals by their Huffman codes');
+end;
+
+procedure ProgressUsage(cmd: Char);
+begin
+  if cmd in ['a', 'x', 'c', 'd', 't'] then
+    WriteLn('  --progress, --no-progress   progress on stderr (default: if it is a terminal)');
 end;
 
 procedure CmdUsage(cmd: Char);
@@ -197,6 +205,7 @@ begin
         WriteLn('                         version (by default it is marked deleted; older');
         WriteLn('                         versions keep it either way: syc x -u)');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
         WriteLn;
         WriteLn('Paths are stored relative: a leading / or drive letter is dropped, and');
         WriteLn('a path with .. is refused (use -C).');
@@ -218,6 +227,7 @@ begin
         WriteLn('  --no-owner             do not set the owner (only root sets it anyway)');
         WriteLn('  -t, --threads N        blocks decompressed N at a time, default 1');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
       end;
     'l':
       begin
@@ -230,6 +240,7 @@ begin
         WriteLn('  --all                  every version of each path, deletions included');
         WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
       end;
     'i':
       begin
@@ -251,6 +262,7 @@ begin
         WriteLn('  -f, --force            overwrite an existing output; write to a terminal');
         WriteLn('  --rm                   delete FILE once it is compressed');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
       end;
     'd':
       begin
@@ -263,6 +275,7 @@ begin
         WriteLn('  -f, --force            overwrite an existing output');
         WriteLn('  --rm                   delete FILE once it is decompressed');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
       end;
     't':
       begin
@@ -273,6 +286,7 @@ begin
         WriteLn;
         WriteLn('  -t, --threads N        blocks checked N at a time, default 1');
         WriteLn('  -q, --quiet / -v, --verbose');
+        ProgressUsage(cmd);
       end;
   end;
 end;
@@ -293,7 +307,9 @@ var
   i, j, k: Integer;
   arg, name, value, shown: string;
   hasValue, noMore: Boolean;
+  progressSet: Integer;   { -1: not given }
 begin
+  progressSet := -1;
   opts := Default(TOptions);
   opts.level := SYLZ_DEFLEVEL;
   opts.blockMiB := 0;
@@ -440,6 +456,8 @@ begin
         end;
       oNoPerms: opts.noPerms := True;
       oNoOwner: opts.noOwner := True;
+      oProgress: progressSet := 1;
+      oNoProgress: progressSet := 0;
       oQuiet: opts.verbosity := vQuiet;
       oVerbose: opts.verbosity := vVerbose;
       oHelp:
@@ -463,6 +481,10 @@ begin
     opts.outPath := '';
     opts.toStdout := True;
   end;
+  if progressSet >= 0 then
+    opts.progress := progressSet = 1
+  else
+    opts.progress := (opts.verbosity <> vQuiet) and IsTerminal(2);
   if opts.blockMiB = 0 then
     if opts.cmd = 'a' then
       opts.blockMiB := DEFAULT_ARCHIVE_BLOCK_MIB

@@ -66,6 +66,17 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## CLI stage 8: progress, help, Usage page (2026-10-24)
+
+- TProgress (sycblocks): one line on stderr rewritten with CR at most 5
+  times a second: percent, bytes, speed, time left (bytes and speed only
+  when the total is unknown, as for stdin). On by default when stderr is
+  a terminal and not -q; --progress / --no-progress. `a` counts the bytes
+  read of the files to store, `x` the bytes written, `t` the bytes
+  checked, `c` the bytes read, `d` the compressed bytes read.
+- The help: one summary (syc h) and a page per command (syc h CMD);
+  the wiki's Usage page has the rest.
+
 ## Archiver stage 7: symlinks on Windows (2026-10-24)
 
 - Stored: a reparse point tagged as a symlink (its print name, read with

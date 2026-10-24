@@ -10,7 +10,7 @@ interface
 uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}termio,{$endif}
-  SysUtils, Classes, sylz;
+  SysUtils, Classes, Math, sylz;
 
 const
   MAX_BLOCK   = 512 shl 20;
@@ -116,6 +116,20 @@ type
     procedure Start(slot: Integer);    { slot's job is ready: work on it }
     procedure Finish(slot: Integer);   { wait until slot's job is done }
     procedure RunJob(job: TJob);
+  end;
+
+  { A progress line on stderr, rewritten in place at most 5 times a second:
+    percent (when the total is known), bytes, speed, time left. Nothing
+    when disabled. }
+  TProgress = class
+    enabled: Boolean;
+    total, done: Int64;
+    started, lastShown: QWord;
+    width: Integer;
+    constructor Create(aEnabled: Boolean; aTotal: Int64);
+    procedure Add(n: Int64);
+    procedure Show;
+    procedure Finish;   { clears the line }
   end;
 
   { Runs proc(0) .. proc(count - 1) on N threads (the calling one among
@@ -478,6 +492,78 @@ var
 begin
   for i := 0 to High(jobs) do
     jobs[i].post := p;
+end;
+
+{ ── progress ───────────────────────────────────────────────────────────── }
+
+function Human(n: Double): string;
+begin
+  if n < 1e6 then
+    Result := Format('%.0f kB', [n / 1e3])
+  else if n < 1e9 then
+    Result := Format('%.1f MB', [n / 1e6])
+  else
+    Result := Format('%.2f GB', [n / 1e9]);
+end;
+
+constructor TProgress.Create(aEnabled: Boolean; aTotal: Int64);
+begin
+  inherited Create;
+  enabled := aEnabled;
+  total := aTotal;
+  started := GetTickCount64;
+  lastShown := started;
+end;
+
+procedure TProgress.Add(n: Int64);
+var
+  now: QWord;
+begin
+  Inc(done, n);
+  if not enabled then
+    Exit;
+  now := GetTickCount64;
+  if now - lastShown >= 200 then
+  begin
+    lastShown := now;
+    Show;
+  end;
+end;
+
+procedure TProgress.Show;
+var
+  secs, speed, left: Double;
+  line: string;
+begin
+  secs := (GetTickCount64 - started) / 1000;
+  if secs <= 0 then
+    secs := 0.001;
+  speed := done / secs;
+  if total > 0 then
+  begin
+    line := Format('%3d%%  %s / %s  %s/s', [Min(100, done * 100 div total), Human(done),
+      Human(total), Human(speed)]);
+    if (speed > 0) and (done < total) then
+    begin
+      left := (total - done) / speed;
+      line := line + Format('  %d:%.2d left', [Trunc(left) div 60, Trunc(left) mod 60]);
+    end;
+  end
+  else
+    line := Format('%s  %s/s', [Human(done), Human(speed)]);
+  if Length(line) < width then
+    line := line + StringOfChar(' ', width - Length(line));
+  width := Length(line);
+  Write(StdErr, #13, line);
+end;
+
+procedure TProgress.Finish;
+begin
+  if enabled and (width > 0) then
+  begin
+    Write(StdErr, #13, StringOfChar(' ', width), #13);
+    width := 0;
+  end;
 end;
 
 { ── the task pool ──────────────────────────────────────────────────────── }
