@@ -7,7 +7,8 @@
 # Usage: tests/arctest.sh SAMPLES-DIR WORK-DIR   (WORK-DIR: new or empty;
 #        SAMPLES-DIR is copied, never written)
 set -e
-SYC=${SYC:-$(cd "$(dirname "$0")/.." && pwd)/out/syc}
+here=$(cd "$(dirname "$0")/.." && pwd)
+SYC=${SYC:-$here/out/syc}
 src=$1
 work=$2
 [ -d "$src" ] && [ -n "$work" ] || { echo "usage: $0 SAMPLES-DIR WORK-DIR" >&2; exit 2; }
@@ -148,6 +149,20 @@ for n in sorted(set([base + 1, base + 16, base + 17, full - 25, full - 24, full 
         print('FAIL: cut at %d: t %d, a %d, t %d, l %d' % (n, r1, r2, r3, r4)); bad += 1
 sys.exit(1 if bad else 0)
 PY
+
+# the test vectors: written by this syc, read by the reference reader
+# (tools/syc_ref.py, from the wiki's format pages) and by syc
+rm -rf vectors
+python3 -I "$here/tests/syc_vectors.py" "$SYC" vectors "$first" || { echo "FAIL: writing the vectors"; fail=1; }
+python3 -I "$here/tools/syc_ref.py" --check vectors > out.txt || { echo "FAIL: the reference reader"; cat out.txt; fail=1; }
+for f in vectors/*.syc vectors/*.sylz; do
+  case $f in
+    */bad-*) want=3 ;;
+    *-tail.syc) want=1 ;;
+    *) want=0 ;;
+  esac
+  check "syc t $f" $want "$SYC" t -q "$f"
+done
 
 # refusals
 echo notanarchive > fake.syc

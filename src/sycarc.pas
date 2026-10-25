@@ -849,6 +849,8 @@ type
     fragOff: array of UInt32;     { offset in its block }
     fragBlock: array of UInt32;   { its block, in blocks[] }
     damaged: Boolean;             { bytes after the last good commit }
+    fmt: Byte;                    { ARC_FMT, or 1 }
+    vheadSize: Integer;           { VHEAD_SIZE, or VHEAD_SIZE_1 }
     allowEmpty: Boolean;          { an archive with no complete version is not an error }
     constructor Open(const path, aName: string; aAllowEmpty: Boolean = False);
     destructor Destroy; override;
@@ -884,7 +886,7 @@ begin
   istart := LEtoN(PInt64(@c[12])^);
   { a version holds at least its head, the end of its blocks and the
     index's header }
-  Result := Result and (vstart >= HEADER_SIZE) and (istart >= vstart + VHEAD_SIZE + 4)
+  Result := Result and (vstart >= HEADER_SIZE) and (istart >= vstart + a.vheadSize + 4)
     and (istart + 4 + BLOCKHDR_SIZE <= at);
 end;
 
@@ -908,8 +910,13 @@ begin
   size := fs.Size;
   if not ReadAt(0, @hdr, HEADER_SIZE) or (CompareByte(hdr[0], ARC_MAGIC[1], 4) <> 0) then
     Corrupt('not a syc archive');
-  if hdr[4] <> ARC_FMT then
+  if (hdr[4] <> ARC_FMT) and (hdr[4] <> 1) then
     Corrupt(Format('archive format %d not supported by syc %s', [hdr[4], SYC_VERSION]));
+  fmt := hdr[4];
+  if fmt = 1 then
+    vheadSize := VHEAD_SIZE_1
+  else
+    vheadSize := VHEAD_SIZE;
   if not ((hdr[5] >= 6) and (hdr[5] < hdr[6]) and (hdr[6] < hdr[7]) and (hdr[7] <= 24)) then
     Corrupt('bad fragment parameters in the header');
   prm := CdcParams(hdr[5], hdr[6], hdr[7]);
@@ -969,7 +976,7 @@ begin
   while at < size do
   begin
     good := ReadAt(at, @w, 4) and (CompareByte(w[0], VHEAD_MAGIC[1], 4) = 0);
-    p := at + VHEAD_SIZE;
+    p := at + vheadSize;
     while good do
     begin
       if not ReadAt(p, @w, 4) then
@@ -1024,8 +1031,16 @@ var
   blk: ^TArcBlock;
 begin
   v := @versions[k];
-  if not ReadAt(v^.vstart, @head, VHEAD_SIZE) or (CompareByte(head[0], VHEAD_MAGIC[1], 4) <> 0) then
+  if not ReadAt(v^.vstart, @head, vheadSize) or (CompareByte(head[0], VHEAD_MAGIC[1], 4) <> 0) then
     Corrupt(Format('version %d: bad header', [k + 1]));
+  { format 2: the codec, then three reserved zero bytes }
+  if fmt >= 2 then
+  begin
+    if (head[17] <> 0) or (head[18] <> 0) or (head[19] <> 0) then
+      Corrupt(Format('version %d: bad header', [k + 1]));
+    if head[16] <> CODEC_SYLZ then
+      Corrupt(Format('version %d: codec %d not supported by syc %s', [k + 1, head[16], SYC_VERSION]));
+  end;
   v^.vnum := LEtoN(PUInt32(@head[4])^);
   v^.time := LEtoN(PInt64(@head[8])^);
   if v^.vnum <> k + 1 then
@@ -1074,7 +1089,7 @@ begin
   SetLength(fragBlock, firstFrag - 1 + nf);
   v^.firstBlock := Length(blocks);
   SetLength(blocks, Length(blocks) + Length(v^.idx.blocks));
-  p := v^.vstart + VHEAD_SIZE;
+  p := v^.vstart + vheadSize;
   f := 0;
   for i := 0 to High(v^.idx.blocks) do
   begin
@@ -1230,6 +1245,8 @@ var
   c: Integer;
   goodEnd, vstart, total: Int64;
   vnum: UInt32;
+  fmt: Byte;
+  vheadSize: Integer;
   hdr: array[0..HEADER_SIZE - 1] of Byte;
   vhead: array[0..VHEAD_SIZE - 1] of Byte;
   fs: TFileStream;
@@ -1255,10 +1272,12 @@ begin
     prev := nil;
     goodEnd := 0;
     vnum := 1;
+    fmt := ARC_FMT;   { appending: the archive's own }
     if appending then
     begin
       arc := TArchive.Open(arcPath, arcPath, True);
       a.prm := arc.prm;
+      fmt := arc.fmt;
       prev := arc.State(Length(arc.versions));
       for i := 0 to High(arc.versions) do
         with arc.versions[i] do
@@ -1403,11 +1422,17 @@ begin
         goodEnd := HEADER_SIZE;
       end;
       vstart := goodEnd;
+      if fmt = 1 then
+        vheadSize := VHEAD_SIZE_1
+      else
+        vheadSize := VHEAD_SIZE;
+      FillChar(vhead, SizeOf(vhead), 0);
       Move(VHEAD_MAGIC[1], vhead[0], 4);
       PUInt32(@vhead[4])^ := NtoLE(vnum);
       PInt64(@vhead[8])^ := NtoLE(UnixNow);
-      a.fout.WriteBuffer(vhead, VHEAD_SIZE);
-      a.pos := vstart + VHEAD_SIZE;
+      vhead[16] := CODEC_SYLZ;   { format 2 only: format 1 ends before }
+      a.fout.WriteBuffer(vhead, vheadSize);
+      a.pos := vstart + vheadSize;
 
       a.blockSize := SizeInt(opts.blockMiB) shl 20;
       a.pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);

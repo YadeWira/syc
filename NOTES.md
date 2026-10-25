@@ -66,6 +66,31 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Formats frozen: archive format 2, stream version 4 (2026-10-24)
+
+- Before freezing, a codec byte: the archive's version head grows from 16
+  to 20 bytes (codec:u8, 1 = sylz, and three reserved zero bytes), the
+  stream's header from 6 to 7 (version 4, codec after it). Other codecs
+  on the roadmap can then live in the same formats. Archive format 1 and
+  stream versions 1-3 (syc 0.2.2-0.3.4) are still read; a format 1
+  archive is appended to in format 1, so syc 0.3.4 keeps reading it.
+  syc 0.3.4 refuses the new ones with "format 2 / version 4 not
+  supported" instead of misreading them.
+- The wiki pages say every range and check a reader needs (the header's
+  fragment parameters, block and fragment sizes, path and target
+  lengths, reference ranges, where blocks, index and commit must meet).
+- `tools/syc_ref.py`: a reference reader in Python written from those
+  pages (sylz blocks through tools/sylz_ref.py): lists, extracts, checks
+  every CRC and fragment hash, finds the complete versions by structure
+  first, as the page says.
+- `tests/syc_vectors.py` writes test vectors with syc from trees it
+  builds (mtimes, permissions, setuid, links, a dangling one, non-ASCII
+  names, sizes around the limits, duplicates, four versions with a type
+  change and a path coming back, -ec and stored blocks, several blocks, a
+  tail after the last version, three damaged archives; six streams); the
+  expected states come from the trees, not from syc. tests/arctest.sh
+  writes them and checks them with the reference reader and `syc t`.
+
 ## Verifications left from the CLI stages (2026-10-24)
 
 - **Owner, as root** (sudo, in a scratch directory): files, a directory

@@ -75,7 +75,7 @@ const
   Codec: TZsCodec = (
     abi: ZS_CODEC_ABI;
     name: 'sylz';
-    library_: 'sylz format v2 (syc 0.3.4)';
+    library_: 'sylz format v2 (syc 0.4.0)';
     min_level: SYLZ_MINLEVEL;   { 0 = fastest; the default is 1 }
     max_level: SYLZ_MAXLEVEL;
     bound: @CodecBound;

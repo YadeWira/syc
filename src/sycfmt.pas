@@ -16,9 +16,13 @@ const
   VHEAD_MAGIC   = 'SYCV';
   INDEX_MAGIC   = 'SYCI';
   COMMIT_MAGIC  = 'SYCE';
-  ARC_FMT       = 1;
+  ARC_FMT       = 2;    { 2: the version head names its codec (syc 0.4.0-);
+                          1: no codec, sylz implied (syc 0.3.1-0.3.4), read
+                          and appended to as such }
   HEADER_SIZE   = 8;
-  VHEAD_SIZE    = 16;
+  VHEAD_SIZE    = 20;   { format 2; 16 in format 1 }
+  VHEAD_SIZE_1  = 16;
+  CODEC_SYLZ    = 1;    { blocks are sylz blocks, format v2 or v3 }
   BLOCKHDR_SIZE = 12;
   COMMIT_SIZE   = 24;
 

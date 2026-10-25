@@ -142,7 +142,9 @@ Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/
 ## Use
 
 Every command and option: [Usage](https://github.com/YadeWira/syc/wiki/Usage) (and `syc h CMD`).
-The archive format stays provisional until 1.0.
+The archive (`.syc`, format 2) and stream (`.sylz`, version 4) formats are
+frozen since v0.4.0: [syc archive format](https://github.com/YadeWira/syc/wiki/syc-archive-format),
+[syc stream format](https://github.com/YadeWira/syc/wiki/syc-stream-format).
 
 ```sh
 out/syc a backup.syc docs/ photos/   # a new archive: deduplicated, solid blocks

@@ -1,16 +1,17 @@
 { sycstream — syc c / d / t: one file (or stdin) as a .sylz stream.
 
-    stream := "SYZ0" version:u8 level:u8 block* end
-              version 3 = sylz format v2 or v3 blocks, v3 literal chunks
-              with four stream sizes; 2: the same with three (syc
-              0.2.5-0.2.13); 1: v2 only. All read.
+    stream := "SYZ0" 4 codec:u8 level:u8 block* end
+              codec 1 = sylz (format v2 or v3 blocks); level is what the
+              writer used, for information. Versions 1-3 (syc 0.2.2-0.3.4)
+              have no codec byte and are read too: 3 = v2 or v3 blocks, 2 =
+              v3 literal chunks with three stream sizes, 1 = v2 only.
     block  := rawLen:u32le packed:u32le crc32:u32le payload
               packed bit 31 set = payload stored raw, else a sylz block;
               the low 31 bits are the payload length
     end    := rawLen = 0 (4 zero bytes)
 
-  crc32 is of the raw block, checked on decompression. The format is
-  provisional until syc 1.0. }
+  crc32 is of the raw block, checked on decompression. Frozen at syc
+  0.4.0 (wiki: syc stream format). }
 unit sycstream;
 
 {$mode objfpc}{$H+}
@@ -27,10 +28,11 @@ implementation
 
 const
   MAGIC        = 'SYZ0';
-  FORMAT_VER   = 3;   { 3: sylz v2 or v3 blocks, v3 chunks of mode 2 (syc
-                        0.2.14-); 2: v3 chunks of mode 1 (syc 0.2.5-0.2.13);
-                        1: v2 only (syc 0.2.2-); 0 was sylz v1 (syc
-                        0.2.0-0.2.1) }
+  FORMAT_VER   = 4;   { 4: a codec byte (syc 0.4.0-); 3: sylz v2 or v3
+                        blocks, v3 chunks of mode 2 (syc 0.2.14-0.3.4); 2:
+                        v3 chunks of mode 1 (syc 0.2.5-0.2.13); 1: v2 only
+                        (syc 0.2.2-); 0 was sylz v1 (syc 0.2.0-0.2.1) }
+  CODEC_SYLZ   = 1;
   STORED_FLAG  = UInt32($80000000);
   PAYLOAD_MASK = UInt32($7FFFFFFF);
 
@@ -38,7 +40,7 @@ const
 procedure Compress(fin, fout: TStream; const opts: TOptions; prog: TProgress; out total, written: Int64);
 var
   pipe: TPipeline;
-  hdr: array[0..5] of Byte;
+  hdr: array[0..6] of Byte;
   blockSize: SizeInt;
   blocks, b, slot: Int64;
   i: Integer;
@@ -77,14 +79,12 @@ begin
     for i := 0 to pipe.Slots - 1 do
       pipe.jobs[i].Reserve(blockSize, SylzBound(blockSize));
     Move(MAGIC[1], hdr[0], 4);
-    if opts.flags and SYLZ_ENTROPY <> 0 then
-      hdr[4] := FORMAT_VER
-    else
-      hdr[4] := 1;   { readable by syc 0.2.2-0.2.4 }
-    hdr[5] := Byte(opts.level);
-    fout.WriteBuffer(hdr, 6);
+    hdr[4] := FORMAT_VER;
+    hdr[5] := CODEC_SYLZ;
+    hdr[6] := Byte(opts.level);
+    fout.WriteBuffer(hdr, 7);
     total := 0;
-    written := 6;
+    written := 7;
     blocks := 0;
     eof := False;
     { block b goes to slot b mod Slots; before a slot takes a new block,
@@ -125,7 +125,7 @@ var
   pipe: TPipeline;
   job: TJob;
   rawLen, packedField, sum, payLen: UInt32;
-  hdr: array[0..5] of Byte;
+  hdr: array[0..6] of Byte;
   at: Int64;
   blocks, b, slot: Int64;
 
@@ -150,6 +150,14 @@ begin
   if (hdr[4] < 1) or (hdr[4] > FORMAT_VER) then
     Fail(EXIT_CORRUPT, Format('%s: stream format version %d not supported by syc %s',
       [name, hdr[4], SYC_VERSION]));
+  { version 4: hdr[5] is the codec; the level byte follows }
+  if hdr[4] >= 4 then
+  begin
+    if hdr[5] <> CODEC_SYLZ then
+      Fail(EXIT_CORRUPT, Format('%s: codec %d not supported by syc %s', [name, hdr[5], SYC_VERSION]));
+    if ReadFull(fin, @hdr[6], 1) <> 1 then
+      Fail(EXIT_CORRUPT, name + ': truncated');
+  end;
   pipe := TPipeline.Create(threads, True, 0, 0);
   try
     at := 0;
