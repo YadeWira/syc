@@ -66,6 +66,31 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Encryption, stage 2: the primitives (2026-10-24)
+
+Plan and format: wiki "syc encryption" (draft, approved by the user).
+`src/syccrypto.pas` (Pascal reference): BLAKE2b, Argon2id v1.3,
+ChaCha20, HChaCha20, Poly1305 (5 x 26-bit limbs), XChaCha20-Poly1305,
+RandomBytes (getrandom / BCryptGenRandom), SameBytes (constant time),
+Wipe; `src/blake2s.pas` gained the keyed mode (also in the C lanes: a
+lane runs the padded key block first).
+
+- Test vectors fetched from the RFCs' text (RFC 7693 A, RFC 8439 2.3.2,
+  2.4.2, 2.5.2, 2.8.2, xchacha draft 2.2.1 and A.3.1, RFC 9106 5.3) and
+  checked against hashlib, cryptography, PyNaCl and OpenSSL before use;
+  tests/cryptotest passes all of them with the Pascal and the C paths,
+  on the first try.
+- tools/crypto_xcheck.py recomputes `cryptotest --dump N` (random
+  inputs: BLAKE2b at every length, keyed BLAKE2s one at a time and in
+  lanes, ChaCha20 at random counters, Poly1305, XChaCha20-Poly1305 both
+  ways, Argon2id with p 1-4 through OpenSSL and p = 1 also through
+  libsodium): no mismatch on x86-64, arm64 (qemu), win32 and win64
+  (wine), C and Pascal paths.
+- Speed (x86-64, CPU 20): XChaCha20-Poly1305 Pascal 84 MB/s, C 473 (four
+  ChaCha20 blocks in vector lanes, Poly1305 with 64-bit products);
+  Argon2id m=64 MiB t=3 Pascal 406 ms, C 204. win32 (wine): 148 MB/s and
+  435 ms in C.
+
 ## One plugin file, two codecs (2026-10-24)
 
 zpaq-std asked (for its 1.8.0) for sylz and sylzec in one file, like

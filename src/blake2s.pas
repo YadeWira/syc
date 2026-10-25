@@ -33,13 +33,20 @@ type
   end;
 
 procedure Blake2sInit(out s: TBlake2s);
+{ keyed (RFC 7693 3.3): keyLen 1..32 bytes of key; 0 is Blake2sInit }
+procedure Blake2sInitKey(out s: TBlake2s; key: PByte; keyLen: Integer);
 procedure Blake2sUpdate(var s: TBlake2s; p: PByte; n: SizeInt);
 procedure Blake2sFinal(var s: TBlake2s; out digest: TBlake2sDigest);
 { the hash of p[0..n) in one call }
 procedure Blake2s256(p: PByte; n: SizeInt; out digest: TBlake2sDigest);
+{ the same, keyed }
+procedure Blake2s256Key(key: PByte; keyLen: Integer; p: PByte; n: SizeInt; out digest: TBlake2sDigest);
 { the hashes of count messages (msg[k], len[k]) into digests[k]: in C,
   four at a time in vector lanes; the same as Blake2s256 on each }
 procedure Blake2sMany(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
+{ the same, keyed }
+procedure Blake2sManyKey(key: PByte; keyLen: Integer; msg: PPByte; len: PSizeInt;
+  count: SizeInt; digests: PByte);
 
 var
   { the C block function (when built in); False: the Pascal one }
@@ -50,8 +57,8 @@ implementation
 {$ifndef SYLZ_PUREPASCAL}
 procedure sylzc_blake2s_blocks(h: PUInt32; p: PByte; n: SizeInt; t: PUInt64; last: LongInt);
   cdecl; external name 'sylzc_blake2s_blocks';
-procedure sylzc_blake2s_many(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
-  cdecl; external name 'sylzc_blake2s_many';
+procedure sylzc_blake2s_many(key: PByte; keyLen: LongInt; msg: PPByte; len: PSizeInt;
+  count: SizeInt; digests: PByte); cdecl; external name 'sylzc_blake2s_many';
 {$endif}
 
 const
@@ -165,13 +172,26 @@ begin
   end;
 end;
 
-procedure Blake2sInit(out s: TBlake2s);
+procedure Blake2sInitKey(out s: TBlake2s; key: PByte; keyLen: Integer);
 begin
   s.h := IV;
-  { parameter block: digest length 32, no key, fanout 1, depth 1 }
-  s.h[0] := s.h[0] xor $01010000 xor BLAKE2S_OUTLEN;
+  { parameter block: digest length 32, key length, fanout 1, depth 1 }
+  s.h[0] := s.h[0] xor $01010000 xor (UInt32(keyLen) shl 8) xor BLAKE2S_OUTLEN;
   s.t := 0;
   s.bufLen := 0;
+  if keyLen > 0 then
+  begin
+    { the key, padded to a block, goes first: a buffered full block,
+      compressed when data follows, as the last one when none does }
+    FillChar(s.buf, SizeOf(s.buf), 0);
+    Move(key^, s.buf[0], keyLen);
+    s.bufLen := 64;
+  end;
+end;
+
+procedure Blake2sInit(out s: TBlake2s);
+begin
+  Blake2sInitKey(s, nil, 0);
 end;
 
 procedure Blake2sUpdate(var s: TBlake2s; p: PByte; n: SizeInt);
@@ -228,19 +248,35 @@ begin
   Blake2sFinal(s, digest);
 end;
 
-procedure Blake2sMany(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
+procedure Blake2s256Key(key: PByte; keyLen: Integer; p: PByte; n: SizeInt; out digest: TBlake2sDigest);
+var
+  s: TBlake2s;
+begin
+  Blake2sInitKey(s, key, keyLen);
+  Blake2sUpdate(s, p, n);
+  Blake2sFinal(s, digest);
+  FillChar(s, SizeOf(s), 0);
+end;
+
+procedure Blake2sManyKey(key: PByte; keyLen: Integer; msg: PPByte; len: PSizeInt;
+  count: SizeInt; digests: PByte);
 var
   k: SizeInt;
 begin
 {$ifndef SYLZ_PUREPASCAL}
   if Blake2sUseC then
   begin
-    sylzc_blake2s_many(msg, len, count, digests);
+    sylzc_blake2s_many(key, keyLen, msg, len, count, digests);
     Exit;
   end;
 {$endif}
   for k := 0 to count - 1 do
-    Blake2s256(msg[k], len[k], PBlake2sDigest(digests + k * BLAKE2S_OUTLEN)^);
+    Blake2s256Key(key, keyLen, msg[k], len[k], PBlake2sDigest(digests + k * BLAKE2S_OUTLEN)^);
+end;
+
+procedure Blake2sMany(msg: PPByte; len: PSizeInt; count: SizeInt; digests: PByte);
+begin
+  Blake2sManyKey(nil, 0, msg, len, count, digests);
 end;
 
 end.

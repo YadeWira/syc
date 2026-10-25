@@ -1151,11 +1151,20 @@ static __attribute__((unused)) uint32_t b2s_load32(const uint8_t *p)
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-/* h after its blocks, then the last (partial or empty) block: the digest */
-static void b2s_finish(uint32_t *h, uint64_t t, const uint8_t *p, intptr_t left, uint8_t *out)
+/* h after its blocks, then the last (partial or empty) block: the digest.
+   kpad: the key block still to go first (keyed, RFC 7693 3.3), or NULL */
+static void b2s_finish(uint32_t *h, uint64_t t, const uint8_t *kpad, const uint8_t *p,
+                       intptr_t left, uint8_t *out)
 {
     uint8_t last[64];
-    intptr_t i, full = left > 0 ? (left - 1) / 64 : 0;
+    intptr_t i, full;
+    if (kpad) {
+        /* with an empty message the key block is the last one */
+        sylzc_blake2s_blocks(h, kpad, 1, &t, left == 0);
+        if (left == 0)
+            goto done;
+    }
+    full = left > 0 ? (left - 1) / 64 : 0;
     sylzc_blake2s_blocks(h, p, full, &t, 0);
     p += 64 * full;
     left -= 64 * full;
@@ -1163,6 +1172,7 @@ static void b2s_finish(uint32_t *h, uint64_t t, const uint8_t *p, intptr_t left,
         last[i] = i < left ? p[i] : 0;
     t = t + left - 64;   /* the final block counts its bytes only */
     sylzc_blake2s_blocks(h, last, 1, &t, 1);
+done:
     for (i = 0; i < 8; i++) {
         out[4 * i] = (uint8_t)h[i];
         out[4 * i + 1] = (uint8_t)(h[i] >> 8);
@@ -1173,7 +1183,8 @@ static void b2s_finish(uint32_t *h, uint64_t t, const uint8_t *p, intptr_t left,
 
 #define B2S_LANES 4
 
-static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
+static __attribute__((unused)) void b2s_many_core(const uint8_t *kpad, int keyLen,
+                          const uint8_t *const *msg, const intptr_t *len, intptr_t count,
                           uint8_t *out)
 {
     static const uint8_t zero[64];
@@ -1182,6 +1193,7 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
     intptr_t left[B2S_LANES], which[B2S_LANES], next = 0;
     uint64_t t[B2S_LANES];
     uint8_t pad[B2S_LANES][64];
+    int keyFirst[B2S_LANES], advance[B2S_LANES];
     int l, i, active = 0;
 
     for (l = 0; l < B2S_LANES; l++)
@@ -1200,7 +1212,8 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
                 t[l] = 0;
                 for (i = 0; i < 8; i++)
                     h[i][l] = b2s_iv[i];
-                h[0][l] ^= 0x01010000u ^ 32;
+                h[0][l] ^= 0x01010000u ^ ((uint32_t)keyLen << 8) ^ 32;
+                keyFirst[l] = keyLen > 0;
                 next++;
                 active++;
             }
@@ -1208,9 +1221,18 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
             break;
         for (l = 0; l < B2S_LANES; l++) {
             last[l] = 0;
+            advance[l] = 1;
             if (which[l] < 0)
                 blk[l] = zero;
-            else if (left[l] > 64) {
+            else if (keyFirst[l]) {
+                /* keyed: the key block first, the last one when the
+                   message is empty */
+                blk[l] = kpad;
+                t[l] += 64;
+                last[l] = left[l] == 0;
+                keyFirst[l] = 0;
+                advance[l] = 0;
+            } else if (left[l] > 64) {
                 blk[l] = p[l];
                 t[l] += 64;
             } else {
@@ -1283,7 +1305,7 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
                 }
                 which[l] = -1;
                 active--;
-            } else {
+            } else if (advance[l]) {
                 p[l] += 64;
                 left[l] -= 64;
             }
@@ -1295,7 +1317,7 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
             uint32_t hs[8];
             for (i = 0; i < 8; i++)
                 hs[i] = h[i][l];
-            b2s_finish(hs, t[l], p[l], left[l], out + 32 * which[l]);
+            b2s_finish(hs, t[l], keyFirst[l] ? kpad : 0, p[l], left[l], out + 32 * which[l]);
         }
 }
 
@@ -1303,8 +1325,8 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *const *msg, con
 /* 32-bit x86 has 8 vector registers for the 16 vectors of the state: the
    lanes spill and ran slower than one message at a time (196 MB/s against
    310, under wine) */
-void sylzc_blake2s_many(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
-                        uint8_t *out)
+static void b2s_many_one(const uint8_t *kpad, int keyLen, const uint8_t *const *msg,
+                         const intptr_t *len, intptr_t count, uint8_t *out)
 {
     intptr_t k;
     for (k = 0; k < count; k++) {
@@ -1312,17 +1334,186 @@ void sylzc_blake2s_many(const uint8_t *const *msg, const intptr_t *len, intptr_t
         int i;
         for (i = 0; i < 8; i++)
             h[i] = b2s_iv[i];
-        h[0] ^= 0x01010000u ^ 32;
-        b2s_finish(h, 0, msg[k], len[k], out + 32 * k);
+        h[0] ^= 0x01010000u ^ ((uint32_t)keyLen << 8) ^ 32;
+        b2s_finish(h, 0, keyLen > 0 ? kpad : 0, msg[k], len[k], out + 32 * k);
     }
 }
-#else
-void sylzc_blake2s_many(const uint8_t *const *msg, const intptr_t *len, intptr_t count,
-                        uint8_t *out)
-{
-    b2s_many_core(msg, len, count, out);
-}
 #endif
+
+/* key: keyLen (0..32) bytes; with none, plain BLAKE2s-256 */
+void sylzc_blake2s_many(const uint8_t *key, int keyLen, const uint8_t *const *msg,
+                        const intptr_t *len, intptr_t count, uint8_t *out)
+{
+    uint8_t kpad[64];
+    int i;
+    for (i = 0; i < 64; i++)
+        kpad[i] = i < keyLen ? key[i] : 0;
+#if defined(__i386__)
+    b2s_many_one(kpad, keyLen, msg, len, count, out);
+#else
+    b2s_many_core(kpad, keyLen, msg, len, count, out);
+#endif
+    for (i = 0; i < 64; i++)
+        ((volatile uint8_t *)kpad)[i] = 0;
+}
+
+/* ── the encryption's primitives (syccrypto.pas, the reference) ─────── */
+
+/* ChaCha20 (RFC 8439): data[0..n) xor the key stream from block counter,
+   in place. Four blocks at a time in vector lanes while 256 bytes remain
+   (lane k is block counter + k), then one at a time. FPC's loop ran at
+   ~80 MB/s with the MAC. */
+#define CHA_QR(a, b, c, d)                                          \
+    do {                                                            \
+        a += b; d ^= a; d = (d << 16) | (d >> 16);                  \
+        c += d; b ^= c; b = (b << 12) | (b >> 20);                  \
+        a += b; d ^= a; d = (d << 8) | (d >> 24);                   \
+        c += d; b ^= c; b = (b << 7) | (b >> 25);                   \
+    } while (0)
+
+#define CHA_ROUNDS(x)                                               \
+    for (r = 0; r < 10; r++) {                                      \
+        CHA_QR(x[0], x[4], x[8],  x[12]);                           \
+        CHA_QR(x[1], x[5], x[9],  x[13]);                           \
+        CHA_QR(x[2], x[6], x[10], x[14]);                           \
+        CHA_QR(x[3], x[7], x[11], x[15]);                           \
+        CHA_QR(x[0], x[5], x[10], x[15]);                           \
+        CHA_QR(x[1], x[6], x[11], x[12]);                           \
+        CHA_QR(x[2], x[7], x[8],  x[13]);                           \
+        CHA_QR(x[3], x[4], x[9],  x[14]);                           \
+    }
+
+static void cha_store32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+void sylzc_chacha20_xor(const uint8_t *key, const uint8_t *nonce12, uint32_t counter,
+                        uint8_t *data, intptr_t n)
+{
+    uint32_t st[16];
+    int i, r;
+    st[0] = 0x61707865u; st[1] = 0x3320646Eu; st[2] = 0x79622D32u; st[3] = 0x6B206574u;
+    for (i = 0; i < 8; i++)
+        st[4 + i] = b2s_load32(key + 4 * i);
+    st[12] = counter;
+    st[13] = b2s_load32(nonce12);
+    st[14] = b2s_load32(nonce12 + 4);
+    st[15] = b2s_load32(nonce12 + 8);
+#if !defined(__i386__)
+    while (n >= 256) {
+        b2s_v4 x[16], s[16];
+        uint8_t ks[256];
+        int l;
+        for (i = 0; i < 16; i++)
+            s[i] = (b2s_v4){ st[i], st[i], st[i], st[i] };
+        s[12] += (b2s_v4){ 0, 1, 2, 3 };
+        for (i = 0; i < 16; i++)
+            x[i] = s[i];
+        CHA_ROUNDS(x)
+        for (i = 0; i < 16; i++) {
+            x[i] += s[i];
+            for (l = 0; l < 4; l++)
+                cha_store32(ks + 64 * l + 4 * i, x[i][l]);
+        }
+        for (i = 0; i < 256; i++)
+            data[i] ^= ks[i];
+        data += 256;
+        n -= 256;
+        st[12] += 4;
+    }
+#endif
+    while (n > 0) {
+        uint32_t x[16];
+        uint8_t ks[64];
+        intptr_t take = n < 64 ? n : 64;
+        for (i = 0; i < 16; i++)
+            x[i] = st[i];
+        CHA_ROUNDS(x)
+        for (i = 0; i < 16; i++)
+            cha_store32(ks + 4 * i, x[i] + st[i]);
+        for (i = 0; i < take; i++)
+            data[i] ^= ks[i];
+        data += take;
+        n -= take;
+        st[12]++;
+    }
+}
+
+/* Poly1305 over whole 16-byte blocks (hibit: 1 << 24 for full blocks, 0
+   for the padded last one), state kept between calls in st: r, h, pad as
+   5 x 26 bits (the Pascal's layout, 15 words). 64-bit products; with a
+   128-bit type the limbs would be 44 bits, kept 26 for one layout. */
+void sylzc_poly1305_blocks(uint32_t *st, const uint8_t *m, intptr_t nblocks, uint32_t hibit)
+{
+    const uint64_t r0 = st[0], r1 = st[1], r2 = st[2], r3 = st[3], r4 = st[4];
+    const uint64_t s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
+    uint64_t h0 = st[5], h1 = st[6], h2 = st[7], h3 = st[8], h4 = st[9];
+    for (; nblocks > 0; nblocks--, m += 16) {
+        uint32_t t0 = b2s_load32(m), t1 = b2s_load32(m + 4), t2 = b2s_load32(m + 8),
+                 t3 = b2s_load32(m + 12);
+        uint64_t d0, d1, d2, d3, d4, c;
+        h0 += t0 & 0x3FFFFFF;
+        h1 += ((t0 >> 26) | (t1 << 6)) & 0x3FFFFFF;
+        h2 += ((t1 >> 20) | (t2 << 12)) & 0x3FFFFFF;
+        h3 += ((t2 >> 14) | (t3 << 18)) & 0x3FFFFFF;
+        h4 += (t3 >> 8) | hibit;
+        d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+        c = d0 >> 26; h0 = d0 & 0x3FFFFFF;
+        d1 += c; c = d1 >> 26; h1 = d1 & 0x3FFFFFF;
+        d2 += c; c = d2 >> 26; h2 = d2 & 0x3FFFFFF;
+        d3 += c; c = d3 >> 26; h3 = d3 & 0x3FFFFFF;
+        d4 += c; c = d4 >> 26; h4 = d4 & 0x3FFFFFF;
+        h0 += c * 5; c = h0 >> 26; h0 &= 0x3FFFFFF;
+        h1 += c;
+    }
+    st[5] = (uint32_t)h0; st[6] = (uint32_t)h1; st[7] = (uint32_t)h2; st[8] = (uint32_t)h3;
+    st[9] = (uint32_t)h4;
+}
+
+/* Argon2's G (RFC 9106 3.5): next = P(prev ^ ref) ^ (prev ^ ref)
+   [^ next, after the first pass]; FillBlock in syccrypto.pas. */
+#define A2_ROR(x, c) (((x) >> (c)) | ((x) << (64 - (c))))
+#define A2_GB(a, b, c, d)                                                   \
+    do {                                                                    \
+        a = a + b + 2 * (uint64_t)(uint32_t)a * (uint32_t)b; d = A2_ROR(d ^ a, 32); \
+        c = c + d + 2 * (uint64_t)(uint32_t)c * (uint32_t)d; b = A2_ROR(b ^ c, 24); \
+        a = a + b + 2 * (uint64_t)(uint32_t)a * (uint32_t)b; d = A2_ROR(d ^ a, 16); \
+        c = c + d + 2 * (uint64_t)(uint32_t)c * (uint32_t)d; b = A2_ROR(b ^ c, 63); \
+    } while (0)
+#define A2_P(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15) \
+    do {                                                                    \
+        A2_GB(v0, v4, v8, v12); A2_GB(v1, v5, v9, v13);                     \
+        A2_GB(v2, v6, v10, v14); A2_GB(v3, v7, v11, v15);                   \
+        A2_GB(v0, v5, v10, v15); A2_GB(v1, v6, v11, v12);                   \
+        A2_GB(v2, v7, v8, v13); A2_GB(v3, v4, v9, v14);                     \
+    } while (0)
+
+void sylzc_argon2_fill(const uint64_t *prev, const uint64_t *ref, uint64_t *next, int withXor)
+{
+    uint64_t r[128], t[128];
+    int i;
+    for (i = 0; i < 128; i++)
+        r[i] = prev[i] ^ ref[i];
+    for (i = 0; i < 128; i++)
+        t[i] = withXor ? r[i] ^ next[i] : r[i];
+    for (i = 0; i < 8; i++)
+        A2_P(r[16 * i], r[16 * i + 1], r[16 * i + 2], r[16 * i + 3],
+             r[16 * i + 4], r[16 * i + 5], r[16 * i + 6], r[16 * i + 7],
+             r[16 * i + 8], r[16 * i + 9], r[16 * i + 10], r[16 * i + 11],
+             r[16 * i + 12], r[16 * i + 13], r[16 * i + 14], r[16 * i + 15]);
+    for (i = 0; i < 8; i++)
+        A2_P(r[2 * i], r[2 * i + 1], r[2 * i + 16], r[2 * i + 17],
+             r[2 * i + 32], r[2 * i + 33], r[2 * i + 48], r[2 * i + 49],
+             r[2 * i + 64], r[2 * i + 65], r[2 * i + 80], r[2 * i + 81],
+             r[2 * i + 96], r[2 * i + 97], r[2 * i + 112], r[2 * i + 113]);
+    for (i = 0; i < 128; i++)
+        next[i] = t[i] ^ r[i];
+}
 
 /* ── arm64 Linux: FPC 3.2.2's program startup ─────────────────────────── */
 
