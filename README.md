@@ -155,6 +155,7 @@ out/syc t backup.syc                 # check everything, write nothing
 out/syc x backup.syc -o restore/     # extract (-f replaces, --skip leaves existing files)
 out/syc x -u 1 backup.syc -o old/    # as of version 1 (or a date: -u 2026-10-24)
 out/syc l --all backup.syc docs/     # every version of each file
+out/syc a -p secret.syc docs/        # encrypted (asks for the password; or --password-file)
 
 out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads)
 out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)

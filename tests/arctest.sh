@@ -150,6 +150,29 @@ for n in sorted(set([base + 1, base + 16, base + 17, full - 25, full - 24, full 
 sys.exit(1 if bad else 0)
 PY
 
+# encryption: both modes, a second version, the password's sources
+rm -rf oe oe2 oe3
+check "a -p (format 3)" 0 "$SYC" a -q -pS3cret --kdf-mem 8 -t 3 enc.syc tree
+check "x -p" 0 "$SYC" x -q -pS3cret -t 2 -o oe enc.syc
+treecmp tree oe/tree || fail=1
+check "l, wrong password" 3 "$SYC" l -pnope enc.syc
+check "l, no password, no terminal" 2 sh -c "'$SYC' l enc.syc < /dev/null"
+echo S3cret > pw.txt
+check "t --password-file" 0 "$SYC" t -q --password-file pw.txt enc.syc
+check "t SYC_PASSWORD" 0 env SYC_PASSWORD=S3cret "$SYC" t -q enc.syc
+if grep -q -a "emptydir" enc.syc; then echo "FAIL: a name in an encrypted archive"; fail=1; fi
+check "a -p --visible-names" 0 "$SYC" a -q -pS3cret --kdf-mem 8 --visible-names encv.syc tree
+check "l --visible-names, no password" 0 sh -c "'$SYC' l encv.syc < /dev/null"
+check "x --visible-names, no password" 2 sh -c "'$SYC' x -o oe3 encv.syc < /dev/null"
+cp -a tree tree2
+echo another > tree2/added
+check "a -p, a second version" 0 "$SYC" a -q -pS3cret enc.syc tree2
+check "x -p -u 1" 0 "$SYC" x -q -pS3cret -u 1 -o oe2 enc.syc
+treecmp tree oe2/tree || fail=1
+rm -rf tree2
+check "c -p / d -p" 0 sh -c "'$SYC' c -q -pS3cret --kdf-mem 8 -O '$first' | '$SYC' d -q -pS3cret -O > enc.out"
+cmp -s enc.out "$first" || { echo "FAIL: encrypted stream round trip"; fail=1; }
+
 # the test vectors: written by this syc, read by the reference reader
 # (tools/syc_ref.py, from the wiki's format pages) and by syc
 rm -rf vectors
@@ -161,7 +184,12 @@ for f in vectors/*.syc vectors/*.sylz; do
     *-tail.syc) want=1 ;;
     *) want=0 ;;
   esac
-  check "syc t $f" $want "$SYC" t -q "$f"
+  pw=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('password',''))" "$f.json")
+  if [ -n "$pw" ]; then
+    check "syc t $f" $want "$SYC" t -q "-p$pw" "$f"
+  else
+    check "syc t $f" $want "$SYC" t -q "$f" </dev/null
+  fi
 done
 
 # --raw: one bare sylz block, back with --size

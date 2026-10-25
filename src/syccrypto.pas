@@ -860,17 +860,12 @@ begin
 end;
 
 procedure Wipe(p: Pointer; n: SizeInt);
-var
-  v: PByte;
-  i: SizeInt;
 begin
-  { through a volatile-like loop: FillChar on memory that is dead after
-    it could be dropped by an optimizer; FPC does not, but this stays
-    explicit }
-  v := p;
-  for i := 0 to n - 1 do
-    PByte(v + i)^ := 0;
-  ReadBarrier;
+  { FillChar is a real call FPC does not drop, even on memory that is
+    dead after it (a byte loop here took 0.3 s for Argon2's 64 MiB) }
+  if n > 0 then
+    FillChar(p^, n, 0);
+  ReadWriteBarrier;
 end;
 
 end.

@@ -11,7 +11,8 @@ attributes, uid/gid, size and SHA-256 of files, symlink targets), taken
 from the trees syc archived, not from syc; "damaged" says whether bytes
 follow the last complete version. For each stream NAME.sylz,
 NAME.sylz.json holds the decoded size and SHA-256. Vectors with
-"corrupt": true must be refused.
+"corrupt": true must be refused. Encrypted ones (enc-*, format 3 and
+stream version 5) give their "password" in the .json.
 """
 import hashlib
 import json
@@ -19,6 +20,7 @@ import os
 import random
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 
@@ -91,7 +93,7 @@ def main():
         subprocess.run([syc] + list(args), check=True, cwd=work, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
 
-    def archive(name, states, opts=(), base='t'):
+    def archive(name, states, opts=(), base='t', password=None):
         """states: functions building the tree in turn; one version each"""
         dest = os.path.join(out, name + '.syc')
         if os.path.exists(dest):
@@ -103,8 +105,10 @@ def main():
             settle(work, base)
             versions.append(snapshot(work, base))
             syc_run('a', '-q', *opts, dest, base)
-        json.dump({'versions': versions, 'damaged': False}, open(dest + '.json', 'w'), indent=0,
-                  ensure_ascii=False)
+        want = {'versions': versions, 'damaged': False}
+        if password:
+            want['password'] = password
+        json.dump(want, open(dest + '.json', 'w'), indent=0, ensure_ascii=False)
         return dest, versions
 
     # one version: sizes around the block and fragment limits, links,
@@ -187,20 +191,61 @@ def main():
         open(os.path.join(out, name + '.syc'), 'wb').write(d)
         json.dump({'corrupt': True}, open(os.path.join(out, name + '.syc.json'), 'w'))
 
+    # encrypted archives (format 3): both modes, versions, several blocks
+    pw = 'syc vectors ñ'
+    archive('enc-basic', [basic], ('-p' + pw,), password=pw)
+    archive('enc-visible', [basic], ('-p' + pw, '--visible-names', '--kdf-mem', '8'), password=pw)
+    archive('enc-versions', [v1, v2, v3, v4], ('-p' + pw, '--kdf-mem', '8'), password=pw)
+    archive('enc-blocks', [big], ('-p' + pw, '--kdf-mem', '8', '-ec', '-5', '-b', '1'), password=pw)
+    # refused: a wrong password; two sealed blocks of a version swapped
+    shutil.copy(os.path.join(out, 'enc-basic.syc'), os.path.join(out, 'bad-enc-password.syc'))
+    json.dump({'corrupt': True, 'password': 'not it'},
+              open(os.path.join(out, 'bad-enc-password.syc.json'), 'w'))
+
+    def two_random(t):
+        write(t + '/r1', bytes(rnd.getrandbits(8) for _ in range(1 << 20)), T0)
+        write(t + '/r2', bytes(rnd.getrandbits(8) for _ in range(1 << 20)), T0)
+    dest, _ = archive('enc-swap-ok', [two_random], ('-p' + pw, '--kdf-mem', '8', '-b', '1'), password=pw)
+    d = open(dest, 'rb').read()
+    p = 8 + 216 + 20
+    spans = []
+    while struct.unpack_from('<I', d, p)[0]:
+        n = 12 + 40 + (struct.unpack_from('<I', d, p + 4)[0] & 0x7FFFFFFF)
+        spans.append((p, n))
+        p += n
+    (a, na), (b, nb) = spans[0], spans[1]
+    assert na == nb, 'stored random blocks of one size'
+    x = bytearray(d)
+    x[a:a + na], x[b:b + nb] = d[b:b + nb], d[a:a + na]
+    open(os.path.join(out, 'bad-enc-swap.syc'), 'wb').write(x)
+    json.dump({'corrupt': True, 'password': pw}, open(os.path.join(out, 'bad-enc-swap.syc.json'), 'w'))
+    os.remove(dest)
+    os.remove(dest + '.json')
+
     # streams
-    def stream(name, data, opts=()):
+    def stream(name, data, opts=(), password=None):
         src = os.path.join(work, name)
         open(src, 'wb').write(data)
         dest = os.path.join(out, name + '.sylz')
         syc_run('c', '-q', '-f', *opts, '-o', dest, name)
-        json.dump({'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()},
-                  open(dest + '.json', 'w'))
+        want = {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        if password:
+            want['password'] = password
+        json.dump(want, open(dest + '.json', 'w'))
+        return dest
     stream('empty', b'')
     stream('one-byte', b'x')
     stream('text', text[:1000000])
     stream('text-ec', text[:1000000], ('-ec', '-10'))
     stream('three-blocks', (text * 3)[:2600000], ('-b', '1'))
     stream('random', bytes(rnd.getrandbits(8) for _ in range(300000)))
+    dest = stream('enc-three-blocks', (text * 3)[:2600000], ('-p' + pw, '--kdf-mem', '8', '-b', '1'), pw)
+    # refused: cut after its first block, with the end record copied after it
+    d = open(dest, 'rb').read()
+    p = 7 + 216
+    first = 12 + 40 + (struct.unpack_from('<I', d, p + 4)[0] & 0x7FFFFFFF)
+    open(os.path.join(out, 'bad-enc-cut.sylz'), 'wb').write(d[:p + first] + d[-44:])
+    json.dump({'corrupt': True, 'password': pw}, open(os.path.join(out, 'bad-enc-cut.sylz.json'), 'w'))
     shutil.rmtree(work)
 
 

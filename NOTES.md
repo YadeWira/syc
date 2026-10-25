@@ -66,6 +66,30 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Encryption, stage 6: reference, vectors, Windows (2026-10-25)
+
+- tools/syc_ref.py decrypts with libsodium (PyNaCl: Argon2id,
+  XChaCha20-Poly1305) and hashlib (keyed BLAKE2s), OpenSSL for Argon2id
+  with lanes: an implementation of the encryption independent of syc's.
+  It reads every file syc encrypted and refuses the wrong password, a
+  moved block and a stream cut at a block boundary.
+- tests/syc_vectors.py: enc-basic (64 MiB Argon2id), enc-visible,
+  enc-versions (four versions), enc-blocks (-ec, several blocks),
+  enc-three-blocks.sylz; refused: bad-enc-password, bad-enc-swap (two
+  sealed blocks of a version swapped), bad-enc-cut.sylz. 23 vectors in
+  all; tests/arctest.sh also round-trips both modes, a second version,
+  the password's sources, and checks no name leaks.
+- Wipe was a byte loop: 0.3 s for Argon2's 64 MiB; FillChar (a real
+  call FPC keeps) brought the key derivation from 0.50 to 0.24 s.
+- Windows 10 (x86-64, 32-bit): the 23 vectors; a password "clave ñ 日本"
+  through -p, SYC_PASSWORD (read with GetEnvironmentVariableW: the ANSI
+  one gave "?") and a password file written by Notepad (UTF-8 with a BOM,
+  now dropped); the console prompt, typed into with SendKeys in the VM's
+  desktop session and seen in a screenshot: no echo, asked twice; the
+  Windows archives read on Linux by syc and by the reference reader.
+- Cost (silesia, level 1, -t 4): a 0.73 -> 0.93 s, x 0.37 -> 0.63, t
+  0.32 -> 0.48; mostly Argon2id's 0.24 s, once per command.
+
 ## Encryption, stage 5: encrypted archives (format 3) (2026-10-24)
 
 - `syc a -p`: format 3, the key record after the header (data from byte

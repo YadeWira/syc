@@ -362,6 +362,29 @@ begin
 end;
 {$endif}
 
+{ SYC_PASSWORD, UTF-8 (on Windows through the UTF-16 environment: the
+  ANSI one turns most characters into "?") }
+function EnvPassword: string;
+{$ifdef windows}
+var
+  w: UnicodeString;
+  n: DWORD;
+begin
+  Result := '';
+  n := GetEnvironmentVariableW('SYC_PASSWORD', nil, 0);
+  if n = 0 then
+    Exit;
+  SetLength(w, n);
+  n := GetEnvironmentVariableW('SYC_PASSWORD', PWideChar(w), n);
+  SetLength(w, n);
+  Result := UTF8Encode(w);
+end;
+{$else}
+begin
+  Result := GetEnvironmentVariable('SYC_PASSWORD');
+end;
+{$endif}
+
 function GetPassword(const opts: TOptions; creating: Boolean; const what: string): TBytes;
 var
   pw, again: string;
@@ -385,9 +408,12 @@ begin
     end;
     if (pw <> '') and (pw[Length(pw)] = #13) then
       SetLength(pw, Length(pw) - 1);
+    { a UTF-8 byte order mark (Notepad writes one) is not the password }
+    if Copy(pw, 1, 3) = #$EF#$BB#$BF then
+      Delete(pw, 1, 3);
   end
-  else if GetEnvironmentVariable('SYC_PASSWORD') <> '' then
-    pw := GetEnvironmentVariable('SYC_PASSWORD')
+  else if EnvPassword <> '' then
+    pw := EnvPassword
   else
   begin
     if not ReadTerminal('Password for ' + what + ': ', pw) then
