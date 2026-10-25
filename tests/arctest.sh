@@ -164,6 +164,15 @@ for f in vectors/*.syc vectors/*.sylz; do
   check "syc t $f" $want "$SYC" t -q "$f"
 done
 
+# --raw: one bare sylz block, back with --size
+size=$(wc -c < "$first")
+check "c --raw -ec" 0 "$SYC" c -q -f --raw -ec -5 -o raw.blk "$first"
+check "t --raw" 0 "$SYC" t -q --raw --size "$size" raw.blk
+check "d --raw" 0 "$SYC" d -q -f --raw --size "$size" -o raw.out raw.blk
+cmp -s raw.out "$first" || { echo "FAIL: --raw round trip"; fail=1; }
+check "d --raw, wrong size" 3 "$SYC" d -q -f --raw --size "$((size + 1))" -o raw.out raw.blk
+check "d --raw without --size" 2 "$SYC" d -q --raw raw.blk
+
 # refusals
 echo notanarchive > fake.syc
 check "a on a file that is not an archive" 3 "$SYC" a fake.syc tree

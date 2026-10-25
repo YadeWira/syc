@@ -66,6 +66,14 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## syc c / d / t --raw (2026-10-24)
+
+One bare sylz block, what SylzCompressEx (the plugins' compress()) writes:
+no header, size or CRC; input up to 512 MiB; `d`/`t` need `--size N`
+(SylzDecompress decodes into exactly N bytes). The blocks are the same
+bytes as the plugin vectors' (tests/sylzvectors) at all 11 levels, v2 and
+v3, 10 cases each; tools/sylz_ref.py decodes them.
+
 ## Formats frozen: archive format 2, stream version 4 (2026-10-24)
 
 - Before freezing, a codec byte: the archive's version head grows from 16

@@ -14,8 +14,9 @@ uses
   SysUtils, sylz, sycblocks;
 
 const
-  SYC_VERSION   = '0.4.0';
+  SYC_VERSION   = '0.4.1';
   STREAM_SUFFIX = '.sylz';
+  RAW_SUFFIX    = '.sylzraw';
   DEFAULT_STREAM_BLOCK_MIB = 4;
   DEFAULT_ARCHIVE_BLOCK_MIB = 16;
 
@@ -33,6 +34,8 @@ type
     force: Boolean;
     skipExisting: Boolean;   { x --skip }
     removeInput: Boolean;    { --rm }
+    raw: Boolean;            { c/d/t --raw: one bare sylz block }
+    rawSize: Integer;        { d/t --size: its decoded size; -1 not given }
     verbosity: TVerbosity;
     progress: Boolean;       { --progress / --no-progress; default: stderr is a terminal }
     cdDir: string;           { -C }
@@ -101,7 +104,7 @@ end;
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
-    oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
+    oRaw, oSize, oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
     id: TOptId;
@@ -111,7 +114,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..22] of TOptDef = (
+  OPTION_DEFS: array[0..24] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
@@ -130,6 +133,8 @@ const
     (id: oUntil;   short: 'u';  long: 'until';      value: True;  cmds: 'xl'),
     (id: oNoPerms; short: '';   long: 'no-perms';   value: False; cmds: 'x'),
     (id: oNoOwner; short: '';   long: 'no-owner';   value: False; cmds: 'x'),
+    (id: oRaw;     short: '';   long: 'raw';        value: False; cmds: 'cdt'),
+    (id: oSize;    short: '';   long: 'size';       value: True;  cmds: 'dt'),
     (id: oProgress; short: '';  long: 'progress';   value: False; cmds: 'axcdt'),
     (id: oNoProgress; short: ''; long: 'no-progress'; value: False; cmds: 'axcdt'),
     (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'axlicdt'),
@@ -261,6 +266,9 @@ begin
         WriteLn('  -O, --stdout           write to stdout');
         WriteLn('  -f, --force            overwrite an existing output; write to a terminal');
         WriteLn('  --rm                   delete FILE once it is compressed');
+        WriteLn('  --raw                  one bare sylz block (v2, v3 with -ec), what the');
+        WriteLn('                         zpaq-std plugins'' compress() returns: no header,');
+        WriteLn('                         size or CRC; FILE up to ', MAX_BLOCK shr 20, ' MiB, -> FILE', RAW_SUFFIX);
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
       end;
@@ -274,6 +282,8 @@ begin
         WriteLn('  -O, --stdout           write to stdout');
         WriteLn('  -f, --force            overwrite an existing output');
         WriteLn('  --rm                   delete FILE once it is decompressed');
+        WriteLn('  --raw --size N         FILE is one bare sylz block of N bytes decoded');
+        WriteLn('                         (syc c --raw; FILE', RAW_SUFFIX, ' -> FILE)');
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
       end;
@@ -285,6 +295,7 @@ begin
         WriteLn('                            index and each fragment''s BLAKE2s-256)');
         WriteLn;
         WriteLn('  -t, --threads N        blocks checked N at a time, default 1');
+        WriteLn('  --raw --size N         FILE is one bare sylz block of N bytes decoded');
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
       end;
@@ -315,6 +326,7 @@ begin
   opts.blockMiB := 0;
   opts.threads := 1;
   opts.verbosity := vNormal;
+  opts.rawSize := -1;
 
   if CmdArgCount < 1 then
   begin
@@ -445,6 +457,8 @@ begin
         end;
       oNoDedup: opts.noDedup := True;
       oNoDelete: opts.noDelete := True;
+      oRaw: opts.raw := True;
+      oSize: opts.rawSize := IntArg(shown, value, 0, MAX_BLOCK);
       oAll: opts.allVersions := True;
       oLong: opts.longList := True;
       oSkip: opts.skipExisting := True;
@@ -476,6 +490,12 @@ begin
     UsageError('-o and -O together');
   if opts.force and opts.skipExisting then
     UsageError('-f and --skip together');
+  if opts.raw and (opts.cmd in ['d', 't']) and (opts.rawSize < 0) then
+    UsageError('--raw needs --size N: a bare block does not hold its decoded size');
+  if (opts.rawSize >= 0) and not opts.raw then
+    UsageError('--size goes with --raw');
+  if opts.raw and (opts.blockMiB > 0) then
+    UsageError('--raw writes one block: no -b');
   if (opts.cmd in ['c', 'd']) and (opts.outPath = '-') then
   begin
     opts.outPath := '';

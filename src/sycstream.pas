@@ -205,6 +205,56 @@ begin
   end;
 end;
 
+{ --raw: the whole input (at most MAX_BLOCK bytes) as one bare sylz block,
+  what SylzCompressEx returns (the zpaq-std plugins' compress()): no
+  header, size or CRC. }
+procedure CompressRaw(fin, fout: TStream; const opts: TOptions; const name: string;
+  out total, written: Int64);
+var
+  src, dst: array of Byte;
+  n, c: SizeInt;
+  ctx: TSylzCtx;
+begin
+  SetLength(src, MAX_BLOCK + 1);
+  n := ReadFull(fin, @src[0], MAX_BLOCK + 1);
+  if n > MAX_BLOCK then
+    Fail(EXIT_USAGE, Format('%s: --raw takes at most %d MiB (one block)', [name, MAX_BLOCK shr 20]));
+  SetLength(src, n + 1);
+  SetLength(dst, SylzBound(n) + 1);
+  SylzCtxInit(ctx);
+  try
+    c := SylzCompressEx(ctx, @src[0], n, @dst[0], Length(dst), opts.level, opts.flags);
+  finally
+    SylzCtxFree(ctx);
+  end;
+  if c < 0 then
+    Fail(EXIT_FATAL, name + ': compression failed');
+  fout.WriteBuffer(dst[0], c);
+  total := n;
+  written := c;
+end;
+
+{ --raw --size: one bare sylz block of size bytes decoded (fout nil: only
+  checked) }
+procedure DecompressRaw(fin, fout: TStream; const name: string; size: SizeInt; out total: Int64);
+var
+  src, dst: array of Byte;
+  n: SizeInt;
+begin
+  { a block is at most SylzBound of what it decodes to }
+  SetLength(src, SylzBound(size) + 2);
+  n := ReadFull(fin, @src[0], Length(src));
+  if n = Length(src) then
+    Fail(EXIT_CORRUPT, Format('%s: longer than a block of %d bytes can be', [name, size]));
+  SetLength(dst, size + 1);
+  if SylzDecompress(@src[0], n, @dst[0], size) <> size then
+    Fail(EXIT_CORRUPT, Format('%s: not a sylz block of %d bytes (corrupt, or another --size)',
+      [name, size]));
+  if fout <> nil then
+    fout.WriteBuffer(dst[0], size);
+  total := size;
+end;
+
 { One operand. Returns its exit code; a usage error is raised instead. }
 function RunOne(const opts: TOptions; const input: string): Integer;
 var
@@ -215,9 +265,13 @@ var
   total, written: Int64;
   magic: array of Byte;
   got: SizeInt;
-  arcPath: string;
+  arcPath, suffix: string;
 begin
   Result := EXIT_OK;
+  if opts.raw then
+    suffix := RAW_SUFFIX
+  else
+    suffix := STREAM_SUFFIX;
   SetLength(magic, 4);
   fromStdin := (input = '') or (input = '-');
   if fromStdin then
@@ -239,12 +293,12 @@ begin
       if opts.outPath <> '' then
         outPath := opts.outPath
       else if opts.cmd = 'c' then
-        outPath := input + STREAM_SUFFIX
-      else if SameText(ExtractFileExt(input), STREAM_SUFFIX) then
+        outPath := input + suffix
+      else if SameText(ExtractFileExt(input), suffix) then
         outPath := ChangeFileExt(input, '')
       else
       begin
-        WriteLn(StdErr, 'syc: ', input, ': no ', STREAM_SUFFIX, ' suffix, skipped (give -o or -O)');
+        WriteLn(StdErr, 'syc: ', input, ': no ', suffix, ' suffix, skipped (give -o or -O)');
         Exit(EXIT_WARN);
       end;
       if not fromStdin and SameFileName(ExpandFileName(input), ExpandFileName(outPath)) then
@@ -289,7 +343,14 @@ begin
         fout := TFileStream.Create(tmpPath, fmCreate);
       end;
 
-      if opts.cmd = 't' then
+      if opts.raw then
+      begin
+        if opts.cmd = 'c' then
+          CompressRaw(fin, fout, opts, inName, total, written)
+        else
+          DecompressRaw(fin, fout, inName, opts.rawSize, total);
+      end
+      else if opts.cmd = 't' then
       begin
         { an archive or a stream: by the first 4 bytes }
         got := ReadFull(fin, @magic[0], 4);
@@ -354,8 +415,12 @@ begin
 
     if opts.verbosity <> vQuiet then
       case opts.cmd of
-        'c': WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)',
-               [inName, total, written, written * 100.0 / Max(total, 1)]));
+        'c': if opts.raw then
+               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%), one sylz block: decode with --raw --size %d',
+                 [inName, total, written, written * 100.0 / Max(total, 1), total]))
+             else
+               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)',
+                 [inName, total, written, written * 100.0 / Max(total, 1)]));
         'd': WriteLn(StdErr, Format('%s: %d bytes', [inName, total]));
         't': WriteLn(StdErr, Format('%s: ok, %d bytes', [inName, total]));
       end;
