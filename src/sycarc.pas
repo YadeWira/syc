@@ -31,7 +31,7 @@ implementation
 uses
   {$ifdef unix}BaseUnix,{$endif}
   {$ifdef windows}Windows,{$endif}
-  Math, sylz, blake2s, syccdc, sycblocks, sycfs, sycfmt;
+  Math, sylz, blake2s, syccdc, syccrypto, sycblocks, sycenc, sycfs, sycfmt;
 
 { ── small helpers ──────────────────────────────────────────────────────── }
 
@@ -302,8 +302,23 @@ type
     last: Boolean;   { no more after this one }
   end;
 
+  { Seals (writing) or opens (reading) an encrypted archive's blocks, on
+    their threads: XChaCha20-Poly1305 with K_aead, AAD "SYCB" vnum k rawLen
+    packed, k the block's place in its version }
+  TArcSealer = class
+    keys: TSycKeys;
+    vnum: UInt32;     { writing: the version's number; job.tag = k }
+    arc: TObject;     { reading: the TArchive; job.tag = its block number }
+    function BlockAad(vn: UInt32; k: Int64; job: TJob): TBytes;
+    procedure SealJob(job: TJob);
+    procedure OpenJob(job: TJob);
+  end;
+
   TAdder = class
     opts: TOptions;
+    enc, indexEnc: Boolean;      { format 3; its index sealed too }
+    sealer: TArcSealer;
+    gearK: array[0..255] of UInt64;   { the keyed cutter's table }
     status: Integer;
     prm: TCdcParams;
     arcFull, tmpFull: string;   { never added to themselves }
@@ -396,7 +411,42 @@ begin
   prog.Free;
   pool.Free;
   pipe.Free;
+  if sealer <> nil then
+  begin
+    WipeKeys(sealer.keys);
+    sealer.Free;
+  end;
   inherited Destroy;
+end;
+
+function TArcSealer.BlockAad(vn: UInt32; k: Int64; job: TJob): TBytes;
+var
+  packedField: UInt32;
+begin
+  Result := nil;
+  PutBytes(Result, 'SYCB');
+  PutU32(Result, vn);
+  PutU32(Result, UInt32(k));
+  PutU32(Result, UInt32(job.n));
+  packedField := UInt32(job.payLen);
+  if job.stored then
+    packedField := packedField or $80000000;
+  PutU32(Result, packedField);
+end;
+
+{ after compressing: the payload (compressed, or the raw data when that
+  is no smaller), sealed in place }
+procedure TArcSealer.SealJob(job: TJob);
+begin
+  job.stored := job.c >= job.n;
+  if job.stored then
+  begin
+    Move(job.raw^, job.payload^, job.n);
+    job.payLen := job.n;
+  end
+  else
+    job.payLen := job.c;
+  SealData(keys.aead, BlockAad(vnum, job.tag, job), job.payload, job.payLen, @job.seal[0]);
 end;
 
 procedure TAdder.AddEntry(const local, stored: string; const m: TMeta);
@@ -484,7 +534,20 @@ begin
   if not job.ok then
     Fail(EXIT_FATAL, 'out of memory');
   WriteU32(fout, UInt32(job.n));
-  if job.c < job.n then
+  if enc then
+  begin
+    { rawLen, packed, crc32 = 0, nonce, the sealed payload, tag }
+    if job.stored then
+      WriteU32(fout, UInt32(job.payLen) or $80000000)
+    else
+      WriteU32(fout, UInt32(job.payLen));
+    WriteU32(fout, 0);
+    fout.WriteBuffer(job.seal[0], 24);
+    fout.WriteBuffer(job.payload^, job.payLen);
+    fout.WriteBuffer(job.seal[24], 16);
+    idx.blocks[nBlocks].bytes := BLOCKHDR_SIZE + SEAL_SIZE + job.payLen;
+  end
+  else if job.c < job.n then
   begin
     WriteU32(fout, UInt32(job.c));
     WriteU32(fout, job.crc);
@@ -511,6 +574,7 @@ begin
   if fill = 0 then
     Exit;
   pipe.jobs[slot].n := fill;
+  pipe.jobs[slot].tag := blocksSubmitted;   { its place in the version (the AAD) }
   pipe.Start(slot);
   if blocksSubmitted >= Length(blockFrags) then
     SetLength(blockFrags, Max(64, 2 * Length(blockFrags)));
@@ -584,7 +648,10 @@ begin
     msg[k] := @cur.data[cur.frags[first + k].off];
     len[k] := cur.frags[first + k].len;
   end;
-  Blake2sMany(@msg[0], @len[0], n, @cur.hash[first]);
+  if enc then
+    Blake2sManyKey(@sealer.keys.frag[0], 32, @msg[0], @len[0], n, @cur.hash[first])
+  else
+    Blake2sMany(@msg[0], @len[0], n, @cur.hash[first]);
 end;
 
 { Cuts files into b from where the last call stopped, until b is full or
@@ -774,8 +841,14 @@ var
   crc: UInt32;
   commit: array[0..COMMIT_SIZE - 1] of Byte;
   istart: Int64;
+  stored: Boolean;
+  packedField: UInt32;
+  aad: TBytes;
+  seal: array[0..SEAL_SIZE - 1] of Byte;
 begin
   b := Default(TByteBuf);
+  if enc then
+    BufI64(b, UnixNow);   { format 3: the version's time, inside the index }
   EncodeIndex(idx, nextFrag - nFrags, b);
   if b.len > MAX_BLOCK then
     Fail(EXIT_FATAL, 'the index is over 512 MiB: too many files for one version');
@@ -786,10 +859,38 @@ begin
   finally
     SylzCtxFree(ctx);
   end;
-  crc := crc32(0, @b.data[0], b.len);
   istart := pos;
   fout.WriteBuffer(INDEX_MAGIC[1], 4);
   WriteU32(fout, b.len);
+  if indexEnc then
+  begin
+    { sealed: AAD "SYCI" vnum rawLen packed; no CRC }
+    stored := (c < 0) or (c >= b.len);
+    if stored then
+    begin
+      SetLength(dst, b.len + 1);
+      Move(b.data[0], dst[0], b.len);
+      c := b.len;
+      packedField := UInt32(c) or $80000000;
+    end
+    else
+      packedField := UInt32(c);
+    aad := nil;
+    PutBytes(aad, 'SYCI');
+    PutU32(aad, sealer.vnum);
+    PutU32(aad, b.len);
+    PutU32(aad, packedField);
+    SealData(sealer.keys.aead, aad, @dst[0], c, @seal[0]);
+    WriteU32(fout, packedField);
+    WriteU32(fout, 0);
+    fout.WriteBuffer(seal[0], 24);
+    fout.WriteBuffer(dst[0], c);
+    fout.WriteBuffer(seal[24], 16);
+    Inc(pos, 4 + BLOCKHDR_SIZE + SEAL_SIZE + c);
+  end
+  else
+  begin
+  crc := crc32(0, @b.data[0], b.len);
   if (c >= 0) and (c < b.len) then
   begin
     WriteU32(fout, c);
@@ -803,6 +904,7 @@ begin
     WriteU32(fout, crc);
     fout.WriteBuffer(b.data[0], b.len);
     Inc(pos, 4 + BLOCKHDR_SIZE + b.len);
+  end;
   end;
   { the version's bytes are on the disk before the commit that makes it
     count, and the commit before syc a reports success }
@@ -849,15 +951,26 @@ type
     fragOff: array of UInt32;     { offset in its block }
     fragBlock: array of UInt32;   { its block, in blocks[] }
     damaged: Boolean;             { bytes after the last good commit }
-    fmt: Byte;                    { ARC_FMT, or 1 }
+    fmt: Byte;                    { ARC_FMT, 1, or ARC_FMT_ENC }
     vheadSize: Integer;           { VHEAD_SIZE, or VHEAD_SIZE_1 }
     allowEmpty: Boolean;          { an archive with no complete version is not an error }
-    constructor Open(const path, aName: string; aAllowEmpty: Boolean = False);
+    { format 3 (encrypted) }
+    enc, indexEnc: Boolean;
+    dataStart: Int64;             { where the first version starts }
+    blockExtra, indexExtra: Integer;   { a sealed record's nonce and tag, 40, else 0 }
+    keyHeader, keyRecord: TBytes;
+    sealer: TArcSealer;           { with the keys, once the password opened them }
+    gearK: array[0..255] of UInt64;
+    { needData: blocks will be read (x, t, a), so an encrypted archive's
+      key is needed even when its index is readable }
+    constructor Open(const path, aName: string; aAllowEmpty, needData: Boolean;
+      const opts: TOptions);
     destructor Destroy; override;
     procedure Corrupt(const msg: string);
     function ReadAt(at: Int64; p: Pointer; n: SizeInt): Boolean;
     procedure ScanForward;
     procedure LoadVersion(k: SizeInt);
+    procedure LoadBlock(b: SizeInt; job: TJob);
     function State(upTo: SizeInt): TEntries;
   end;
 
@@ -886,17 +999,20 @@ begin
   istart := LEtoN(PInt64(@c[12])^);
   { a version holds at least its head, the end of its blocks and the
     index's header }
-  Result := Result and (vstart >= HEADER_SIZE) and (istart >= vstart + a.vheadSize + 4)
-    and (istart + 4 + BLOCKHDR_SIZE <= at);
+  Result := Result and (vstart >= a.dataStart) and (istart >= vstart + a.vheadSize + 4)
+    and (istart + 4 + BLOCKHDR_SIZE + a.indexExtra <= at);
 end;
 
-constructor TArchive.Open(const path, aName: string; aAllowEmpty: Boolean);
+constructor TArchive.Open(const path, aName: string; aAllowEmpty, needData: Boolean;
+  const opts: TOptions);
 var
   hdr: array[0..HEADER_SIZE - 1] of Byte;
   at, vstart, istart: Int64;
   list: array of TVersion;
   n, i: SizeInt;
   ok: Boolean;
+  pw: TBytes;
+  keys: TSycKeys;
 begin
   inherited Create;
   name := aName;
@@ -910,7 +1026,7 @@ begin
   size := fs.Size;
   if not ReadAt(0, @hdr, HEADER_SIZE) or (CompareByte(hdr[0], ARC_MAGIC[1], 4) <> 0) then
     Corrupt('not a syc archive');
-  if (hdr[4] <> ARC_FMT) and (hdr[4] <> 1) then
+  if (hdr[4] <> ARC_FMT) and (hdr[4] <> 1) and (hdr[4] <> ARC_FMT_ENC) then
     Corrupt(Format('archive format %d not supported by syc %s', [hdr[4], SYC_VERSION]));
   fmt := hdr[4];
   if fmt = 1 then
@@ -920,13 +1036,42 @@ begin
   if not ((hdr[5] >= 6) and (hdr[5] < hdr[6]) and (hdr[6] < hdr[7]) and (hdr[7] <= 24)) then
     Corrupt('bad fragment parameters in the header');
   prm := CdcParams(hdr[5], hdr[6], hdr[7]);
+  dataStart := HEADER_SIZE;
+  if fmt = ARC_FMT_ENC then
+  begin
+    { the key record; the password when the index or the data is read }
+    enc := True;
+    SetLength(keyHeader, HEADER_SIZE);
+    Move(hdr, keyHeader[0], HEADER_SIZE);
+    SetLength(keyRecord, KEYREC_SIZE);
+    if not ReadAt(HEADER_SIZE, @keyRecord[0], KEYREC_SIZE) then
+      Corrupt('truncated key record');
+    indexEnc := keyRecord[4] and KEYREC_FLAG_INDEX <> 0;
+    dataStart := HEADER_SIZE + KEYREC_SIZE;
+    blockExtra := SEAL_SIZE;
+    if indexEnc then
+      indexExtra := SEAL_SIZE;
+    if indexEnc or needData then
+    begin
+      pw := GetPassword(opts, False, name);
+      if not OpenKeyRecord(keyHeader, keyRecord, pw, name, keys) then
+        Corrupt('wrong password, or a damaged key record');
+      Wipe(@pw[0], Length(pw));
+      sealer := TArcSealer.Create;
+      sealer.keys := keys;
+      sealer.arc := Self;
+      WipeKeys(keys);
+      MakeGear(LEtoN(PUInt64(@sealer.keys.cdc[0])^), gearK);
+      prm.gear := @gearK[0];
+    end;
+  end;
 
   { back from the end, commit by commit }
   list := nil;
   n := 0;
   at := size;
   ok := True;
-  while at > HEADER_SIZE do
+  while at > dataStart do
   begin
     if not ReadCommit(Self, at - COMMIT_SIZE, vstart, istart) or (vstart >= at - COMMIT_SIZE) then
     begin
@@ -941,7 +1086,7 @@ begin
     Inc(n);
     at := vstart;
   end;
-  if ok and (at = HEADER_SIZE) then
+  if ok and (at = dataStart) then
   begin
     SetLength(versions, n);
     for i := 0 to n - 1 do
@@ -956,7 +1101,29 @@ end;
 destructor TArchive.Destroy;
 begin
   fs.Free;
+  if sealer <> nil then
+  begin
+    WipeKeys(sealer.keys);
+    sealer.Free;
+  end;
   inherited Destroy;
+end;
+
+{ before decompressing a block read from the archive: checked and opened
+  in place; job.tag is the archive's block number }
+procedure TArcSealer.OpenJob(job: TJob);
+var
+  a: TArchive;
+  blk: ^TArcBlock;
+begin
+  a := TArchive(arc);
+  blk := @a.blocks[job.tag];
+  if not OpenData(keys.aead, BlockAad(blk^.ver + 1, job.tag - a.versions[blk^.ver].firstBlock, job),
+     job.payload, job.payLen, @job.seal[0]) then
+  begin
+    job.ok := False;
+    job.failed := -1;   { the tag }
+  end;
 end;
 
 { from the first version on, as far as the versions are whole: their
@@ -972,7 +1139,7 @@ begin
   n := 0;
   payLen := 0;
   FillChar(w, SizeOf(w), 0);
-  at := HEADER_SIZE;
+  at := dataStart;
   while at < size do
   begin
     good := ReadAt(at, @w, 4) and (CompareByte(w[0], VHEAD_MAGIC[1], 4) = 0);
@@ -991,7 +1158,7 @@ begin
       else
       begin
         payLen := LEtoN(PUInt32(@w[4])^) and $7FFFFFFF;
-        Inc(p, BLOCKHDR_SIZE + payLen);
+        Inc(p, BLOCKHDR_SIZE + blockExtra + payLen);
       end;
     end;
     if good then
@@ -999,7 +1166,7 @@ begin
     if good then
     begin
       payLen := LEtoN(PUInt32(@w[8])^) and $7FFFFFFF;
-      good := ReadCommit(Self, p + 4 + BLOCKHDR_SIZE + payLen, vstart, istart)
+      good := ReadCommit(Self, p + 4 + BLOCKHDR_SIZE + indexExtra + payLen, vstart, istart)
         and (vstart = at) and (istart = p);
     end;
     if not good then
@@ -1007,7 +1174,7 @@ begin
     SetLength(versions, n + 1);
     versions[n].vstart := at;
     versions[n].istart := p;
-    versions[n].commitPos := p + 4 + BLOCKHDR_SIZE + payLen;
+    versions[n].commitPos := p + 4 + BLOCKHDR_SIZE + indexExtra + payLen;
     Inc(n);
     at := versions[n - 1].commitPos + COMMIT_SIZE;
   end;
@@ -1029,6 +1196,8 @@ var
   p, blockRaw, firstFrag, total: Int64;
   e: ^TEntry;
   blk: ^TArcBlock;
+  seal: array[0..SEAL_SIZE - 1] of Byte;
+  aad: TBytes;
 begin
   v := @versions[k];
   if not ReadAt(v^.vstart, @head, vheadSize) or (CompareByte(head[0], VHEAD_MAGIC[1], 4) <> 0) then
@@ -1053,12 +1222,28 @@ begin
   packedField := LEtoN(PUInt32(@ih[8])^);
   sum := LEtoN(PUInt32(@ih[12])^);
   payLen := packedField and $7FFFFFFF;
-  if (rawLen > MAX_BLOCK) or (v^.istart + SizeOf(ih) + payLen <> v^.commitPos)
-     or ((packedField and $80000000 <> 0) and (payLen <> rawLen)) then
+  if (rawLen > MAX_BLOCK) or (v^.istart + SizeOf(ih) + indexExtra + payLen <> v^.commitPos)
+     or ((packedField and $80000000 <> 0) and (payLen <> rawLen))
+     or (indexEnc and (sum <> 0)) or (enc and (rawLen < 8)) then
     Corrupt(Format('version %d: bad index header', [k + 1]));
-  v^.indexBytes := SizeOf(ih) + payLen;
+  v^.indexBytes := SizeOf(ih) + indexExtra + payLen;
   SetLength(payload, payLen + 1);
-  if not ReadAt(v^.istart + SizeOf(ih), @payload[0], payLen) then
+  if indexEnc then
+  begin
+    { nonce, sealed payload, tag }
+    if not ReadAt(v^.istart + SizeOf(ih), @seal[0], 24)
+       or not ReadAt(v^.istart + SizeOf(ih) + 24, @payload[0], payLen)
+       or not ReadAt(v^.istart + SizeOf(ih) + 24 + payLen, @seal[24], 16) then
+      Corrupt(Format('version %d: truncated index', [k + 1]));
+    aad := nil;
+    PutBytes(aad, 'SYCI');
+    PutU32(aad, k + 1);
+    PutU32(aad, rawLen);
+    PutU32(aad, packedField);
+    if not OpenData(sealer.keys.aead, aad, @payload[0], payLen, @seal[0]) then
+      Corrupt(Format('version %d: the index does not authenticate', [k + 1]));
+  end
+  else if not ReadAt(v^.istart + SizeOf(ih), @payload[0], payLen) then
     Corrupt(Format('version %d: truncated index', [k + 1]));
   SetLength(raw, rawLen + 1);
   if packedField and $80000000 <> 0 then
@@ -1073,13 +1258,21 @@ begin
       SylzDCtxFree(ctx);
     end;
   end;
-  if crc32(0, @raw[0], rawLen) <> sum then
+  if not indexEnc and (crc32(0, @raw[0], rawLen) <> sum) then
     Corrupt(Format('version %d: index checksum mismatch', [k + 1]));
   payload := nil;
   firstFrag := Length(fragSize) + 1;
   v^.firstFrag := firstFrag;
-  DecodeIndex(@raw[0], rawLen, firstFrag, prm.maxSize, v^.idx,
-    Format('%s, version %d', [name, k + 1]));
+  if enc then
+  begin
+    { format 3: the time first, then the index as in format 2 }
+    v^.time := LEtoN(PInt64(@raw[0])^);
+    DecodeIndex(@raw[8], rawLen - 8, firstFrag, prm.maxSize, blockExtra, v^.idx,
+      Format('%s, version %d', [name, k + 1]));
+  end
+  else
+    DecodeIndex(@raw[0], rawLen, firstFrag, prm.maxSize, 0, v^.idx,
+      Format('%s, version %d', [name, k + 1]));
   raw := nil;
 
   { where each block and fragment is }
@@ -1128,6 +1321,42 @@ begin
     if total <> e^.meta.size then
       Corrupt(Format('version %d: %s: size does not match its fragments', [k + 1, e^.path]));
   end;
+end;
+
+{ block b's record into job, checked against the index: its payload, and
+  for format 3 its nonce and tag (the job's pre hook opens it) }
+procedure TArchive.LoadBlock(b: SizeInt; job: TJob);
+var
+  w: array[0..BLOCKHDR_SIZE - 1] of Byte;
+  rawLen, packedField, payLen: UInt32;
+  blk: ^TArcBlock;
+  at: Int64;
+begin
+  blk := @blocks[b];
+  if not ReadAt(blk^.pos, @w, BLOCKHDR_SIZE) then
+    Corrupt(Format('truncated block at offset %d', [blk^.pos]));
+  rawLen := LEtoN(PUInt32(@w[0])^);
+  packedField := LEtoN(PUInt32(@w[4])^);
+  payLen := packedField and $7FFFFFFF;
+  if (Int64(rawLen) <> blk^.rawLen) or (BLOCKHDR_SIZE + blockExtra + Int64(payLen) <> blk^.bytes)
+     or ((packedField and $80000000 <> 0) and (payLen <> rawLen))
+     or (enc and (PUInt32(@w[8])^ <> 0)) then
+    Corrupt(Format('the block at offset %d does not match the index', [blk^.pos]));
+  job.Reserve(rawLen, payLen);
+  at := blk^.pos + BLOCKHDR_SIZE;
+  if enc then
+  begin
+    if not ReadAt(at, @job.seal[0], 24) or not ReadAt(at + 24 + payLen, @job.seal[24], 16) then
+      Corrupt(Format('truncated block at offset %d', [blk^.pos]));
+    Inc(at, 24);
+  end;
+  if not ReadAt(at, job.payload, payLen) then
+    Corrupt(Format('truncated block at offset %d', [blk^.pos]));
+  job.n := rawLen;
+  job.payLen := payLen;
+  job.stored := packedField and $80000000 <> 0;
+  job.sum := LEtoN(PUInt32(@w[8])^);
+  job.tag := b;
 end;
 
 function TArchive.State(upTo: SizeInt): TEntries;
@@ -1184,7 +1413,8 @@ begin
 end;
 
 { opens ARCHIVE, from stdin through a temporary copy }
-function OpenArchive(const path: string; out tmp: string): TArchive;
+function OpenArchive(const path: string; out tmp: string; needData: Boolean;
+  const opts: TOptions): TArchive;
 var
   s: TStream;
 begin
@@ -1199,10 +1429,10 @@ begin
     finally
       s.Free;
     end;
-    Result := TArchive.Open(tmp, '(stdin)');
+    Result := TArchive.Open(tmp, '(stdin)', False, needData, opts);
   end
   else
-    Result := TArchive.Open(path, path);
+    Result := TArchive.Open(path, path, False, needData, opts);
 end;
 
 procedure WarnDamaged(a: TArchive; var code: Integer);
@@ -1250,6 +1480,7 @@ var
   hdr: array[0..HEADER_SIZE - 1] of Byte;
   vhead: array[0..VHEAD_SIZE - 1] of Byte;
   fs: TFileStream;
+  hdrB, pw, rec: TBytes;
 begin
   arcPath := opts.operands[0];
   toStdout := arcPath = '-';
@@ -1273,9 +1504,23 @@ begin
     goodEnd := 0;
     vnum := 1;
     fmt := ARC_FMT;   { appending: the archive's own }
+    if opts.visibleNames and not EncryptionRequested(opts) then
+      Fail(EXIT_USAGE, '--visible-names goes with a password (-p)');
     if appending then
     begin
-      arc := TArchive.Open(arcPath, arcPath, True);
+      arc := TArchive.Open(arcPath, arcPath, True, True, opts);
+      if arc.enc then
+      begin
+        { the archive's keys and mode }
+        a.enc := True;
+        a.indexEnc := arc.indexEnc;
+        a.sealer := TArcSealer.Create;
+        a.sealer.keys := arc.sealer.keys;
+        if opts.visibleNames then
+          Fail(EXIT_USAGE, '--visible-names is chosen when an archive is created');
+      end
+      else if EncryptionRequested(opts) then
+        Fail(EXIT_USAGE, arcPath + ' is not encrypted: a version cannot add a password to it');
       a.prm := arc.prm;
       fmt := arc.fmt;
       prev := arc.State(Length(arc.versions));
@@ -1288,7 +1533,7 @@ begin
       if Length(arc.versions) > 0 then
         goodEnd := arc.versions[High(arc.versions)].commitPos + COMMIT_SIZE
       else
-        goodEnd := HEADER_SIZE;
+        goodEnd := arc.dataStart;
       if goodEnd < arc.size then
       begin
         WriteLn(StdErr, Format('syc: %s: %d bytes after the last complete version (an interrupted '
@@ -1418,8 +1663,38 @@ begin
         hdr[5] := CDC_MIN_LOG;
         hdr[6] := CDC_AVG_LOG;
         hdr[7] := CDC_MAX_LOG;
-        a.fout.WriteBuffer(hdr, HEADER_SIZE);
-        goodEnd := HEADER_SIZE;
+        if EncryptionRequested(opts) then
+        begin
+          { format 3: the key record after the header }
+          hdr[4] := ARC_FMT_ENC;
+          fmt := ARC_FMT_ENC;
+          a.enc := True;
+          a.indexEnc := not opts.visibleNames;
+          SetLength(hdrB, HEADER_SIZE);
+          Move(hdr, hdrB[0], HEADER_SIZE);
+          pw := GetPassword(opts, True, arcPath);
+          a.sealer := TArcSealer.Create;
+          if a.indexEnc then
+            NewKeyRecord(hdrB, pw, UInt32(opts.kdfMemMiB) * 1024, KEYREC_FLAG_INDEX, a.sealer.keys, rec)
+          else
+            NewKeyRecord(hdrB, pw, UInt32(opts.kdfMemMiB) * 1024, 0, a.sealer.keys, rec);
+          Wipe(@pw[0], Length(pw));
+          a.fout.WriteBuffer(hdr, HEADER_SIZE);
+          a.fout.WriteBuffer(rec[0], KEYREC_SIZE);
+          goodEnd := HEADER_SIZE + KEYREC_SIZE;
+        end
+        else
+        begin
+          a.fout.WriteBuffer(hdr, HEADER_SIZE);
+          goodEnd := HEADER_SIZE;
+        end;
+      end;
+      if a.enc then
+      begin
+        { the keyed cutter, the version's number for the AADs }
+        MakeGear(LEtoN(PUInt64(@a.sealer.keys.cdc[0])^), a.gearK);
+        a.prm.gear := @a.gearK[0];
+        a.sealer.vnum := vnum;
       end;
       vstart := goodEnd;
       if fmt = 1 then
@@ -1429,7 +1704,8 @@ begin
       FillChar(vhead, SizeOf(vhead), 0);
       Move(VHEAD_MAGIC[1], vhead[0], 4);
       PUInt32(@vhead[4])^ := NtoLE(vnum);
-      PInt64(@vhead[8])^ := NtoLE(UnixNow);
+      if fmt <> ARC_FMT_ENC then
+        PInt64(@vhead[8])^ := NtoLE(UnixNow);   { format 3: 0, the time is in the index }
       vhead[16] := CODEC_SYLZ;   { format 2 only: format 1 ends before }
       a.fout.WriteBuffer(vhead, vheadSize);
       a.pos := vstart + vheadSize;
@@ -1438,6 +1714,11 @@ begin
       a.pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);
       for i := 0 to a.pipe.Slots - 1 do
         a.pipe.jobs[i].Reserve(a.blockSize, SylzBound(a.blockSize));
+      if a.enc then
+      begin
+        a.pipe.SetPre(nil, True);
+        a.pipe.SetPost(@a.sealer.SealJob);
+      end;
       a.slot := 0;
       a.pool := TTaskPool.Create(opts.threads);
       SetLength(a.refCount, a.count);
@@ -1594,7 +1875,7 @@ begin
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
     filters[i - 1] := StoredPath(opts.operands[i]);
-  a := OpenArchive(opts.operands[0], tmp);
+  a := OpenArchive(opts.operands[0], tmp, False, opts);
   try
     WarnDamaged(a, Result);
     upTo := VersionsUntil(a, opts.untilSpec);
@@ -1666,7 +1947,7 @@ var
   totalFiles, totalSize, uniq: Int64;
 begin
   Result := EXIT_OK;
-  a := OpenArchive(opts.operands[0], tmp);
+  a := OpenArchive(opts.operands[0], tmp, False, opts);
   try
     WarnDamaged(a, Result);
     WriteLn(Format('%s: %d version(s), %d bytes, fragments %d / %d / %d KiB (min / average / max)',
@@ -1749,7 +2030,10 @@ begin
     msg[k] := job.raw + a.fragOff[first + k - 1];
     len[k] := a.fragSize[first + k - 1];
   end;
-  Blake2sMany(@msg[0], @len[0], n, @h[0]);
+  if a.enc then
+    Blake2sManyKey(@a.sealer.keys.frag[0], 32, @msg[0], @len[0], n, @h[0])
+  else
+    Blake2sMany(@msg[0], @len[0], n, @h[0]);
   for k := 0 to n - 1 do
     if CompareByte(h[k], v^.idx.frags[first + k - v^.firstFrag].hash, SizeOf(TBlake2sDigest)) <> 0 then
     begin
@@ -1777,6 +2061,9 @@ var
     pipe.Finish(s);
     job := pipe.jobs[s];
     blk := @a.blocks[done];
+    if (not job.ok) and (job.failed = -1) then
+      a.Corrupt(Format('the block at offset %d does not authenticate (changed, moved or from '
+        + 'another archive)', [blk^.pos]));
     if not job.ok then
       a.Corrupt(Format('the block at offset %d: corrupt data or checksum mismatch', [blk^.pos]));
     if job.failed <> 0 then
@@ -1787,14 +2074,10 @@ var
   end;
 
 var
-  w: array[0..BLOCKHDR_SIZE - 1] of Byte;
-  rawLen, packedField, payLen: UInt32;
-  job: TJob;
   s: SizeInt;
-  blk: ^TArcBlock;
 begin
   Result := EXIT_OK;
-  a := TArchive.Open(path, name);
+  a := TArchive.Open(path, name, False, True, opts);
   pipe := nil;
   prog := nil;
   hc := THashCheck.Create;
@@ -1803,6 +2086,8 @@ begin
     WarnDamaged(a, Result);
     pipe := TPipeline.Create(opts.threads, True, 0, 0);
     pipe.SetPost(@hc.Check);
+    if a.enc then
+      pipe.SetPre(@a.sealer.OpenJob, True);
     nb := Length(a.blocks);
     total := 0;
     for b := 0 to nb - 1 do
@@ -1815,24 +2100,7 @@ begin
       s := b mod pipe.Slots;
       if b >= pipe.Slots then
         CheckSlot(s);
-      blk := @a.blocks[b];
-      if not a.ReadAt(blk^.pos, @w, BLOCKHDR_SIZE) then
-        a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
-      rawLen := LEtoN(PUInt32(@w[0])^);
-      packedField := LEtoN(PUInt32(@w[4])^);
-      payLen := packedField and $7FFFFFFF;
-      if (Int64(rawLen) <> blk^.rawLen) or (BLOCKHDR_SIZE + Int64(payLen) <> blk^.bytes)
-         or ((packedField and $80000000 <> 0) and (payLen <> rawLen)) then
-        a.Corrupt(Format('the block at offset %d does not match the index', [blk^.pos]));
-      job := pipe.jobs[s];
-      job.Reserve(rawLen, payLen);
-      if not a.ReadAt(blk^.pos + BLOCKHDR_SIZE, job.payload, payLen) then
-        a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
-      job.n := rawLen;
-      job.payLen := payLen;
-      job.stored := packedField and $80000000 <> 0;
-      job.sum := LEtoN(PUInt32(@w[8])^);
-      job.tag := b;
+      a.LoadBlock(b, pipe.jobs[s]);
       pipe.Start(s);
     end;
     while done < nb do
@@ -1889,32 +2157,10 @@ begin
 end;
 
 procedure TExtractor.StartAccess(k: SizeInt);
-var
-  w: array[0..BLOCKHDR_SIZE - 1] of Byte;
-  rawLen, packedField, payLen: UInt32;
-  job: TJob;
-  blk: ^TArcBlock;
 begin
   if k >= nAccess then
     Exit;
-  blk := @a.blocks[access[k]];
-  if not a.ReadAt(blk^.pos, @w, BLOCKHDR_SIZE) then
-    a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
-  rawLen := LEtoN(PUInt32(@w[0])^);
-  packedField := LEtoN(PUInt32(@w[4])^);
-  payLen := packedField and $7FFFFFFF;
-  if (Int64(rawLen) <> blk^.rawLen) or (BLOCKHDR_SIZE + Int64(payLen) <> blk^.bytes)
-     or ((packedField and $80000000 <> 0) and (payLen <> rawLen)) then
-    a.Corrupt(Format('the block at offset %d does not match the index', [blk^.pos]));
-  job := pipe.jobs[k mod pipe.Slots];
-  job.Reserve(rawLen, payLen);
-  if not a.ReadAt(blk^.pos + BLOCKHDR_SIZE, job.payload, payLen) then
-    a.Corrupt(Format('truncated block at offset %d', [blk^.pos]));
-  job.n := rawLen;
-  job.payLen := payLen;
-  job.stored := packedField and $80000000 <> 0;
-  job.sum := LEtoN(PUInt32(@w[8])^);
-  job.tag := access[k];
+  a.LoadBlock(access[k], pipe.jobs[k mod pipe.Slots]);
   pipe.Start(k mod pipe.Slots);
 end;
 
@@ -1933,6 +2179,9 @@ begin
       StartAccess(cur - 1 + pipe.Slots);
     s := cur mod pipe.Slots;
     pipe.Finish(s);
+    if (not pipe.jobs[s].ok) and (pipe.jobs[s].failed = -1) then
+      a.Corrupt(Format('the block at offset %d does not authenticate (changed, moved or from '
+        + 'another archive)', [a.blocks[blk].pos]));
     if not pipe.jobs[s].ok then
       a.Corrupt(Format('the block at offset %d: corrupt data or checksum mismatch',
         [a.blocks[blk].pos]));
@@ -1990,7 +2239,7 @@ begin
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
     filters[i - 1] := StoredPath(opts.operands[i]);
-  x.a := OpenArchive(opts.operands[0], tmp);
+  x.a := OpenArchive(opts.operands[0], tmp, True, opts);
   try
     WarnDamaged(x.a, x.status);
     st := x.a.State(VersionsUntil(x.a, opts.untilSpec));
@@ -2083,6 +2332,8 @@ begin
     x.hc.a := x.a;
     x.pipe := TPipeline.Create(opts.threads, True, 0, 0);
     x.pipe.SetPost(@x.hc.Check);
+    if x.a.enc then
+      x.pipe.SetPre(@x.a.sealer.OpenJob, True);
     x.cur := -1;
     total := 0;
     for i := 0 to n - 1 do

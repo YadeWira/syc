@@ -16,7 +16,9 @@ const
   VHEAD_MAGIC   = 'SYCV';
   INDEX_MAGIC   = 'SYCI';
   COMMIT_MAGIC  = 'SYCE';
-  ARC_FMT       = 2;    { 2: the version head names its codec (syc 0.4.0-);
+  ARC_FMT       = 2;
+  ARC_FMT_ENC   = 3;    { encrypted (wiki: syc encryption): a key record
+                          after the header; sealed blocks and index }    { 2: the version head names its codec (syc 0.4.0-);
                           1: no codec, sylz implied (syc 0.3.1-0.3.4), read
                           and appended to as such }
   HEADER_SIZE   = 8;
@@ -82,12 +84,13 @@ function ReadStr(var r: TByteReader; maxLen: SizeInt): string;
 { The index's bytes. firstFrag: the number of the version's first new
   fragment. }
 procedure EncodeIndex(const idx: TIndex; firstFrag: Int64; var b: TByteBuf);
-{ Decodes and checks an index: blocks holding all the new fragments,
+{ Decodes and checks an index (blockExtra: an encrypted block's nonce and
+  tag, 40, else 0): blocks holding all the new fragments,
   fragment sizes 1..maxFrag, references to fragments 1 .. firstFrag +
   Length(frags) - 1, paths valid, sorted and unique. File sizes against
   their fragments are the caller's to check (it has every version's
   fragments). }
-procedure DecodeIndex(p: PByte; n: SizeInt; firstFrag, maxFrag: Int64;
+procedure DecodeIndex(p: PByte; n: SizeInt; firstFrag, maxFrag: Int64; blockExtra: Integer;
   out idx: TIndex; const what: string);
 
 implementation
@@ -305,7 +308,7 @@ begin
   Result := True;
 end;
 
-procedure DecodeIndex(p: PByte; n: SizeInt; firstFrag, maxFrag: Int64;
+procedure DecodeIndex(p: PByte; n: SizeInt; firstFrag, maxFrag: Int64; blockExtra: Integer;
   out idx: TIndex; const what: string);
 var
   r: TByteReader;
@@ -322,7 +325,7 @@ begin
   for i := 0 to count - 1 do
   begin
     v := ReadVarint(r);
-    if (v < BLOCKHDR_SIZE) or (v > BLOCKHDR_SIZE + MAX_BLOCK) then
+    if (v < BLOCKHDR_SIZE + blockExtra) or (v > BLOCKHDR_SIZE + blockExtra + MAX_BLOCK) then
       Corrupt(r, 'block size');
     idx.blocks[i].bytes := v;
     v := ReadVarint(r);

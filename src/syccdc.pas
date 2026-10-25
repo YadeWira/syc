@@ -21,10 +21,15 @@ type
   TCdcParams = record
     minSize, avgSize, maxSize: SizeInt;
     strictShift, looseShift: Integer;   { 64 - (avgLog +- 2) }
+    gear: PUInt64;                      { 256 values: the global table, or a keyed one }
   end;
 
-{ the parameters from their logs (as an archive's header stores them) }
+{ the parameters from their logs (as an archive's header stores them),
+  with the global gear table }
 function CdcParams(minLog, avgLog, maxLog: Integer): TCdcParams;
+{ a gear table from a splitmix64 state: the global one's is
+  0x5359434143444331; an encrypted archive's comes from its key }
+procedure MakeGear(seed: UInt64; out g: array of UInt64);
 { The length of the fragment starting at p, with n > 0 bytes left in the
   file: 1 .. min(n, maxSize). }
 function CdcCut(const prm: TCdcParams; p: PByte; n: SizeInt): SizeInt;
@@ -55,6 +60,7 @@ begin
   Result.maxSize := SizeInt(1) shl maxLog;
   Result.strictShift := 64 - (avgLog + 2);
   Result.looseShift := 64 - (avgLog - 2);
+  Result.gear := @gear[0];
 end;
 
 { The spec's loop, in two parts: while the fragment would be shorter than
@@ -65,7 +71,7 @@ begin
 {$ifndef SYLZ_PUREPASCAL}
   if CdcUseC then
     Exit(sylzc_cdc_cut(p, n, prm.minSize, prm.avgSize, prm.maxSize, prm.strictShift,
-      prm.looseShift, @gear[0]));
+      prm.looseShift, prm.gear));
 {$endif}
   Result := CdcCutPas(prm, p, n);
 end;
@@ -87,14 +93,14 @@ begin
   i := prm.minSize;
   while i < e1 do
   begin
-    h := (h shl 1) + gear[p[i]];
+    h := (h shl 1) + prm.gear[p[i]];
     Inc(i);
     if h shr prm.strictShift = 0 then
       Exit(i);
   end;
   while i < lim do
   begin
-    h := (h shl 1) + gear[p[i]];
+    h := (h shl 1) + prm.gear[p[i]];
     Inc(i);
     if h shr prm.looseShift = 0 then
       Exit(i);
@@ -102,23 +108,22 @@ begin
   Result := lim;
 end;
 
-{ splitmix64 from "SYCACDC1" }
-procedure GearInit;
+procedure MakeGear(seed: UInt64; out g: array of UInt64);
 var
   state, z: UInt64;
   i: Integer;
 begin
-  state := UInt64($5359434143444331);
+  state := seed;
   for i := 0 to 255 do
   begin
     state := state + UInt64($9E3779B97F4A7C15);
     z := state;
     z := (z xor (z shr 30)) * UInt64($BF58476D1CE4E5B9);
     z := (z xor (z shr 27)) * UInt64($94D049BB133111EB);
-    gear[i] := z xor (z shr 31);
+    g[i] := z xor (z shr 31);
   end;
 end;
 
 initialization
-  GearInit;
+  MakeGear(UInt64($5359434143444331), gear);   { "SYCACDC1" }
 end.

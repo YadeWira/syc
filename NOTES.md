@@ -66,6 +66,27 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Encryption, stage 5: encrypted archives (format 3) (2026-10-24)
+
+- `syc a -p`: format 3, the key record after the header (data from byte
+  224); blocks sealed on their threads (AAD "SYCB" vnum k rawLen packed),
+  the index sealed (AAD "SYCI" vnum rawLen packed) unless
+  `--visible-names`, the version's time moved into the index (the vhead
+  says 0); fragment ids are BLAKE2s keyed with K_fragment, and the
+  cutter's gear table comes from K_cdc. Appending needs the password and
+  keeps the mode; -p on a plain archive, --visible-names on an existing
+  one or without -p are usage errors.
+- One reader for t and x: TArchive.LoadBlock (format 3: nonce and tag
+  around the payload, CRC field 0); the pre hook opens each block on its
+  thread.
+- Checked: the tree back after x (and -u 1 after a second version); no
+  name in the default mode's bytes; `l` without the password works with
+  --visible-names only; each of 300 random byte flips (both modes)
+  refused; two equal-size sealed blocks swapped inside a version, or one
+  copied from version 2 into version 1: "does not authenticate"; none of
+  the plain BLAKE2s ids of the data (fragments as format 2 would cut
+  them, whole files) appears in a --visible-names archive.
+
 ## Encryption, stages 3-4: the password, encrypted streams (2026-10-24)
 
 - `src/sycenc.pas`: the key record (made with a random data key wrapped
