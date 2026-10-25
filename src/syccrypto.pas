@@ -24,6 +24,8 @@ type
   TKey32 = array[0..31] of Byte;
   TNonce24 = array[0..23] of Byte;
   TTag16 = array[0..15] of Byte;
+  PNonce24 = ^TNonce24;
+  PTag16 = ^TTag16;
 
 { BLAKE2b with an outLen of 1..64 bytes, unkeyed }
 procedure Blake2b(outLen: Integer; p: PByte; n: SizeInt; dst: PByte);

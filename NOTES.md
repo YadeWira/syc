@@ -66,6 +66,24 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Encryption, stages 3-4: the password, encrypted streams (2026-10-24)
+
+- `src/sycenc.pas`: the key record (made with a random data key wrapped
+  by Argon2id's key; opened slot by slot, the structure checked before
+  any Argon2id runs), the subkeys, SealData / OpenData, the password.
+- Password, in order: -pPASSWORD / --password=, --password-file (first
+  line), SYC_PASSWORD, the terminal without echo (/dev/tty with termios;
+  CONIN$ with ReadConsoleW on Windows), twice when creating. Checked
+  through a pseudo-terminal: no echo, the two entries compared, a
+  password with spaces and "ñ" the same typed and inline.
+- Streams version 5 (`c -p`): each block sealed on its thread after
+  compression (TJob.post), opened before decompression on its thread
+  (TJob.pre, new); no CRC-32 (TJob.noCrc); the end sealed with the number
+  of blocks. Refused (exit 3): a wrong password, each of 60 random byte
+  flips, a stream cut at a block boundary with the end record copied
+  after it, two blocks swapped, a byte after the end. `--raw` with a
+  password is a usage error.
+
 ## Encryption, stage 2: the primitives (2026-10-24)
 
 Plan and format: wiki "syc encryption" (draft, approved by the user).

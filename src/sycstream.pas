@@ -19,7 +19,7 @@ unit sycstream;
 interface
 
 uses
-  SysUtils, Classes, Math, sylz, sycblocks, syccli, sycarc;
+  SysUtils, Classes, Math, sylz, syccrypto, sycblocks, syccli, sycenc, sycarc;
 
 { runs syc c, d or t on every operand; returns the exit code }
 function RunStreamCommand(const opts: TOptions): Integer;
@@ -32,19 +32,85 @@ const
                         blocks, v3 chunks of mode 2 (syc 0.2.14-0.3.4); 2:
                         v3 chunks of mode 1 (syc 0.2.5-0.2.13); 1: v2 only
                         (syc 0.2.2-); 0 was sylz v1 (syc 0.2.0-0.2.1) }
+  FORMAT_ENC   = 5;   { 5: encrypted (wiki: syc encryption) }
   CODEC_SYLZ   = 1;
   STORED_FLAG  = UInt32($80000000);
   PAYLOAD_MASK = UInt32($7FFFFFFF);
 
-{ Compresses fin to fout; returns the bytes read and written. }
-procedure Compress(fin, fout: TStream; const opts: TOptions; prog: TProgress; out total, written: Int64);
+type
+  { seals (compressing) or opens (decompressing) the blocks of an
+    encrypted stream (version 5), on each block's thread }
+  TStreamSealer = class
+    keys: TSycKeys;
+    function Aad(job: TJob): TBytes;
+    procedure SealJob(job: TJob);
+    procedure OpenJob(job: TJob);
+  end;
+
+{ "SYZB", the block's position, rawLen, packed }
+function TStreamSealer.Aad(job: TJob): TBytes;
+var
+  packedField: UInt32;
+begin
+  Result := nil;
+  PutBytes(Result, 'SYZB');
+  PutU64(Result, UInt64(job.tag));
+  PutU32(Result, UInt32(job.n));
+  packedField := UInt32(job.payLen);
+  if job.stored then
+    packedField := packedField or STORED_FLAG;
+  PutU32(Result, packedField);
+end;
+
+{ after compressing: the payload (compressed, or the raw data when that
+  is no smaller), sealed in place }
+procedure TStreamSealer.SealJob(job: TJob);
+begin
+  job.stored := job.c >= job.n;
+  if job.stored then
+  begin
+    Move(job.raw^, job.payload^, job.n);
+    job.payLen := job.n;
+  end
+  else
+    job.payLen := job.c;
+  SealData(keys.aead, Aad(job), job.payload, job.payLen, @job.seal[0]);
+end;
+
+{ before decompressing: the payload checked and opened in place }
+procedure TStreamSealer.OpenJob(job: TJob);
+begin
+  if not OpenData(keys.aead, Aad(job), job.payload, job.payLen, @job.seal[0]) then
+  begin
+    job.ok := False;
+    job.failed := -1;   { the tag }
+  end;
+end;
+
+{ the header's bytes, as the key record's AAD takes them }
+function StreamPrefix(version, codec, level: Byte): TBytes;
+begin
+  Result := nil;
+  PutBytes(Result, MAGIC);
+  SetLength(Result, 7);
+  Result[4] := version;
+  Result[5] := codec;
+  Result[6] := level;
+end;
+
+{ Compresses fin to fout; returns the bytes read and written. With a
+  password (-p...), stream version 5: encrypted. }
+procedure Compress(fin, fout: TStream; const opts: TOptions; const name: string; prog: TProgress;
+  out total, written: Int64);
 var
   pipe: TPipeline;
-  hdr: array[0..6] of Byte;
+  hdr, rec, pw, aad: TBytes;
   blockSize: SizeInt;
   blocks, b, slot: Int64;
   i: Integer;
-  eof: Boolean;
+  eof, enc: Boolean;
+  sealer: TStreamSealer;
+  seal: array[0..SEAL_SIZE - 1] of Byte;
 
   procedure WriteSlot(slot: Integer);
   var
@@ -55,7 +121,20 @@ var
     if not job.ok then
       Fail(EXIT_FATAL, 'out of memory');
     WriteU32(fout, UInt32(job.n));
-    if job.c < job.n then
+    if enc then
+    begin
+      { rawLen, packed, crc32 = 0, nonce, the sealed payload, tag }
+      if job.stored then
+        WriteU32(fout, UInt32(job.payLen) or STORED_FLAG)
+      else
+        WriteU32(fout, UInt32(job.payLen));
+      WriteU32(fout, 0);
+      fout.WriteBuffer(job.seal[0], 24);
+      fout.WriteBuffer(job.payload^, job.payLen);
+      fout.WriteBuffer(job.seal[24], 16);
+      Inc(written, 12 + SEAL_SIZE + job.payLen);
+    end
+    else if job.c < job.n then
     begin
       WriteU32(fout, UInt32(job.c));
       WriteU32(fout, job.crc);
@@ -73,18 +152,33 @@ var
   end;
 
 begin
+  enc := EncryptionRequested(opts);
   blockSize := SizeInt(opts.blockMiB) shl 20;
+  sealer := nil;
   pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);
   try
     for i := 0 to pipe.Slots - 1 do
       pipe.jobs[i].Reserve(blockSize, SylzBound(blockSize));
-    Move(MAGIC[1], hdr[0], 4);
-    hdr[4] := FORMAT_VER;
-    hdr[5] := CODEC_SYLZ;
-    hdr[6] := Byte(opts.level);
-    fout.WriteBuffer(hdr, 7);
+    if enc then
+    begin
+      hdr := StreamPrefix(FORMAT_ENC, CODEC_SYLZ, Byte(opts.level));
+      pw := GetPassword(opts, True, name);
+      sealer := TStreamSealer.Create;
+      NewKeyRecord(hdr, pw, UInt32(opts.kdfMemMiB) * 1024, 0, sealer.keys, rec);
+      Wipe(@pw[0], Length(pw));
+      fout.WriteBuffer(hdr[0], Length(hdr));
+      fout.WriteBuffer(rec[0], Length(rec));
+      written := Length(hdr) + Length(rec);
+      pipe.SetPre(nil, True);
+      pipe.SetPost(@sealer.SealJob);
+    end
+    else
+    begin
+      hdr := StreamPrefix(FORMAT_VER, CODEC_SYLZ, Byte(opts.level));
+      fout.WriteBuffer(hdr[0], Length(hdr));
+      written := Length(hdr);
+    end;
     total := 0;
-    written := 7;
     blocks := 0;
     eof := False;
     { block b goes to slot b mod Slots; before a slot takes a new block,
@@ -100,6 +194,7 @@ begin
         eof := True;
       if pipe.jobs[slot].n = 0 then
         Break;
+      pipe.jobs[slot].tag := blocks;
       pipe.Start(slot);
       Inc(blocks);
     end;
@@ -112,22 +207,42 @@ begin
     end;
     WriteU32(fout, 0);
     Inc(written, 4);
+    if enc then
+    begin
+      { the end, authenticated with the number of blocks }
+      aad := nil;
+      PutBytes(aad, 'SYZE');
+      PutU64(aad, UInt64(blocks));
+      SealData(sealer.keys.aead, aad, nil, 0, @seal[0]);
+      fout.WriteBuffer(seal, SEAL_SIZE);
+      Inc(written, SEAL_SIZE);
+    end;
   finally
     pipe.Free;
+    if sealer <> nil then
+    begin
+      WipeKeys(sealer.keys);
+      sealer.Free;
+    end;
   end;
 end;
 
 { Decompresses fin to fout (nil: only checks it); returns the bytes
   written. name is fin's, for the messages. }
-procedure Decompress(fin, fout: TStream; const name: string; threads: Integer; prog: TProgress;
+procedure Decompress(fin, fout: TStream; const opts: TOptions; const name: string; prog: TProgress;
   out total: Int64);
 var
   pipe: TPipeline;
   job: TJob;
   rawLen, packedField, sum, payLen: UInt32;
   hdr: array[0..6] of Byte;
+  prefix, rec, pw, aad: TBytes;
+  seal: array[0..SEAL_SIZE - 1] of Byte;
+  extra: Byte;
   at: Int64;
   blocks, b, slot: Int64;
+  enc: Boolean;
+  sealer: TStreamSealer;
 
   procedure WriteSlot(slot: Integer);
   var
@@ -136,8 +251,13 @@ var
     pipe.Finish(slot);
     job := pipe.jobs[slot];
     if not job.ok then
+    begin
+      if job.failed = -1 then
+        Fail(EXIT_CORRUPT, Format('%s: the block at output offset %d does not authenticate '
+          + '(changed, moved or from another stream)', [name, total]));
       Fail(EXIT_CORRUPT, Format('%s: corrupt data or checksum mismatch in the block at output offset %d',
         [name, total]));
+    end;
     if fout <> nil then
       fout.WriteBuffer(job.raw^, job.n);
     Inc(total, job.n);
@@ -147,10 +267,10 @@ begin
   total := 0;
   if (ReadFull(fin, @hdr[0], 6) <> 6) or (CompareByte(hdr[0], MAGIC[1], 4) <> 0) then
     Fail(EXIT_CORRUPT, name + ': not a ' + STREAM_SUFFIX + ' stream');
-  if (hdr[4] < 1) or (hdr[4] > FORMAT_VER) then
+  if (hdr[4] < 1) or (hdr[4] > FORMAT_ENC) then
     Fail(EXIT_CORRUPT, Format('%s: stream format version %d not supported by syc %s',
       [name, hdr[4], SYC_VERSION]));
-  { version 4: hdr[5] is the codec; the level byte follows }
+  { version 4 and up: hdr[5] is the codec; the level byte follows }
   if hdr[4] >= 4 then
   begin
     if hdr[5] <> CODEC_SYLZ then
@@ -158,8 +278,23 @@ begin
     if ReadFull(fin, @hdr[6], 1) <> 1 then
       Fail(EXIT_CORRUPT, name + ': truncated');
   end;
-  pipe := TPipeline.Create(threads, True, 0, 0);
+  enc := hdr[4] = FORMAT_ENC;
+  sealer := nil;
+  pipe := TPipeline.Create(opts.threads, True, 0, 0);
   try
+    if enc then
+    begin
+      prefix := StreamPrefix(hdr[4], hdr[5], hdr[6]);
+      SetLength(rec, KEYREC_SIZE);
+      if ReadFull(fin, @rec[0], KEYREC_SIZE) <> KEYREC_SIZE then
+        Fail(EXIT_CORRUPT, name + ': truncated');
+      pw := GetPassword(opts, False, name);
+      sealer := TStreamSealer.Create;
+      if not OpenKeyRecord(prefix, rec, pw, name, sealer.keys) then
+        Fail(EXIT_CORRUPT, name + ': wrong password, or a damaged key record');
+      Wipe(@pw[0], Length(pw));
+      pipe.SetPre(@sealer.OpenJob, True);
+    end;
     at := 0;
     blocks := 0;
     try
@@ -172,23 +307,42 @@ begin
         sum := ReadU32(fin);
         payLen := packedField and PAYLOAD_MASK;
         if (rawLen > MAX_BLOCK) or (payLen > MAX_BLOCK)
-           or ((packedField and STORED_FLAG <> 0) and (payLen <> rawLen)) then
+           or ((packedField and STORED_FLAG <> 0) and (payLen <> rawLen))
+           or (enc and (sum <> 0)) then
           Fail(EXIT_CORRUPT, Format('%s: corrupt block header at output offset %d', [name, at]));
         slot := blocks mod pipe.Slots;
         if blocks >= pipe.Slots then
           WriteSlot(slot);
         job := pipe.jobs[slot];
         job.Reserve(rawLen, payLen);
+        if enc and (ReadFull(fin, @job.seal[0], 24) <> 24) then
+          Fail(EXIT_CORRUPT, name + ': truncated');
         if ReadFull(fin, job.payload, payLen) <> SizeInt(payLen) then
+          Fail(EXIT_CORRUPT, name + ': truncated');
+        if enc and (ReadFull(fin, @job.seal[24], 16) <> 16) then
           Fail(EXIT_CORRUPT, name + ': truncated');
         prog.Add(12 + payLen);
         job.n := rawLen;
         job.payLen := payLen;
         job.stored := packedField and STORED_FLAG <> 0;
         job.sum := sum;
+        job.tag := blocks;
         Inc(at, rawLen);
         pipe.Start(slot);
         Inc(blocks);
+      end;
+      if enc then
+      begin
+        { the end: authenticated with the number of blocks, then nothing }
+        if ReadFull(fin, @seal[0], SEAL_SIZE) <> SEAL_SIZE then
+          Fail(EXIT_CORRUPT, name + ': truncated');
+        aad := nil;
+        PutBytes(aad, 'SYZE');
+        PutU64(aad, UInt64(blocks));
+        if not OpenData(sealer.keys.aead, aad, nil, 0, @seal[0]) then
+          Fail(EXIT_CORRUPT, name + ': the end does not authenticate (cut, or blocks added)');
+        if ReadFull(fin, @extra, 1) <> 0 then
+          Fail(EXIT_CORRUPT, name + ': bytes after the end');
       end;
     except
       on EReadError do
@@ -202,6 +356,11 @@ begin
     end;
   finally
     pipe.Free;
+    if sealer <> nil then
+    begin
+      WipeKeys(sealer.keys);
+      sealer.Free;
+    end;
   end;
 end;
 
@@ -377,15 +536,15 @@ begin
         end;
         pre := TPrefixStream.Create(Copy(magic, 0, got), fin);
         try
-          Decompress(pre, nil, inName, opts.threads, prog, total);
+          Decompress(pre, nil, opts, inName, prog, total);
         finally
           pre.Free;
         end;
       end
       else if opts.cmd = 'c' then
-        Compress(fin, fout, opts, prog, total, written)
+        Compress(fin, fout, opts, inName, prog, total, written)
       else
-        Decompress(fin, fout, inName, opts.threads, prog, total);
+        Decompress(fin, fout, opts, inName, prog, total);
     finally
       if prog <> nil then
         prog.Finish;

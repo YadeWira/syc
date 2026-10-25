@@ -35,6 +35,11 @@ type
     skipExisting: Boolean;   { x --skip }
     removeInput: Boolean;    { --rm }
     raw: Boolean;            { c/d/t --raw: one bare sylz block }
+    passwordFlag: Boolean;   { -p / --password: encrypt (a, c), password from the sources }
+    passwordInline: string;  { -pPASSWORD / --password=PASSWORD }
+    passwordFile: string;    { --password-file }
+    visibleNames: Boolean;   { a --visible-names }
+    kdfMemMiB: Integer;      { --kdf-mem }
     rawSize: Integer;        { d/t --size: its decoded size; -1 not given }
     verbosity: TVerbosity;
     progress: Boolean;       { --progress / --no-progress; default: stderr is a terminal }
@@ -104,7 +109,7 @@ end;
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
-    oRaw, oSize, oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
+    oRaw, oSize, oPassword, oPasswordFile, oVisibleNames, oKdfMem, oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
     id: TOptId;
@@ -114,7 +119,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..24] of TOptDef = (
+  OPTION_DEFS: array[0..28] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
@@ -135,6 +140,10 @@ const
     (id: oNoOwner; short: '';   long: 'no-owner';   value: False; cmds: 'x'),
     (id: oRaw;     short: '';   long: 'raw';        value: False; cmds: 'cdt'),
     (id: oSize;    short: '';   long: 'size';       value: True;  cmds: 'dt'),
+    (id: oPassword; short: '';  long: 'password';   value: False; cmds: 'axlicdt'),
+    (id: oPasswordFile; short: ''; long: 'password-file'; value: True; cmds: 'axlicdt'),
+    (id: oVisibleNames; short: ''; long: 'visible-names'; value: False; cmds: 'a'),
+    (id: oKdfMem;  short: '';   long: 'kdf-mem';    value: True;  cmds: 'ac'),
     (id: oProgress; short: '';  long: 'progress';   value: False; cmds: 'axcdt'),
     (id: oNoProgress; short: ''; long: 'no-progress'; value: False; cmds: 'axcdt'),
     (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'axlicdt'),
@@ -180,8 +189,25 @@ begin
   WriteLn('              9-10 price literals by their Huffman codes');
 end;
 
+procedure PasswordUsage(cmd: Char);
+begin
+  if cmd in ['a', 'c'] then
+  begin
+    WriteLn('  -p, --password         encrypt (XChaCha20-Poly1305, key from Argon2id); the');
+    WriteLn('                         password comes from -pPASSWORD / --password=PASSWORD');
+    WriteLn('                         (seen by other users: avoid), --password-file FILE,');
+    WriteLn('                         SYC_PASSWORD, else the terminal');
+    WriteLn('  --kdf-mem MIB          Argon2id''s memory, default 64');
+    if cmd = 'a' then
+      WriteLn('  --visible-names        encrypt the data only: names, sizes, dates stay listable');
+  end
+  else if cmd in ['x', 'l', 'i', 't', 'd'] then
+    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)');
+end;
+
 procedure ProgressUsage(cmd: Char);
 begin
+  PasswordUsage(cmd);
   if cmd in ['a', 'x', 'c', 'd', 't'] then
     WriteLn('  --progress, --no-progress   progress on stderr (default: if it is a terminal)');
 end;
@@ -327,6 +353,7 @@ begin
   opts.threads := 1;
   opts.verbosity := vNormal;
   opts.rawSize := -1;
+  opts.kdfMemMiB := 64;
 
   if CmdArgCount < 1 then
   begin
@@ -375,6 +402,22 @@ begin
       opts.level := IntArg('the level', Copy(arg, 2, MaxInt), SYLZ_MINLEVEL, SYLZ_MAXLEVEL);
       if Pos(opts.cmd, OPTION_DEFS[Ord(oLevel)].cmds) = 0 then
         UsageError(Format('syc %s takes no level', [opts.cmd]));
+      Continue;
+    end;
+
+    { -p, -pPASSWORD, --password=PASSWORD: the value is optional }
+    if (Copy(arg, 1, 2) = '-p') or (Copy(arg, 1, 11) = '--password=') then
+    begin
+      if Pos(opts.cmd, 'axlicdt') = 0 then
+        UsageError(Format('syc %s takes no password', [opts.cmd]));
+      if arg = '-p' then
+        opts.passwordFlag := True
+      else if Copy(arg, 1, 2) = '-p' then
+        opts.passwordInline := Copy(arg, 3, MaxInt)
+      else
+        opts.passwordInline := Copy(arg, 12, MaxInt);
+      if (arg <> '-p') and (opts.passwordInline = '') then
+        UsageError('an empty password');
       Continue;
     end;
 
@@ -458,6 +501,15 @@ begin
       oNoDedup: opts.noDedup := True;
       oNoDelete: opts.noDelete := True;
       oRaw: opts.raw := True;
+      oPassword: opts.passwordFlag := True;
+      oPasswordFile:
+        begin
+          if value = '' then
+            UsageError(shown + ' needs a file');
+          opts.passwordFile := value;
+        end;
+      oVisibleNames: opts.visibleNames := True;
+      oKdfMem: opts.kdfMemMiB := IntArg(shown, value, 8, 4096);
       oSize: opts.rawSize := IntArg(shown, value, 0, MAX_BLOCK);
       oAll: opts.allVersions := True;
       oLong: opts.longList := True;
@@ -494,6 +546,8 @@ begin
     UsageError('--raw needs --size N: a bare block does not hold its decoded size');
   if (opts.rawSize >= 0) and not opts.raw then
     UsageError('--size goes with --raw');
+  if opts.raw and (opts.passwordFlag or (opts.passwordInline <> '') or (opts.passwordFile <> '')) then
+    UsageError('--raw writes a bare sylz block: it cannot be encrypted');
   if opts.raw and (opts.blockMiB > 0) then
     UsageError('--raw writes one block: no -b');
   if (opts.cmd in ['c', 'd']) and (opts.outPath = '-') then

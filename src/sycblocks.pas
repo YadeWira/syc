@@ -75,8 +75,11 @@ type
     ctx: TSylzCtx;
     dctx: TSylzDCtx;
     post: TJobPost;
+    pre: TJobPost;       { decompressing: run first (decryption); clears ok to stop }
     tag: Int64;          { the caller's: which block this is }
     failed: Int64;       { set by post: what it found wrong (0: nothing) }
+    noCrc: Boolean;      { encrypted blocks: no CRC-32 (their tag checks them) }
+    seal: array[0..39] of Byte;   { an encrypted block's nonce (24) and tag (16) }
     constructor Create;
     destructor Destroy; override;
     procedure Reserve(rawSize, paySize: SizeInt);
@@ -113,6 +116,8 @@ type
     destructor Destroy; override;
     function Slots: Integer;
     procedure SetPost(p: TJobPost);
+    { pre hooks, and no CRC-32 (encrypted blocks) }
+    procedure SetPre(p: TJobPost; aNoCrc: Boolean);
     procedure Start(slot: Integer);    { slot's job is ready: work on it }
     procedure Finish(slot: Integer);   { wait until slot's job is done }
     procedure RunJob(job: TJob);
@@ -366,7 +371,10 @@ end;
 
 procedure TJob.DoCompress(level, flags: Integer);
 begin
-  crc := crc32(0, raw, n);
+  if noCrc then
+    crc := 0
+  else
+    crc := crc32(0, raw, n);
   c := SylzCompressEx(ctx, raw, n, payload, payCap, level, flags);
   ok := c >= 0;
 end;
@@ -380,7 +388,7 @@ begin
     ok := False;
     Exit;
   end;
-  ok := crc32(0, raw, n) = sum;
+  ok := noCrc or (crc32(0, raw, n) = sum);
 end;
 
 constructor TWorker.Create(aPipe: TPipeline; aIndex: Integer);
@@ -474,11 +482,17 @@ end;
 procedure TPipeline.RunJob(job: TJob);
 begin
   try
+    job.failed := 0;
     if decompressing then
-      job.DoDecompress
+    begin
+      job.ok := True;
+      if Assigned(job.pre) then
+        job.pre(job);
+      if job.ok then
+        job.DoDecompress;
+    end
     else
       job.DoCompress(level, flags);
-    job.failed := 0;
     if job.ok and Assigned(job.post) then
       job.post(job);
   except
@@ -492,6 +506,17 @@ var
 begin
   for i := 0 to High(jobs) do
     jobs[i].post := p;
+end;
+
+procedure TPipeline.SetPre(p: TJobPost; aNoCrc: Boolean);
+var
+  i: Integer;
+begin
+  for i := 0 to High(jobs) do
+  begin
+    jobs[i].pre := p;
+    jobs[i].noCrc := aNoCrc;
+  end;
 end;
 
 { ── progress ───────────────────────────────────────────────────────────── }
