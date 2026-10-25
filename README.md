@@ -171,22 +171,23 @@ Each block carries a CRC32 of its data, checked on decompression.
 
 ## zpaq-std plugins
 
-`plugin/` holds two codec plugins for
-[zpaq-std](https://github.com/YadeWira/zpaq-std) (plugin ABI 1: one
-exported C function, `zpaqstd_codec_v1`, per file): `sylz` (`-ma:sylz`,
-format v2) and `sylzec` (`-ma:sylzec`, format v3: `-ec`'s), levels 0..10,
-default 1.
+`plugin/` holds one plugin file for
+[zpaq-std](https://github.com/YadeWira/zpaq-std) (plugin ABI 1) with two
+codecs: `sylz` (`-ma:sylz`, format v2) and `sylzec` (`-ma:sylzec`, format
+v3: `-ec`'s), levels 0..10, default 1. It exports `zpaqstd_codec_v1`
+(sylz, what zpaq-std 1.7 and earlier load) and `zpaqstd_codecs_v1(i)`
+(0 sylz, 1 sylzec, then NULL). Before v0.4.2 sylzec was a file of its own.
 
 ```sh
-plugin/build.sh linux-x86_64          # out/plugin/linux-x86_64/sylz.so and sylzec.so
-plugin/build.sh win64                 # .../win64/sylz.dll and sylzec.dll
+plugin/build.sh linux-x86_64          # out/plugin/linux-x86_64/sylz.so
+plugin/build.sh win64                 # .../win64/sylz.dll
 FPC=ppcross386 plugin/build.sh win32 -Fu<rtl>/units/i386-win32
 FPC=ppcrossa64 plugin/build.sh linux-arm64 -Fu<rtl>/units/aarch64-linux \
   -Fl/usr/lib/gcc-cross/aarch64-linux-gnu/14 -Fl/usr/aarch64-linux-gnu/lib
 ```
 
-`plugin/test_plugin.c` loads either plugin the way zpaq-std does and checks the
-contract: exported entry, ABI fields, roundtrips at every level,
+`plugin/test_plugin.c` loads the plugin the way zpaq-std does (`--codec N`
+picks a codec of the list) and checks the contract: exported entry, ABI fields, roundtrips at every level,
 `compress` never past `cap` (also when `cap` is too small), corrupt and
 truncated streams, 8 threads at once, and that loading the library leaves
 the process's floating-point state (MXCSR, x87 control word) alone. It

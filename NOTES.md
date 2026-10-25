@@ -66,6 +66,18 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## One plugin file, two codecs (2026-10-24)
+
+zpaq-std asked (for its 1.8.0) for sylz and sylzec in one file, like
+pja.dll: `zpaqstd_codec_v1` returns sylz as before (zpaq-std 1.7 and
+earlier load the file unchanged), `zpaqstd_codecs_v1(int i)` returns 0
+sylz, 1 sylzec, then NULL. Names, library strings and bytes unchanged:
+66 compressions (both codecs, 11 levels, 3 files) identical to v0.4.1's
+two files. plugin/test_plugin.c gained `--codec N` (and checks that entry
+0 is zpaqstd_codec_v1's and that the list ends). Under wine the x64
+harness reports MXCSR's precision flag (0x20, a status bit) set by
+loading, with v0.4.1's DLL too; on Windows 10 both DLLs pass.
+
 ## syc c / d / t --raw (2026-10-24)
 
 One bare sylz block, what SylzCompressEx (the plugins' compress()) writes:

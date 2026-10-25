@@ -1,6 +1,5 @@
-{ zs_codec.inc — what both zpaq-std adapters share (sylz_zpaqstd.pas,
-  sylzec_zpaqstd.pas): zpaq-std's plugin ABI 1 (compressors/plug/zs_codec.h
-  in YadeWira/zpaq-std) and the bound both codecs give. }
+{ zs_codec.inc — zpaq-std's plugin ABI 1 (compressors/plug/zs_codec.h in
+  YadeWira/zpaq-std) and the bound both codecs of sylz_zpaqstd.pas give. }
 
 const
   ZS_CODEC_ABI  = 1;

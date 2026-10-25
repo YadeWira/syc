@@ -23,9 +23,8 @@ mkdir -p "$dir/units"
 . ./build-c.sh
 # shellcheck disable=SC2086
 build_c "$dir/units" $opts "$@"
-for codec in sylz sylzec; do
-  "$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -Fuplugin -FU"$dir/units" -Fo"$dir/units" -FE"$dir" "$@" \
-    plugin/${codec}_zpaqstd.pas
-  mv -f "$dir/${pre}${codec}_zpaqstd.$ext" "$dir/$codec.$ext"
-  echo "$dir/$codec.$ext"
-done
+# one file, both codecs: sylz (format v2) and sylzec (format v3)
+"$FPC" -O3 -XX -Xs -vewn $opts -Fusrc -Fuplugin -FU"$dir/units" -Fo"$dir/units" -FE"$dir" "$@" \
+  plugin/sylz_zpaqstd.pas
+mv -f "$dir/${pre}sylz_zpaqstd.$ext" "$dir/sylz.$ext"
+echo "$dir/sylz.$ext"

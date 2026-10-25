@@ -1,9 +1,11 @@
 /* test_plugin — loads a sylz zpaq-std plugin (sylz or sylzec) the way zpaq-std does and
    checks it against zs_codec.h's contract.
 
-   Usage: test_plugin PLUGIN FILE...
+   Usage: test_plugin [--codec N] PLUGIN FILE...
 
-   - zpaqstd_codec_v1 is exported, abi/name/levels are as expected
+   - zpaqstd_codec_v1 is exported, abi/name/levels are as expected; with
+     --codec N, zpaqstd_codecs_v1(N) is the codec tested, (0) is what
+     zpaqstd_codec_v1 returns, and the list ends with NULL after sylzec
    - loading the plugin leaves the floating-point state (MXCSR, x87 control
      word) of the process unchanged
    - every file, at every level: compress with bound() bytes, decompress
@@ -163,7 +165,13 @@ static void* worker(void* p)
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: test_plugin PLUGIN FILE...\n"); return 2; }
+    int pick = -1;
+    if (argc >= 3 && strcmp(argv[1], "--codec") == 0) {
+        pick = atoi(argv[2]);
+        argv += 2;
+        argc -= 2;
+    }
+    if (argc < 3) { fprintf(stderr, "usage: test_plugin [--codec N] PLUGIN FILE...\n"); return 2; }
 
 #ifdef HAVE_X86
     unsigned mxcsr0 = _mm_getcsr();
@@ -182,6 +190,12 @@ int main(int argc, char** argv)
     zs_codec_entry entry = (zs_codec_entry)dlsym(h, "zpaqstd_codec_v1");
 #endif
     if (!entry) { printf("FAIL: zpaqstd_codec_v1 not exported\n"); return 1; }
+    typedef const zs_codec* (*zs_list_entry)(int);
+#ifdef _WIN32
+    zs_list_entry list = (zs_list_entry)(void*)GetProcAddress(h, "zpaqstd_codecs_v1");
+#else
+    zs_list_entry list = (zs_list_entry)dlsym(h, "zpaqstd_codecs_v1");
+#endif
 
 #ifdef HAVE_X86
     CHECK(_mm_getcsr() == mxcsr0, "loading the plugin changed MXCSR %08x -> %08x", mxcsr0, _mm_getcsr());
@@ -193,6 +207,14 @@ int main(int argc, char** argv)
 
     C = entry();
     CHECK(C != NULL, "zpaqstd_codec_v1 returned NULL");
+    if (pick >= 0) {
+        CHECK(list != NULL, "zpaqstd_codecs_v1 not exported");
+        if (!list) return 1;
+        CHECK(list(0) == C, "zpaqstd_codecs_v1(0) is not what zpaqstd_codec_v1 returns");
+        CHECK(list(2) == NULL, "zpaqstd_codecs_v1(2) is not NULL");
+        C = list(pick);
+        CHECK(C != NULL, "zpaqstd_codecs_v1(%d) returned NULL", pick);
+    }
     if (!C) return 1;
     CHECK(C->abi == 1, "abi %d", C->abi);
     CHECK(C->name && (strcmp(C->name, "sylz") == 0 || strcmp(C->name, "sylzec") == 0),
