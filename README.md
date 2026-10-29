@@ -4,11 +4,30 @@ A streaming archiver and compressor with its own LZ codecs, written from
 scratch in Free Pascal, with C and assembler for the hottest loops. Tuned
 for modest hardware.
 
-**Status: v0.2.x, pre-release.** Every release stays a pre-release until
-v1.0.0, and the formats can change between versions. syc v0.1.x was a
-Rust archiver; its sources are archived in [`legacy/rust/`](legacy/rust/). v0.2 restarts
-the project in Free Pascal, algorithms first: the codec is under way, the
-command line is a placeholder and will also be designed from scratch.
+| Component | Status |
+|---|---|
+| CI | [![CI][ciBadge]][ciLink] |
+| Latest release | [![Release][relBadge]][relLink] |
+| Language | Free Pascal 3.2.2, with C and assembler beside a Pascal reference |
+| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional |
+
+[ciBadge]: https://github.com/YadeWira/syc/actions/workflows/ci.yml/badge.svg "Continuous Integration"
+[ciLink]: https://github.com/YadeWira/syc/actions/workflows/ci.yml
+[relBadge]: https://img.shields.io/github/v/release/YadeWira/syc?include_prereleases "Latest release"
+[relLink]: https://github.com/YadeWira/syc/releases
+
+| OS | Architectures | State |
+|---|---|---|
+| Linux | x86-64, arm64, x86 (32-bit) | CI and release binaries |
+| Windows | x86-64, x86 (32-bit) | CI and release binaries; also tested on Windows 10 |
+| macOS | arm64 (Apple Silicon) | CI and release binaries |
+
+CI builds and tests every platform above and checks they all compress to
+the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
+
+**Status: v0.5.x, pre-release.** Every release stays a pre-release until
+v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
+[`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
 ## Goals
 
@@ -124,9 +143,10 @@ The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).
 
 ## Build
 
-Free Pascal 3.2.2 and a C compiler for the target (gcc; mingw-w64 for
-Windows; aarch64-linux-gnu-gcc for arm64; `CC` overrides), which
-build.sh picks from the fpc options:
+Free Pascal 3.2.2 and a C compiler for the target (gcc; gcc -m32 for
+Linux x86; clang on macOS; mingw-w64 for Windows; aarch64-linux-gnu-gcc
+for arm64; `CC` overrides), which build.sh picks from the compiler's
+target:
 
 ```sh
 ./build.sh                    # out/syc and out/sylzbench
@@ -134,9 +154,16 @@ build.sh picks from the fpc options:
 ./build.sh -dSYLZ_PUREPASCAL  # no assembler, no C: Pascal paths only
 FPC=ppcross386 ./build.sh -Twin32                  # Windows 32-bit
 FPC=ppcrossa64 ./build.sh -XPaarch64-linux-gnu-    # Linux arm64
+scripts/fpc-i386.sh /opt/fpc-i386                  # Linux x86: a 32-bit FPC
+FPC=/opt/fpc-i386/fpc ./build.sh                   #   (needs gcc-multilib)
 ```
 
-Release binaries: Linux x86-64 and arm64, Windows x86-64 and 32-bit.
+On macOS (`brew install fpc`) `./build.sh` builds as on Linux.
+
+Release binaries: Linux x86-64, arm64 and x86, Windows x86-64 and 32-bit,
+macOS arm64. The macOS ones are not signed: after downloading, run
+`xattr -d com.apple.quarantine syc` (or allow it in System Settings ›
+Privacy & Security).
 Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/Building).
 
 ## Use
@@ -213,8 +240,8 @@ out/sylzfuzz 3000 SAMPLE-FILES...
 Roundtrips random, structured and real data at every level, decodes
 corrupted and truncated blocks against guard-page buffers (any read or
 write out of bounds faults), alternates the assembler and Pascal paths,
-and checks the two compressors agree byte for byte. Linux only (uses
-mmap).
+and checks the two compressors agree byte for byte. Unix only (uses
+mmap). `.github/test.sh` runs every test the way CI does.
 
 ## Layout
 

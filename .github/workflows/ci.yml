@@ -1,0 +1,226 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Every job builds syc, runs the tests and records the SHA-256 of what syc
+# compresses from a fixed sample (.github/test.sh). The last job compares
+# them: the formats give the same bytes on every platform, and the Pascal
+# reference the same bytes as the C and assembler paths.
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal and the Python checkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          pip install pynacl cryptography argon2-cffi
+      - name: Build
+        run: ./build.sh
+      - name: Test
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-linux-x64
+          path: hash.txt
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal and the Python checkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          pip install pynacl cryptography argon2-cffi
+      - name: Build
+        run: ./build.sh
+      - name: Test
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-linux-arm64
+          path: hash.txt
+
+  linux-x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the 32-bit toolchain and the Python checkers
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libc6:i386
+          pip install pynacl cryptography argon2-cffi
+      - name: Install the 32-bit Free Pascal
+        run: scripts/fpc-i386.sh /tmp/fpc-i386
+      - name: Build
+        env:
+          FPC: /tmp/fpc-i386/fpc
+        run: ./build.sh
+      - name: Test
+        env:
+          FPC: /tmp/fpc-i386/fpc
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-linux-x86
+          path: hash.txt
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal and the Python checkers
+        run: |
+          brew install fpc
+          pip install pynacl cryptography argon2-cffi
+      - name: Build
+        run: ./build.sh
+      - name: Test
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-macos-arm64
+          path: hash.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syc-macos-arm64
+          path: |
+            out/syc
+            out/sylzbench
+
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal (win32 and win64) and the Python checkers
+        shell: pwsh
+        run: |
+          $url = 'https://sourceforge.net/projects/freepascal/files/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe/download'
+          curl.exe -L --fail --retry 3 -o "$env:TEMP\fpc-setup.exe" $url
+          Start-Process -Wait -FilePath "$env:TEMP\fpc-setup.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'
+          pip install pynacl cryptography argon2-cffi
+      - name: Add the toolchains to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+          $fpc = Get-ChildItem C:\FPC -Recurse -Filter fpc.exe | Select-Object -First 1
+          if (-not $fpc) { throw 'fpc.exe not found after the installer' }
+          Split-Path $fpc.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+      - name: Build
+        shell: bash
+        run: ./build.sh -Twin64
+      - name: Test
+        shell: bash
+        env:
+          FPCOPTS: -Twin64
+          WINDOWS: 1
+          PYTHON: python
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-windows-x64
+          path: hash.txt
+
+  windows-x86:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal (win32 and win64) and the Python checkers
+        shell: pwsh
+        run: |
+          $url = 'https://sourceforge.net/projects/freepascal/files/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe/download'
+          curl.exe -L --fail --retry 3 -o "$env:TEMP\fpc-setup.exe" $url
+          Start-Process -Wait -FilePath "$env:TEMP\fpc-setup.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'
+          pip install pynacl cryptography argon2-cffi
+      - name: Install the 32-bit mingw toolchain
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\msys64\mingw32\bin\gcc.exe')) {
+            & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --noconfirm --needed mingw-w64-i686-gcc'
+          }
+      - name: Add the toolchains to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw32\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+          $fpc = Get-ChildItem C:\FPC -Recurse -Filter fpc.exe | Select-Object -First 1
+          if (-not $fpc) { throw 'fpc.exe not found after the installer' }
+          Split-Path $fpc.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+      - name: Build
+        shell: bash
+        run: ./build.sh -Twin32
+      - name: Test
+        shell: bash
+        env:
+          FPCOPTS: -Twin32
+          WINDOWS: 1
+          PYTHON: python
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-windows-x86
+          path: hash.txt
+
+  pascal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Free Pascal and the Python checkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          pip install pynacl cryptography argon2-cffi
+      - name: Build without assembler or C
+        run: ./build.sh -dSYLZ_PUREPASCAL
+      - name: Test
+        env:
+          FPCOPTS: -dSYLZ_PUREPASCAL
+        run: sh .github/test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hash-pascal
+          path: hash.txt
+
+  determinism:
+    needs: [linux-x64, linux-arm64, linux-x86, macos-arm64, windows-x64, windows-x86, pascal]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hash-*
+      - name: Compare hashes
+        run: |
+          for f in hash-*/*; do echo "$f: $(tr -d '\r' < "$f")"; done
+          n=$(cat hash-*/* | tr -d '\r' | sort -u | wc -l)
+          if [ "$n" -ne 1 ]; then
+            echo "compressed output differs between platforms" >&2
+            exit 1
+          fi
+          echo "same bytes on every platform"

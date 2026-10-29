@@ -2,7 +2,8 @@
 """crypto_xcheck.py - recomputes `cryptotest --dump N` with independent
 implementations: hashlib (BLAKE2b, keyed BLAKE2s), cryptography (ChaCha20, Poly1305),
 libsodium through PyNaCl (XChaCha20-Poly1305; Argon2id with one lane),
-OpenSSL's command line (Argon2id with any lanes).
+OpenSSL's command line (Argon2id with any lanes; OpenSSL 3.2 or later,
+or else argon2-cffi, which wraps the reference implementation).
 
     cryptotest --dump 500 | python3 crypto_xcheck.py
 """
@@ -30,8 +31,22 @@ def argon2_openssl(t, m, p, pwd, salt, n):
     return bytes.fromhex(out.strip().replace(':', ''))
 
 
+def argon2_cffi(t, m, p, pwd, salt, n):
+    from argon2.low_level import Type, hash_secret_raw
+    return hash_secret_raw(pwd, salt, t, m, p, n, Type.ID)
+
+
+def argon2_any_lanes():
+    try:
+        argon2_openssl(1, 8, 1, b'p', b'saltsalt', 32)
+        return argon2_openssl
+    except (OSError, subprocess.CalledProcessError):
+        return argon2_cffi   # an OpenSSL without ARGON2ID (before 3.2)
+
+
 def main():
     counts, bad = {}, 0
+    argon2 = argon2_any_lanes()
     for line in sys.stdin:
         f = line.split()
         kind = f[0]
@@ -52,7 +67,7 @@ def main():
         elif kind == 'argon2id':
             t, m, p = int(f[1]), int(f[2]), int(f[3])
             pwd, salt, out = unhex(f[4]), unhex(f[5]), unhex(f[6])
-            ok = argon2_openssl(t, m, p, pwd, salt, len(out)) == out
+            ok = argon2(t, m, p, pwd, salt, len(out)) == out
             if ok and p == 1 and len(out) >= 16 and m >= 8:
                 # libsodium: one lane, memory in bytes, its own minimums
                 try:
@@ -60,7 +75,7 @@ def main():
                                                     bindings.crypto_pwhash_ALG_ARGON2ID13) == out
                     kind = 'argon2id+sodium'
                 except Exception:
-                    pass   # below libsodium's limits (t < 1 or m < 8 KiB): OpenSSL only
+                    pass   # below libsodium's limits (t < 1 or m < 8 KiB): the other one only
         else:
             raise SystemExit('unknown line: ' + line[:40])
         counts[kind] = counts.get(kind, 0) + 1

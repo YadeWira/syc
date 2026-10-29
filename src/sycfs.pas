@@ -101,12 +101,17 @@ end;
 
 type
   TTimeSpec = record
-    sec, nsec: PtrInt;   { time_t and long on the Linux targets syc builds }
+    sec, nsec: PtrInt;   { time_t and long on the targets syc builds }
   end;
 
 const
+{$ifdef darwin}
+  AT_FDCWD = -2;
+  AT_SYMLINK_NOFOLLOW = $20;
+{$else}
   AT_FDCWD = -100;
   AT_SYMLINK_NOFOLLOW = $100;
+{$endif}
 
 function utimensat(dirfd: LongInt; path: PChar; times: Pointer; flags: LongInt): LongInt;
   cdecl; external 'c' name 'utimensat';
@@ -184,7 +189,7 @@ begin
     m.kind := ET_OTHER;
   if m.kind = ET_FILE then
     m.size := st.st_size;
-  m.mtime := Int64(st.st_mtime) * 1000000000 + Int64(st.st_mtime_nsec);
+  m.mtime := Int64(st.st_mtime) * 1000000000 + Int64(st.{$ifdef darwin}st_mtimensec{$else}st_mtime_nsec{$endif});
   m.attrKind := AK_UNIX;
   m.attrs := st.st_mode and $FFF;
   m.uid := st.st_uid;

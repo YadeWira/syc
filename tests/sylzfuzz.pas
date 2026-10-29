@@ -16,7 +16,7 @@ uses
   BaseUnix, SysUtils, Classes, sylz, sylzhuf;
 
 const
-  PAGE = 4096;
+  PAGE = 16384;   { a multiple of every target's page (Apple arm64: 16 KiB) }
 
 type
   { n usable bytes ending exactly at a guard page }
@@ -322,8 +322,10 @@ begin
     LoadSample(ParamStr(i));
   SylzCtxInit(fctx);
   bmi2 := HufUseBmi2;
-  for k := 1 to iters do
+  k := 0;
+  while k < iters do   { not a for: a 64-bit counter is not ordinal on 32-bit targets }
   begin
+    Inc(k);
     SylzUseAsm := Odd(k);   { alternate the assembler and Pascal decoders }
     SylzPreferC := k mod 4 = 1;   { and, on x86_64, C instead of assembler }
     { and the Huffman decoder's: Pascal, assembler, assembler with BMI2 }

@@ -84,6 +84,8 @@ def main():
     if not text:
         words = [b'the ', b'syc ', b'archive ', b'fragment ', b'block ', b'version ', b'of ', b'and ']
         text = b''.join(rnd.choice(words) for _ in range(400000))
+    while len(text) < 2600000:   # a short sample: three-blocks needs three blocks
+        text += text
     work = os.path.join(out, '.work')
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)

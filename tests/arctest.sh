@@ -2,7 +2,7 @@
 # arctest — the archiver end to end: syc a, x, l, i, t on a tree, the same
 # archive whatever the threads, the tree back exactly (contents, types,
 # permissions, times to the ns, symlinks), overwrite rules, refusals and
-# exit codes, and damage: every byte flip found by syc t (exit 3),
+# exit codes, and damage: every byte flip found by syc t (exit 3) or harmless,
 # truncations and trailing junk.
 # Usage: tests/arctest.sh SAMPLES-DIR WORK-DIR   (WORK-DIR: new or empty;
 #        SAMPLES-DIR is copied, never written)
@@ -34,7 +34,8 @@ mkdir tree/emptydir
 ln -s copy tree/link
 chmod 600 tree/copy
 chmod 700 tree/emptydir
-touch -d '2001-02-03 04:05:06.123456789' tree/copy
+# 2001-02-03 04:05:06.123456789 UTC (python: touch -d is GNU only)
+python3 -c 'import os; t = 981173106123456789; os.utime("tree/copy", ns=(t, t))'
 
 # the same tree: types, contents, permissions, mtime (ns), link targets
 treecmp() {
@@ -209,23 +210,35 @@ check "nothing to add" 1 "$SYC" a x.syc -X '*' tree
 [ ! -e x.syc ] || { echo "FAIL: nothing to add wrote an archive"; fail=1; }
 check "missing path" 1 "$SYC" a y.syc tree/copy no-such-file
 
-# damage, on a small archive: every flipped byte is found
+# damage, on a small archive: every flipped byte is found, or is one the
+# decoder ignores and the files come back the same
 mkdir -p small
 head -c 300000 "$first" > small/a
 printf 'small' > small/b
 "$SYC" a -q -b 1 sm.syc small
 python3 - "$SYC" <<'EOF' || fail=1
-import random, subprocess, sys
+import filecmp, os, random, shutil, subprocess, sys
 syc = sys.argv[1]
 orig = open('sm.syc', 'rb').read()
 random.seed(1)
-bad = 0
+bad = ignored = 0
+def same(a, b):
+    na, nb = sorted(os.listdir(a)), sorted(os.listdir(b))
+    return na == nb and all(filecmp.cmp(os.path.join(a, n), os.path.join(b, n), shallow=False) for n in na)
 for i in range(200):
     d = bytearray(orig)
     k = random.randrange(len(d))
     d[k] ^= 1 << random.randrange(8)
     open('fz.syc', 'wb').write(d)
     r = subprocess.run([syc, 't', '-q', 'fz.syc'], capture_output=True).returncode
+    if r == 0:
+        # a bit the decoder ignores (the checksums cover the decoded data):
+        # passing is right only if the archive still holds the same files
+        shutil.rmtree('fzx', ignore_errors=True)
+        subprocess.run([syc, 'x', '-q', '-o', 'fzx', 'fz.syc'], check=True)
+        if not filecmp.dircmp('fzx/small', 'small').left_only and same('fzx/small', 'small'):
+            ignored += 1
+            continue
     if r != 3:
         print('FAIL: byte %d flipped: t exit %d' % (k, r)); bad += 1
     for cmd in ('l', 'i'):
@@ -241,6 +254,8 @@ open('fz.syc', 'wb').write(orig + b'junk after the commit')
 r = subprocess.run([syc, 't', '-q', 'fz.syc'], capture_output=True).returncode
 if r != 1:
     print('FAIL: trailing junk: t exit %d' % r); bad += 1
+if ignored:
+    print('arctest: %d of 200 flipped bits ignored by the decoder, data intact' % ignored)
 sys.exit(1 if bad else 0)
 EOF
 

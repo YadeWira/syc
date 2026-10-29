@@ -368,6 +368,7 @@ begin
     end;
 
   FillChar(zero, SizeOf(zero), 0);
+  FillChar(address, SizeOf(address), 0);
   for pass := 0 to t - 1 do
     for slice := 0 to ARGON2_SYNC_POINTS - 1 do
       for lane := 0 to p - 1 do
@@ -803,7 +804,26 @@ end;
 
 { ── randomness, comparison, wiping ───────────────────────────────────── }
 
-{$ifdef unix}
+{$ifdef darwin}
+function getentropy(buf: Pointer; buflen: SizeUInt): LongInt;
+  cdecl; external 'c' name 'getentropy';
+
+procedure RandomBytes(p: PByte; n: SizeInt);
+var
+  k: SizeInt;
+begin
+  while n > 0 do
+  begin
+    k := n;
+    if k > 256 then   { getentropy's limit per call }
+      k := 256;
+    if getentropy(p, k) <> 0 then
+      raise Exception.Create('no random numbers from the system (getentropy)');
+    Inc(p, k);
+    Dec(n, k);
+  end;
+end;
+{$else}{$ifdef unix}
 function getrandom(buf: Pointer; buflen: SizeUInt; flags: LongWord): PtrInt;
   cdecl; external 'c' name 'getrandom';
 
@@ -846,7 +866,7 @@ begin
     Dec(n, take);
   end;
 end;
-{$endif}
+{$endif}{$endif}
 
 function SameBytes(a, b: PByte; n: SizeInt): Boolean;
 var
