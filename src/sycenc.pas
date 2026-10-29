@@ -37,6 +37,15 @@ procedure NewKeyRecord(const prefix: TBytes; const pw: TBytes; memKiB: UInt32; f
   format. name is for the messages. }
 function OpenKeyRecord(const prefix, rec, pw: TBytes; const name: string;
   out keys: TSycKeys): Boolean;
+{ the same, and the slot that opened (0 or 1) }
+function OpenKeyRecordSlot(const prefix, rec, pw: TBytes; const name: string;
+  out keys: TSycKeys; out slot: Integer): Boolean;
+{ A new password for a key record that slot opened, in two steps
+  (wiki: syc encryption): withBoth has the data key wrapped with newPw in
+  the other slot, at a higher generation, and slot as it was; withNew has
+  slot zeroed too. memKiB 0: the opened slot's. }
+procedure RewrapKeyRecord(const prefix, rec: TBytes; slot: Integer; const keys: TSycKeys;
+  const newPw: TBytes; memKiB: UInt32; out withBoth, withNew: TBytes);
 procedure WipeKeys(var keys: TSycKeys);
 
 { seals data[0..n) in place with key: a random nonce, the tag (into
@@ -49,6 +58,9 @@ function OpenData(const key: TKey32; const aad: TBytes; data: PByte; n: SizeInt;
   environment's SYC_PASSWORD, else the terminal (twice when creating).
   Raises ESycError(EXIT_USAGE) when there is none to be had. }
 function GetPassword(const opts: TOptions; creating: Boolean; const what: string): TBytes;
+{ syc k's new password: --new-password=, --new-password-file,
+  SYC_NEW_PASSWORD, else the terminal (twice) }
+function GetNewPassword(const opts: TOptions; const what: string): TBytes;
 { a new archive or stream is to be encrypted }
 function EncryptionRequested(const opts: TOptions): Boolean;
 
@@ -118,8 +130,10 @@ begin
   Move(rec[slotAt], Result[Length(prefix) + 8], 16);
 end;
 
-procedure NewKeyRecord(const prefix: TBytes; const pw: TBytes; memKiB: UInt32; flags: Byte;
-  out keys: TSycKeys; out rec: TBytes);
+{ fills the slot at rec[s]: gen, Argon2id (t = 3, p = 1, memKiB), a new
+  salt and nonce, and the data key k wrapped with the password }
+procedure FillSlot(const prefix: TBytes; var rec: TBytes; s: SizeInt; gen: UInt32;
+  const k: TKey32; const pw: TBytes; memKiB: UInt32);
 const
   PASSES = 3;
   LANES = 1;
@@ -127,7 +141,26 @@ var
   kek: TKey32;
   aad: TBytes;
   tag: TTag16;
-  s: SizeInt;
+begin
+  FillChar(rec[s], SLOT_SIZE, 0);
+  PUInt32(@rec[s])^ := NtoLE(gen);
+  rec[s + 4] := KDF_ARGON2ID;
+  rec[s + 5] := LANES;
+  PUInt32(@rec[s + 8])^ := NtoLE(memKiB);
+  PUInt32(@rec[s + 12])^ := NtoLE(UInt32(PASSES));
+  RandomBytes(@rec[s + 16], 16);                 { salt }
+  RandomBytes(@rec[s + 32], 24);                 { nonce }
+  Argon2id(@pw[0], Length(pw), @rec[s + 16], 16, nil, 0, nil, 0, PASSES, memKiB, LANES,
+    @kek[0], 32);
+  Move(k, rec[s + 56], 32);
+  aad := SlotAad(prefix, rec, s);
+  XChaChaPolyEncrypt(kek, PNonce24(@rec[s + 32])^, @aad[0], Length(aad), @rec[s + 56], 32, tag);
+  Move(tag, rec[s + 88], 16);
+  Wipe(@kek, SizeOf(kek));
+end;
+
+procedure NewKeyRecord(const prefix: TBytes; const pw: TBytes; memKiB: UInt32; flags: Byte;
+  out keys: TSycKeys; out rec: TBytes);
 begin
   keys := Default(TSycKeys);
   RandomBytes(@keys.k[0], 32);
@@ -138,25 +171,41 @@ begin
   FillChar(rec[0], KEYREC_SIZE, 0);
   Move(PChar('SYCK')^, rec[0], 4);
   rec[4] := flags;
-  s := 8;   { slot 0 }
-  PUInt32(@rec[s])^ := NtoLE(UInt32(1));        { gen }
-  rec[s + 4] := KDF_ARGON2ID;
-  rec[s + 5] := LANES;
-  PUInt32(@rec[s + 8])^ := NtoLE(memKiB);
-  PUInt32(@rec[s + 12])^ := NtoLE(UInt32(PASSES));
-  RandomBytes(@rec[s + 16], 16);                 { salt }
-  RandomBytes(@rec[s + 32], 24);                 { nonce }
-  Argon2id(@pw[0], Length(pw), @rec[s + 16], 16, nil, 0, nil, 0, PASSES, memKiB, LANES,
-    @kek[0], 32);
-  Move(keys.k, rec[s + 56], 32);
-  aad := SlotAad(prefix, rec, s);
-  XChaChaPolyEncrypt(kek, PNonce24(@rec[s + 32])^, @aad[0], Length(aad), @rec[s + 56], 32, tag);
-  Move(tag, rec[s + 88], 16);
-  Wipe(@kek, SizeOf(kek));
+  FillSlot(prefix, rec, 8, 1, keys.k, pw, memKiB);   { slot 0, gen 1 }
+end;
+
+procedure RewrapKeyRecord(const prefix, rec: TBytes; slot: Integer; const keys: TSycKeys;
+  const newPw: TBytes; memKiB: UInt32; out withBoth, withNew: TBytes);
+var
+  s, o: SizeInt;
+  gen, other: UInt32;
+begin
+  s := 8 + slot * SLOT_SIZE;
+  o := 8 + (1 - slot) * SLOT_SIZE;
+  gen := LEtoN(PUInt32(@rec[s])^);
+  other := LEtoN(PUInt32(@rec[o])^);
+  if other > gen then
+    gen := other;
+  if gen = High(UInt32) then
+    Fail(EXIT_CORRUPT, 'the key record''s generation cannot go higher');
+  if memKiB = 0 then
+    memKiB := LEtoN(PUInt32(@rec[s + 8])^);
+  withBoth := Copy(rec);
+  FillSlot(prefix, withBoth, o, gen + 1, keys.k, newPw, memKiB);
+  withNew := Copy(withBoth);
+  FillChar(withNew[s], SLOT_SIZE, 0);
 end;
 
 function OpenKeyRecord(const prefix, rec, pw: TBytes; const name: string;
   out keys: TSycKeys): Boolean;
+var
+  slot: Integer;
+begin
+  Result := OpenKeyRecordSlot(prefix, rec, pw, name, keys, slot);
+end;
+
+function OpenKeyRecordSlot(const prefix, rec, pw: TBytes; const name: string;
+  out keys: TSycKeys; out slot: Integer): Boolean;
 var
   gens: array[0..1] of UInt32;
   order: array[0..1] of Integer;
@@ -174,6 +223,7 @@ var
 
 begin
   Result := False;
+  slot := -1;
   keys := Default(TSycKeys);
   if (Length(rec) <> KEYREC_SIZE) or (CompareByte(rec[0], PChar('SYCK')^, 4) <> 0) then
     Bad('no "SYCK"');
@@ -227,6 +277,7 @@ begin
       Move(key, keys.k, 32);
       keys.flags := rec[4];
       DeriveSubkeys(keys);
+      slot := i;
       Result := True;
     end;
     Wipe(@key, SizeOf(key));
@@ -362,39 +413,43 @@ begin
 end;
 {$endif}
 
-{ SYC_PASSWORD, UTF-8 (on Windows through the UTF-16 environment: the
-  ANSI one turns most characters into "?") }
-function EnvPassword: string;
+{ the variable var (SYC_PASSWORD), UTF-8 (on Windows through the UTF-16
+  environment: the ANSI one turns most characters into "?") }
+function EnvPassword(const v: string): string;
 {$ifdef windows}
 var
   w: UnicodeString;
   n: DWORD;
 begin
   Result := '';
-  n := GetEnvironmentVariableW('SYC_PASSWORD', nil, 0);
+  n := GetEnvironmentVariableW(PWideChar(UnicodeString(v)), nil, 0);
   if n = 0 then
     Exit;
   SetLength(w, n);
-  n := GetEnvironmentVariableW('SYC_PASSWORD', PWideChar(w), n);
+  n := GetEnvironmentVariableW(PWideChar(UnicodeString(v)), PWideChar(w), n);
   SetLength(w, n);
   Result := UTF8Encode(w);
 end;
 {$else}
 begin
-  Result := GetEnvironmentVariable('SYC_PASSWORD');
+  Result := GetEnvironmentVariable(v);
 end;
 {$endif}
 
-function GetPassword(const opts: TOptions; creating: Boolean; const what: string): TBytes;
+{ the password from inline, else the file's first line, else the
+  variable envVar, else the terminal (prompt; twice when twice); missing:
+  the message when none can be had }
+function PasswordFrom(const inline, fileName, envVar, prompt: string; twice: Boolean;
+  const missing: string): TBytes;
 var
   pw, again: string;
   f: TextFile;
 begin
-  if opts.passwordInline <> '' then
-    pw := opts.passwordInline
-  else if opts.passwordFile <> '' then
+  if inline <> '' then
+    pw := inline
+  else if fileName <> '' then
   begin
-    AssignFile(f, opts.passwordFile);
+    AssignFile(f, fileName);
     try
       Reset(f);
       try
@@ -404,7 +459,7 @@ begin
       end;
     except
       on E: EInOutError do
-        Fail(EXIT_USAGE, opts.passwordFile + ': cannot read the password');
+        Fail(EXIT_USAGE, fileName + ': cannot read the password');
     end;
     if (pw <> '') and (pw[Length(pw)] = #13) then
       SetLength(pw, Length(pw) - 1);
@@ -412,14 +467,13 @@ begin
     if Copy(pw, 1, 3) = #$EF#$BB#$BF then
       Delete(pw, 1, 3);
   end
-  else if EnvPassword <> '' then
-    pw := EnvPassword
+  else if EnvPassword(envVar) <> '' then
+    pw := EnvPassword(envVar)
   else
   begin
-    if not ReadTerminal('Password for ' + what + ': ', pw) then
-      Fail(EXIT_USAGE, what + ' is encrypted: give the password (-pPASSWORD, --password-file '
-        + 'FILE or SYC_PASSWORD), or run where it can be asked');
-    if creating then
+    if not ReadTerminal(prompt, pw) then
+      Fail(EXIT_USAGE, missing);
+    if twice then
     begin
       ReadTerminal('Again: ', again);
       if again <> pw then
@@ -436,6 +490,22 @@ begin
   { our own copy (pw may share opts' string), then cleared }
   UniqueString(pw);
   Wipe(@pw[1], Length(pw));
+end;
+
+function GetPassword(const opts: TOptions; creating: Boolean; const what: string): TBytes;
+begin
+  Result := PasswordFrom(opts.passwordInline, opts.passwordFile, 'SYC_PASSWORD',
+    'Password for ' + what + ': ', creating,
+    what + ' is encrypted: give the password (-pPASSWORD, --password-file '
+    + 'FILE or SYC_PASSWORD), or run where it can be asked');
+end;
+
+function GetNewPassword(const opts: TOptions; const what: string): TBytes;
+begin
+  Result := PasswordFrom(opts.newPasswordInline, opts.newPasswordFile, 'SYC_NEW_PASSWORD',
+    'New password for ' + what + ': ', True,
+    'give the new password (--new-password=PASSWORD, --new-password-file FILE or '
+    + 'SYC_NEW_PASSWORD), or run where it can be asked');
 end;
 
 end.

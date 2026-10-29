@@ -24,7 +24,7 @@ type
   TVerbosity = (vQuiet, vNormal, vVerbose);
 
   TOptions = record
-    cmd: Char;               { 'a', 'x', 'l', 'i', 'c', 'd', 't' }
+    cmd: Char;               { 'a', 'x', 'l', 'i', 'c', 'd', 't', 'k' }
     level: Integer;
     flags: Integer;          { SYLZ_ENTROPY with -ec }
     blockMiB: Integer;       { the command's default unless -b }
@@ -40,6 +40,9 @@ type
     passwordFile: string;    { --password-file }
     visibleNames: Boolean;   { a --visible-names }
     kdfMemMiB: Integer;      { --kdf-mem }
+    kdfMemSet: Boolean;      { --kdf-mem given (k: else the current slot's) }
+    newPasswordInline: string;   { k --new-password=PASSWORD }
+    newPasswordFile: string;     { k --new-password-file }
     rawSize: Integer;        { d/t --size: its decoded size; -1 not given }
     verbosity: TVerbosity;
     progress: Boolean;       { --progress / --no-progress; default: stderr is a terminal }
@@ -109,7 +112,7 @@ end;
 type
   TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
-    oRaw, oSize, oPassword, oPasswordFile, oVisibleNames, oKdfMem, oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
+    oRaw, oSize, oPassword, oPasswordFile, oNewPassword, oNewPasswordFile, oVisibleNames, oKdfMem, oProgress, oNoProgress, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
     id: TOptId;
@@ -119,7 +122,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..28] of TOptDef = (
+  OPTION_DEFS: array[0..30] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'ac'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'ac'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'ac'),
@@ -140,18 +143,20 @@ const
     (id: oNoOwner; short: '';   long: 'no-owner';   value: False; cmds: 'x'),
     (id: oRaw;     short: '';   long: 'raw';        value: False; cmds: 'cdt'),
     (id: oSize;    short: '';   long: 'size';       value: True;  cmds: 'dt'),
-    (id: oPassword; short: '';  long: 'password';   value: False; cmds: 'axlicdt'),
-    (id: oPasswordFile; short: ''; long: 'password-file'; value: True; cmds: 'axlicdt'),
+    (id: oPassword; short: '';  long: 'password';   value: False; cmds: 'axlicdtk'),
+    (id: oPasswordFile; short: ''; long: 'password-file'; value: True; cmds: 'axlicdtk'),
+    (id: oNewPassword; short: ''; long: 'new-password'; value: True; cmds: 'k'),
+    (id: oNewPasswordFile; short: ''; long: 'new-password-file'; value: True; cmds: 'k'),
     (id: oVisibleNames; short: ''; long: 'visible-names'; value: False; cmds: 'a'),
-    (id: oKdfMem;  short: '';   long: 'kdf-mem';    value: True;  cmds: 'ac'),
+    (id: oKdfMem;  short: '';   long: 'kdf-mem';    value: True;  cmds: 'ack'),
     (id: oProgress; short: '';  long: 'progress';   value: False; cmds: 'axcdt'),
     (id: oNoProgress; short: ''; long: 'no-progress'; value: False; cmds: 'axcdt'),
-    (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'axlicdt'),
-    (id: oVerbose; short: 'v';  long: 'verbose';    value: False; cmds: 'axlicdt'),
-    (id: oHelp;    short: 'h';  long: 'help';       value: False; cmds: 'axlicdt')
+    (id: oQuiet;   short: 'q';  long: 'quiet';      value: False; cmds: 'axlicdtk'),
+    (id: oVerbose; short: 'v';  long: 'verbose';    value: False; cmds: 'axlicdtk'),
+    (id: oHelp;    short: 'h';  long: 'help';       value: False; cmds: 'axlicdtk')
   );
 
-  COMMANDS = 'axlicdt';
+  COMMANDS = 'axlicdtk';
 
 procedure Usage;
 begin
@@ -168,6 +173,7 @@ begin
   WriteLn('  syc d [options] [FILE...]            decompress each FILE', STREAM_SUFFIX, ' to FILE');
   WriteLn;
   WriteLn('  syc t [options] [FILE...]            check archives and streams, write nothing');
+  WriteLn('  syc k [options] FILE...              change the password of encrypted ones');
   WriteLn('  syc h CMD, syc CMD -h                a command''s options');
   WriteLn('  syc -V, --version');
   WriteLn;
@@ -202,7 +208,16 @@ begin
       WriteLn('  --visible-names        encrypt the data only: names, sizes, dates stay listable');
   end
   else if cmd in ['x', 'l', 'i', 't', 'd'] then
-    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)');
+    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)')
+  else if cmd = 'k' then
+  begin
+    WriteLn('  -pPASSWORD, --password-file FILE   the current password (or SYC_PASSWORD,');
+    WriteLn('                         or asked)');
+    WriteLn('  --new-password=PASSWORD, --new-password-file FILE   the new one (or');
+    WriteLn('                         SYC_NEW_PASSWORD, or asked twice)');
+    WriteLn('  --kdf-mem MIB          Argon2id''s memory for the new password, default: as');
+    WriteLn('                         the current one''s');
+  end;
 end;
 
 procedure ProgressUsage(cmd: Char);
@@ -313,6 +328,16 @@ begin
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
       end;
+    'k':
+      begin
+        WriteLn('syc k [options] FILE...   change the password of encrypted archives and');
+        WriteLn('                          streams in place, without recompressing: the data');
+        WriteLn('                          key is wrapped again; if interrupted, the old or');
+        WriteLn('                          the new password opens FILE, never neither');
+        WriteLn;
+        PasswordUsage(cmd);
+        WriteLn('  -q, --quiet / -v, --verbose');
+      end;
     't':
       begin
         WriteLn('syc t [options] [FILE...]   check archives (.syc) and streams (', STREAM_SUFFIX, '),');
@@ -408,7 +433,7 @@ begin
     { -p, -pPASSWORD, --password=PASSWORD: the value is optional }
     if (Copy(arg, 1, 2) = '-p') or (Copy(arg, 1, 11) = '--password=') then
     begin
-      if Pos(opts.cmd, 'axlicdt') = 0 then
+      if Pos(opts.cmd, 'axlicdtk') = 0 then
         UsageError(Format('syc %s takes no password', [opts.cmd]));
       if arg = '-p' then
         opts.passwordFlag := True
@@ -509,7 +534,23 @@ begin
           opts.passwordFile := value;
         end;
       oVisibleNames: opts.visibleNames := True;
-      oKdfMem: opts.kdfMemMiB := IntArg(shown, value, 8, 4096);
+      oKdfMem:
+        begin
+          opts.kdfMemMiB := IntArg(shown, value, 8, 4096);
+          opts.kdfMemSet := True;
+        end;
+      oNewPassword:
+        begin
+          if value = '' then
+            UsageError('an empty password');
+          opts.newPasswordInline := value;
+        end;
+      oNewPasswordFile:
+        begin
+          if value = '' then
+            UsageError(shown + ' needs a file');
+          opts.newPasswordFile := value;
+        end;
       oSize: opts.rawSize := IntArg(shown, value, 0, MAX_BLOCK);
       oAll: opts.allVersions := True;
       oLong: opts.longList := True;
@@ -572,6 +613,8 @@ begin
            UsageError(Format('syc %s needs an ARCHIVE', [opts.cmd]));
     'i': if Length(opts.operands) <> 1 then
            UsageError('syc i takes one ARCHIVE');
+    'k': if Length(opts.operands) < 1 then
+           UsageError('syc k needs a FILE');
   end;
 end;
 

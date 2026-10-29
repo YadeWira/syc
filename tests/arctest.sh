@@ -152,7 +152,7 @@ sys.exit(1 if bad else 0)
 PY
 
 # encryption: both modes, a second version, the password's sources
-rm -rf oe oe2 oe3
+rm -rf oe oe2 oe3 oe4
 check "a -p (format 3)" 0 "$SYC" a -q -pS3cret --kdf-mem 8 -t 3 enc.syc tree
 check "x -p" 0 "$SYC" x -q -pS3cret -t 2 -o oe enc.syc
 treecmp tree oe/tree || fail=1
@@ -173,6 +173,50 @@ treecmp tree oe2/tree || fail=1
 rm -rf tree2
 check "c -p / d -p" 0 sh -c "'$SYC' c -q -pS3cret --kdf-mem 8 -O '$first' | '$SYC' d -q -pS3cret -O > enc.out"
 cmp -s enc.out "$first" || { echo "FAIL: encrypted stream round trip"; fail=1; }
+
+# syc k: a new password in place, without recompressing
+cp enc.syc enck.syc
+check "k" 0 "$SYC" k -q -pS3cret --new-password=N3w --kdf-mem 9 enck.syc
+check "k: the old password" 3 "$SYC" t -q -pS3cret enck.syc
+check "k: the new password" 0 "$SYC" t -q -pN3w enck.syc
+check "k: the reference reader" 0 python3 -I "$here/tools/syc_ref.py" -pN3w t enck.syc
+check "k: a wrong current password" 3 "$SYC" k -q -pnope --new-password=x enck.syc
+check "k: not encrypted" 2 "$SYC" k -q -px --new-password=y t1.syc
+check "k: stdin" 2 "$SYC" k -q -px --new-password=y -
+echo N3w > pw2.txt
+check "k --visible-names" 0 "$SYC" k -q -pS3cret --new-password-file pw2.txt encv.syc
+check "k --visible-names: l without one" 0 sh -c "'$SYC' l encv.syc < /dev/null"
+check "k --visible-names: x" 0 "$SYC" x -q -pN3w -o oe4 encv.syc
+treecmp tree oe4/tree || fail=1
+"$SYC" c -q -f -pS3cret --kdf-mem 8 -o enck0.sylz "$first"
+cp enck0.sylz enck.sylz
+check "k, a stream (the sources' variables)" 0 env SYC_PASSWORD=S3cret SYC_NEW_PASSWORD=N3w "$SYC" k -q enck.sylz
+check "k, a stream: d" 0 sh -c "'$SYC' d -q -pN3w -O enck.sylz > enck.out"
+cmp -s enck.out "$first" || { echo "FAIL: k, a stream: not the same data"; fail=1; }
+# only the key record changed; the new password in the other slot at gen 2;
+# and the state between k's two writes (both slots) opens with either
+python3 - "$SYC" <<'PY' || fail=1
+import struct, subprocess, sys
+syc, bad = sys.argv[1], 0
+for before, after, p, mem in (('enc.syc', 'enck.syc', 8, 9216), ('enck0.sylz', 'enck.sylz', 7, 8192)):
+    b, a = open(before, 'rb').read(), open(after, 'rb').read()
+    if len(a) != len(b) or a[:p + 8] != b[:p + 8] or a[p + 216:] != b[p + 216:]:
+        print('FAIL: k changed more than the key record of %s' % after); bad += 1
+    slot = lambda d, i: d[p + 8 + 104 * i:p + 8 + 104 * (i + 1)]
+    if slot(a, 0) != bytes(104) or struct.unpack_from('<II', slot(a, 1), 0)[0] != 2 \
+       or struct.unpack_from('<I', slot(a, 1), 8)[0] != mem:
+        print('FAIL: %s: slots after k' % after); bad += 1
+    mid = bytearray(a)
+    mid[p + 8:p + 8 + 104] = slot(b, 0)
+    open('mid', 'wb').write(mid)
+    for pw in ('S3cret', 'N3w'):
+        r = subprocess.run([syc, 't', '-q', '-p' + pw, 'mid'], capture_output=True).returncode
+        if r != 0:
+            print('FAIL: %s between the two writes: %s gives %d' % (after, pw, r)); bad += 1
+sys.exit(1 if bad else 0)
+PY
+check "k again: gen 3 in slot 0" 0 "$SYC" k -q -pN3w --new-password=Z enck.syc
+check "k again: the newest" 0 "$SYC" t -q -pZ enck.syc
 
 # the test vectors: written by this syc, read by the reference reader
 # (tools/syc_ref.py, from the wiki's format pages) and by syc

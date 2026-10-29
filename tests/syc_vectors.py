@@ -12,7 +12,8 @@ from the trees syc archived, not from syc; "damaged" says whether bytes
 follow the last complete version. For each stream NAME.sylz,
 NAME.sylz.json holds the decoded size and SHA-256. Vectors with
 "corrupt": true must be refused. Encrypted ones (enc-*, format 3 and
-stream version 5) give their "password" in the .json.
+stream version 5) give their "password" in the .json; enc-rekeyed's was
+changed with syc k (its live key slot is the second).
 """
 import hashlib
 import json
@@ -199,6 +200,10 @@ def main():
     archive('enc-visible', [basic], ('-p' + pw, '--visible-names', '--kdf-mem', '8'), password=pw)
     archive('enc-versions', [v1, v2, v3, v4], ('-p' + pw, '--kdf-mem', '8'), password=pw)
     archive('enc-blocks', [big], ('-p' + pw, '--kdf-mem', '8', '-ec', '-5', '-b', '1'), password=pw)
+    # after syc k: the live slot is slot 1 (gen 2), slot 0 is zero
+    pw2 = 'syc vectors, new'
+    dest, _ = archive('enc-rekeyed', [v1, v2], ('-p' + pw, '--kdf-mem', '8'), password=pw2)
+    syc_run('k', '-q', '-p' + pw, '--new-password=' + pw2, dest)
     # refused: a wrong password; two sealed blocks of a version swapped
     shutil.copy(os.path.join(out, 'enc-basic.syc'), os.path.join(out, 'bad-enc-password.syc'))
     json.dump({'corrupt': True, 'password': 'not it'},

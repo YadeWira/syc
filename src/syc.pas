@@ -2,7 +2,8 @@
 
     syc a / x / l / i archives (sycarc)
     syc c / d / t     one file or stdin as a .sylz stream (sycstream); t
-                      checks archives too }
+                      checks archives too
+    syc k             a new password for encrypted ones (syckey) }
 program syc;
 
 {$mode objfpc}{$H+}
@@ -10,7 +11,7 @@ program syc;
 uses
   {$ifdef unix}cthreads,{$endif}
   {$ifdef windows}Windows,{$endif}
-  SysUtils, sycblocks, syccli, sycstream, sycarc;
+  SysUtils, sycblocks, syccli, sycstream, sycarc, syckey;
 
 var
   opts: TOptions;
@@ -28,6 +29,8 @@ begin
     ParseCommandLine(opts);
     if opts.cmd in ['a', 'x', 'l', 'i'] then
       ExitCode := RunArchiveCommand(opts)
+    else if opts.cmd = 'k' then
+      ExitCode := RunKeyCommand(opts)
     else
       ExitCode := RunStreamCommand(opts);
   except
