@@ -20,9 +20,18 @@ program sylzbench;
 {$mode objfpc}{$H+}
 
 uses
-  {$ifdef unix}Linux, UnixType,{$endif}
+  {$ifdef linux}Linux,{$endif}
+  {$ifdef unix}UnixType,{$endif}
   {$ifdef windows}Windows,{$endif}
   SysUtils, Classes, Math, sylz, sylzhuf;
+
+{$ifdef darwin}
+const
+  CLOCK_MONOTONIC = 6;   { macOS 10.12 and later }
+
+function clock_gettime(clk: LongInt; tp: PTimeSpec): LongInt;
+  cdecl; external 'c' name 'clock_gettime';
+{$endif}
 
 function NowNs: UInt64;
 {$ifdef unix}

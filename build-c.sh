@@ -14,7 +14,7 @@ build_c() {
   _bc_cpu=$(${FPC:-fpc} "$@" -iTP 2>/dev/null) || _bc_cpu=
   case "$_bc_os-$_bc_cpu" in
     linux-i386) _bc_cc="gcc -m32" ;;
-    darwin-*) _bc_cc=cc ;;
+    darwin-*) _bc_cc="cc -mmacosx-version-min=11.0" ;;   # what FPC links for
     *) _bc_cc=gcc ;;
   esac
   _bc_extra=

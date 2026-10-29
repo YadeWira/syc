@@ -361,9 +361,11 @@ static intptr_t count_match(const uint8_t *a, const uint8_t *b, const uint8_t *l
     while (limit - a >= 8) {
         uint64_t diff = read64(a) ^ read64(b);
         if (diff) {
-#if UINTPTR_MAX == 0xFFFFFFFF
-            /* two 32-bit counts: some gcc versions call libgcc's
-               __ctzdi2 for a 64-bit one, and FPC does not link libgcc */
+#if UINTPTR_MAX == 0xFFFFFFFF && !defined(_WIN32)
+            /* two 32-bit counts: some gcc versions (Ubuntu's 13, -m32)
+               call libgcc's __ctzdi2 for a 64-bit one, and FPC does not
+               link libgcc; mingw inlines it (and the win32 plugin keeps
+               its bytes) */
             uint32_t lo = (uint32_t)diff;
             return (a - start) + ((lo ? __builtin_ctz(lo) : 32 + __builtin_ctz((uint32_t)(diff >> 32))) >> 3);
 #else
