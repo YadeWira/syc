@@ -9,3 +9,6 @@
 
 # Local agent settings
 /.claude/
+
+# CI output (.github/test.sh)
+/hash.txt

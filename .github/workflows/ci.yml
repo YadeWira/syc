@@ -121,7 +121,7 @@ jobs:
           curl.exe -L --fail --retry 3 -o "$env:TEMP\fpc-setup.exe" $url
           Start-Process -Wait -FilePath "$env:TEMP\fpc-setup.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'
           pip install pynacl cryptography argon2-cffi
-      - name: Add the toolchains to PATH
+      - name: Add the toolchains to PATH (fpc.exe is the i386 driver; -Px86_64 runs ppcrossx64)
         shell: pwsh
         run: |
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
@@ -130,11 +130,11 @@ jobs:
           Split-Path $fpc.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
       - name: Build
         shell: bash
-        run: ./build.sh -Twin64
+        run: ./build.sh -Px86_64 -Twin64
       - name: Test
         shell: bash
         env:
-          FPCOPTS: -Twin64
+          FPCOPTS: -Px86_64 -Twin64
           WINDOWS: 1
           PYTHON: python
         run: sh .github/test.sh

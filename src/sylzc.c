@@ -360,8 +360,16 @@ static intptr_t count_match(const uint8_t *a, const uint8_t *b, const uint8_t *l
     const uint8_t *start = a;
     while (limit - a >= 8) {
         uint64_t diff = read64(a) ^ read64(b);
-        if (diff)
+        if (diff) {
+#if UINTPTR_MAX == 0xFFFFFFFF
+            /* two 32-bit counts: some gcc versions call libgcc's
+               __ctzdi2 for a 64-bit one, and FPC does not link libgcc */
+            uint32_t lo = (uint32_t)diff;
+            return (a - start) + ((lo ? __builtin_ctz(lo) : 32 + __builtin_ctz((uint32_t)(diff >> 32))) >> 3);
+#else
             return (a - start) + (__builtin_ctzll(diff) >> 3);
+#endif
+        }
         a += 8;
         b += 8;
     }
@@ -1239,21 +1247,26 @@ static __attribute__((unused)) void b2s_many_core(const uint8_t *kpad, int keyLe
         }
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         /* four words of each lane, then a 4x4 transpose: word i of every
-           lane in m[i] */
+           lane in m[i] (clang spells gcc's __builtin_shuffle its own way) */
+#if defined(__clang__)
+#define B2S_SHUF(a, b, i0, i1, i2, i3) __builtin_shufflevector(a, b, i0, i1, i2, i3)
+#else
+#define B2S_SHUF(a, b, i0, i1, i2, i3) __builtin_shuffle(a, b, (b2s_v4){ i0, i1, i2, i3 })
+#endif
         for (i = 0; i < 16; i += 4) {
             typedef b2s_v4 b2s_v4u __attribute__((aligned(1), may_alias));
             const b2s_v4 r0 = *(const b2s_v4u *)(blk[0] + 4 * i);
             const b2s_v4 r1 = *(const b2s_v4u *)(blk[1] + 4 * i);
             const b2s_v4 r2 = *(const b2s_v4u *)(blk[2] + 4 * i);
             const b2s_v4 r3 = *(const b2s_v4u *)(blk[3] + 4 * i);
-            const b2s_v4 t0 = __builtin_shuffle(r0, r1, (b2s_v4){ 0, 4, 1, 5 });
-            const b2s_v4 t1 = __builtin_shuffle(r2, r3, (b2s_v4){ 0, 4, 1, 5 });
-            const b2s_v4 t2 = __builtin_shuffle(r0, r1, (b2s_v4){ 2, 6, 3, 7 });
-            const b2s_v4 t3 = __builtin_shuffle(r2, r3, (b2s_v4){ 2, 6, 3, 7 });
-            m[i] = __builtin_shuffle(t0, t1, (b2s_v4){ 0, 1, 4, 5 });
-            m[i + 1] = __builtin_shuffle(t0, t1, (b2s_v4){ 2, 3, 6, 7 });
-            m[i + 2] = __builtin_shuffle(t2, t3, (b2s_v4){ 0, 1, 4, 5 });
-            m[i + 3] = __builtin_shuffle(t2, t3, (b2s_v4){ 2, 3, 6, 7 });
+            const b2s_v4 t0 = B2S_SHUF(r0, r1, 0, 4, 1, 5);
+            const b2s_v4 t1 = B2S_SHUF(r2, r3, 0, 4, 1, 5);
+            const b2s_v4 t2 = B2S_SHUF(r0, r1, 2, 6, 3, 7);
+            const b2s_v4 t3 = B2S_SHUF(r2, r3, 2, 6, 3, 7);
+            m[i] = B2S_SHUF(t0, t1, 0, 1, 4, 5);
+            m[i + 1] = B2S_SHUF(t0, t1, 2, 3, 6, 7);
+            m[i + 2] = B2S_SHUF(t2, t3, 0, 1, 4, 5);
+            m[i + 3] = B2S_SHUF(t2, t3, 2, 3, 6, 7);
         }
 #else
         for (i = 0; i < 16; i++)

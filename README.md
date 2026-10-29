@@ -150,7 +150,8 @@ target:
 
 ```sh
 ./build.sh                    # out/syc and out/sylzbench
-./build.sh -Twin64            # Windows x86-64 (FPC's win64 units)
+./build.sh -Twin64            # Windows x86-64 (FPC's win64 units;
+                              #   with FPC's Windows installer: -Px86_64 -Twin64)
 ./build.sh -dSYLZ_PUREPASCAL  # no assembler, no C: Pascal paths only
 FPC=ppcross386 ./build.sh -Twin32                  # Windows 32-bit
 FPC=ppcrossa64 ./build.sh -XPaarch64-linux-gnu-    # Linux arm64

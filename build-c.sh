@@ -10,8 +10,8 @@ CFLAGS_SYLZ="-O2 -ffreestanding -fno-builtin -fno-stack-protector \
 build_c() {
   _bc_out=$1
   shift
-  _bc_os=$(${FPC:-fpc} "$@" -iTO 2>/dev/null)
-  _bc_cpu=$(${FPC:-fpc} "$@" -iTP 2>/dev/null)
+  _bc_os=$(${FPC:-fpc} "$@" -iTO 2>/dev/null) || _bc_os=
+  _bc_cpu=$(${FPC:-fpc} "$@" -iTP 2>/dev/null) || _bc_cpu=
   case "$_bc_os-$_bc_cpu" in
     linux-i386) _bc_cc="gcc -m32" ;;
     darwin-*) _bc_cc=cc ;;
