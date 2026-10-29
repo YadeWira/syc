@@ -66,6 +66,22 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## The same blocks on 32-bit targets (2026-10-29)
+
+zpaq-std's user asked for x86 and x64 to write the same bytes: on 32-bit
+targets HashFast (levels 0-1) hashed 4 bytes and MidHashLong (levels 2-3,
+and -ec 0-1) mixed two 4-byte words, where 64-bit ones hash 6 bytes; the
+blocks were valid but different (their directory: 766 797 B on x86
+against 641 172 B on x64 at level 1). Now every target hashes 6 bytes, in
+Pascal and in C. x64: 110 compressions (both codecs, 11 levels, five
+silesia files) identical to v0.4.2; win32: 80 blocks (levels 0-10, v2
+and v3, five files) identical to x64's.
+
+Cost on win32, first 100 MB of silesia.tar: under wine (CPU 21) level 0
+322 -> 299 MB/s (-7%), 1 317 -> 299 (-6%), 2 208 -> 185 (-11%), 3 145 ->
+131 (-10%); on Windows 10 (VM) the two builds overlap within the noise.
+Level 1's output on that sample shrinks 41.62% -> 40.63%.
+
 ## Encryption, stage 6: reference, vectors, Windows (2026-10-25)
 
 - tools/syc_ref.py decrypts with libsodium (PyNaCl: Argon2id,

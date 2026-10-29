@@ -271,15 +271,13 @@ begin
   Result := UInt32(v * UInt32(2654435761)) shr (32 - hashLog);
 end;
 
-{ Hash of the bytes at p for the fast levels: FAST_HASH_BYTES on 64-bit
-  targets, 4 where a 64-bit multiply is costly. }
+{ Hash of the bytes at p for the fast levels: FAST_HASH_BYTES of them, on
+  every target. 32-bit ones hashed 4 bytes until syc 0.5.1 (a 64-bit
+  multiply costs more there) and wrote other, equally valid blocks; zpaq-std
+  asked for the same bytes on x86 and x64. }
 function HashFast(p: PByte; hashLog: Integer): UInt32; inline;
 begin
-{$ifdef CPU64}
   Result := UInt32((Read64(p) shl (64 - 8 * FAST_HASH_BYTES)) * UInt64(889523592379) shr (64 - hashLog));
-{$else}
-  Result := Hash4(Read32(p), hashLog);
-{$endif}
 end;
 
 { hash table size of each fast level }
@@ -959,13 +957,11 @@ end;
   level 3 39.99% at 139 MB/s in Pascal, where 2-attempt hash chains made
   40.75% at 71 MB/s. }
 
+{ 6 bytes on every target (32-bit ones mixed two 4-byte words until syc
+  0.5.1: the same blocks everywhere now, as HashFast) }
 function MidHashLong(p: PByte; hashLog: Integer): UInt32; inline;
 begin
-{$ifdef CPU64}
   Result := UInt32((Read64(p) shl 16) * UInt64(889523592379) shr (64 - hashLog));
-{$else}
-  Result := Hash4(Read32(p) + UInt32(Read32(p + 2) * UInt32(2246822519)), hashLog);
-{$endif}
 end;
 
 function MidHashShort(p: PByte; hashLog: Integer): UInt32; inline;

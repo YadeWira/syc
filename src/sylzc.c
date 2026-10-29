@@ -438,14 +438,11 @@ static void emit_sequence(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
 
 #define SKIP_STRENGTH 6
 
-/* HashFast in sylz.pas: 6 bytes where a 64-bit multiply is cheap, else 4 */
+/* HashFast in sylz.pas: 6 bytes on every target (the same blocks on x86
+   and x64; 32-bit ones hashed 4 until syc 0.5.1) */
 static uint32_t hash_fast(const uint8_t *p, int hashLog)
 {
-#if UINTPTR_MAX > 0xFFFFFFFFu
     return (uint32_t)(((read64(p) << 16) * 889523592379ull) >> (64 - hashLog));
-#else
-    return (uint32_t)(read32(p) * 2654435761u) >> (32 - hashLog);
-#endif
 }
 
 /* In/out of sylzc_compress_fast (TFastCState in sylz.pas). */
@@ -531,11 +528,8 @@ static uint32_t hash4(uint32_t v, int hashLog)
 /* MidHashLong / MidHashShort in sylz.pas */
 static uint32_t mid_hash_long(const uint8_t *p, int hashLog)
 {
-#if UINTPTR_MAX > 0xFFFFFFFFu
+    /* 6 bytes on every target, as MidHashLong */
     return (uint32_t)(((read64(p) << 16) * 889523592379ull) >> (64 - hashLog));
-#else
-    return hash4(read32(p) + (uint32_t)(read32(p + 2) * 2246822519u), hashLog);
-#endif
 }
 
 static uint32_t mid_hash_short(const uint8_t *p, int hashLog)
