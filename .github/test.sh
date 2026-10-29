@@ -53,8 +53,8 @@ case $pt in
   linux-aarch64) pt=linux-arm64-native; lib=sylz.so; tcc="$tcc -ldl" ;;
   linux-i386) pt=linux-i386; lib=sylz.so; tcc="gcc -m32 -msse -O2 -pthread -ldl" ;;
   darwin-aarch64) pt=macos-arm64; lib=sylz.dylib ;;
-  win64-x86_64) pt=win64; lib=sylz.dll; tcc="gcc -O2" ;;
-  win32-i386) pt=win32; lib=sylz.dll; tcc="gcc -O2" ;;
+  win64-x86_64) pt=win64; lib=sylz.dll; tcc="x86_64-w64-mingw32-gcc -O2" ;;
+  win32-i386) pt=win32; lib=sylz.dll; tcc="i686-w64-mingw32-gcc -O2" ;;
   *) echo "no plugin target for $pt" >&2; exit 1 ;;
 esac
 # shellcheck disable=SC2086
