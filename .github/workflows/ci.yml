@@ -106,6 +106,7 @@ jobs:
           path: |
             out/syc
             out/sylzbench
+            out/plugin/macos-arm64/sylz.dylib
 
   windows-x64:
     runs-on: windows-latest

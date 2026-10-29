@@ -19,6 +19,7 @@
    - several threads compress and decompress at the same time
 
    Build (Linux):  cc -O2 -pthread plugin/test_plugin.c -o out/test_plugin -ldl
+                   (32-bit: gcc -m32 -msse ...; macOS: cc without -ldl)
    Build (Windows, mingw): i686-w64-mingw32-gcc / x86_64-w64-mingw32-gcc
                    -O2 plugin/test_plugin.c -o test_plugin.exe */
 #include <stdio.h>

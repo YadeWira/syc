@@ -165,9 +165,11 @@ begin
   end;
 end;
 
+{ FPC 3.2.2 exports these names as written; on macOS a C symbol has a
+  leading underscore (dlsym adds it), so there it is written in }
 exports
-  zpaqstd_codec_v1 name 'zpaqstd_codec_v1',
-  zpaqstd_codecs_v1 name 'zpaqstd_codecs_v1';
+  zpaqstd_codec_v1 name {$ifdef darwin}'_zpaqstd_codec_v1'{$else}'zpaqstd_codec_v1'{$endif},
+  zpaqstd_codecs_v1 name {$ifdef darwin}'_zpaqstd_codecs_v1'{$else}'zpaqstd_codecs_v1'{$endif};
 
 begin
   IsMultiThread := True;
