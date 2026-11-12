@@ -137,6 +137,67 @@ Same session, v2 `-10`: 36.03% at 3498 MB/s decode. With one thread v3
 decodes at 60-65% of v2's speed on silesia.tar, at twice zstd -1's; on
 mixed data zstd -1 is still smaller.
 
+### Formats v4 and v5 (provisional)
+
+`--format 4` writes format v4, and with `-ec` v5: the next formats, **not
+frozen yet** (until they are, read such files with the syc version that
+wrote them; the default stays v2). What is new in them:
+
+- three streams instead of two: one-byte tokens, offsets, literals;
+- a match can take the previous match's offset again for no offset bytes
+  (in structured data a fifth to a half of the matches do);
+- what has no code of its own is written as two or three plain tokens
+  instead of an escape, which the decoder takes without a branch: half
+  the branch misses of v2's decoder;
+- each chunk of 131072 sequences can bring its own token table, made from
+  the pairs it uses most.
+
+The same levels and parsers as v2 and v3, one session (2026-11-12, the
+machine busy with other work: speeds vary by ~5%), in MB/s:
+
+**silesia.tar, v4 against v2**
+
+| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 46.51% | **44.93%** | 508 | 411 | -19% | 3215 | 3437 | +7% |
+| 1 | 44.55% | **43.12%** | 476 | 392 | -18% | 3233 | 3388 | +5% |
+| 2 | 40.89% | **39.41%** | 264 | 222 | -16% | 3081 | 3014 | -2% |
+| 3 | 39.99% | **38.62%** | 199 | 178 | -11% | 3117 | 3069 | -2% |
+| 4 | 38.80% | **37.89%** | 90.7 | 85.9 | -5% | 3098 | 3116 | +1% |
+| 5 | 37.78% | **36.92%** | 63.0 | 63.1 | +0% | 3036 | 3173 | +5% |
+| 6 | 37.13% | **36.30%** | 47.4 | 48.3 | +2% | 3063 | 3339 | +9% |
+| 7 | 36.73% | **35.94%** | 37.5 | 39.8 | +6% | 3190 | 3388 | +6% |
+| 8 | 36.38% | **35.62%** | 23.2 | 25.1 | +8% | 3187 | 3410 | +7% |
+| 9 | 36.04% | **35.06%** | 7.62 | 7.33 | -4% | 3473 | 3445 | -1% |
+| 10 | 36.03% | **35.06%** | 6.56 | 6.16 | -6% | 3382 | 3489 | +3% |
+
+**silesia.tar, v5 against v3**
+
+| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 38.80% | **37.22%** | 200 | 169 | -15% | 2168 | 1962 | -10% |
+| 1 | 37.99% | **36.54%** | 158 | 140 | -12% | 2188 | 1975 | -10% |
+| 2 | 36.72% | **35.81%** | 82.6 | 72.0 | -13% | 2167 | 2021 | -7% |
+| 3 | 35.79% | **34.93%** | 61.3 | 54.3 | -11% | 2211 | 2052 | -7% |
+| 4 | 35.18% | **34.35%** | 47.4 | 42.3 | -11% | 2246 | 2095 | -7% |
+| 5 | 34.80% | **34.01%** | 36.7 | 33.9 | -8% | 2241 | 2104 | -6% |
+| 6 | 34.47% | **33.70%** | 23.3 | 21.9 | -6% | 2183 | 2134 | -2% |
+| 7 | 33.99% | **32.95%** | 8.01 | 6.88 | -14% | 2481 | 2151 | -13% |
+| 8 | 33.98% | **32.95%** | 6.72 | 5.72 | -15% | 2487 | 2143 | -14% |
+| 9 | 33.61% | **32.54%** | 4.03 | 3.48 | -14% | 2240 | 2122 | -5% |
+| 10 | 33.60% | **32.65%** | 3.22 | 2.99 | -7% | 2075 | 2304 | +11% |
+
+What they are so far: **smaller at every level** (v4 1.0 to 1.6 points
+under v2 on silesia.tar, and under it on every file of Silesia but two
+within 0.11%; v5 about a point under v3), and **not yet faster**. v4
+decodes within a few percent of v2 either way (faster on silesia.tar at
+most levels, up to 9% slower on the mixed corpus at levels 2 to 5); it
+compresses 11-19% slower at levels 0 to 3, where the tokens are written
+in a second pass that builds each chunk's table, and about as fast from
+level 5 up. v5 decodes up to 14% slower than v3 on silesia.tar. Speed is
+what is left to do before they can replace v2 and v3. The mixed corpus:
+[Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
 the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
 The format: [sylz format](https://github.com/YadeWira/syc/wiki/sylz-format).

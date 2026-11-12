@@ -14,7 +14,7 @@ uses
   SysUtils, sylz, sycblocks, sycui;
 
 const
-  SYC_VERSION   = '0.5.4';
+  SYC_VERSION   = '0.6.0';
   STREAM_SUFFIX = '.sylz';
   RAW_SUFFIX    = '.sylzraw';
   DEFAULT_STREAM_BLOCK_MIB = 4;
@@ -75,7 +75,7 @@ function SetCodePaths(const name: string): Boolean;
 { the paths built into this binary and the ones in use, in words }
 function CodePathsBuilt: string;
 function CodePathsInUse: string;
-{ "syc 0.5.4" and, on a second line, the commit, compiler and target }
+{ "syc 0.6.0" and, on a second line, the commit, compiler and target }
 function VersionLines: string;
 
 implementation

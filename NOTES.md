@@ -135,6 +135,20 @@ How it got there, each step measured on silesia.tar and the mixed corpus
   token pass in C); the repeat check costs little (checking only the
   first probe after a match: +2%). v2's loops are assembler; v4's are C:
   level 1 346 MB/s against 475 (v2 in C: 419).
+- **Assembler compressors** for levels 0-3 (CompressFast4X64,
+  CompressMid4X64: v2's with the repeat check and records instead of
+  tokens; they return when the records are full and resume at the match
+  they stopped at). Same CPU, v4 / v2: level 0 440 / 542 MB/s, 1 417 /
+  504, 2 256 / 266, 3 198 / 208. Without the repeat check level 1 gains
+  2% and loses 0.9 points. What is left at levels 0-1 is the second
+  pass: the token pass in C 8% of the time, the moves 2%, the count and
+  the table 2%. Chunks of 32768 or 16384 sequences (records in L2): no
+  faster, 0.08-0.17 points bigger. A padded code table (one lookup, no
+  range test): no faster.
+- **Final tables** (wiki, Benchmarks): ratio better at every level of
+  both corpora; speed is not: v4 compresses 11-19% slower at levels
+  0-3 and decodes within -9..+9% of v2; v5 decodes up to 14% slower
+  than v3 on silesia.tar. So "better in everything" is not met yet.
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
