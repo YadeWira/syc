@@ -1,7 +1,8 @@
 { sycstream — syc c / d / t: one file (or stdin) as a .sylz stream.
 
     stream := "SYZ0" 4 codec:u8 level:u8 block* end
-              codec 1 = sylz (format v2 or v3 blocks); level is what the
+              codec 1 = sylz (format v2 or v3 blocks), 2 = sylz (v4 or
+              v5 blocks: provisional, syc 0.6.0-); level is what the
               writer used, for information. Versions 1-3 (syc 0.2.2-0.3.4)
               have no codec byte and are read too: 3 = v2 or v3 blocks, 2 =
               v3 literal chunks with three stream sizes, 1 = v2 only.
@@ -675,7 +676,9 @@ var
   rec: array[0..KEYREC_SIZE - 1] of Byte;
   first: array[0..3] of Byte;
   rawLen, packedField, sum, payLen, gen, bestGen, memKiB: UInt32;
-  blocks, nStored, nV3, raw, at, pos, extra: Int64;
+  blocks, nStored, raw, at, pos, extra: Int64;
+  nFmt: array['2'..'5'] of Int64;   { blocks of each sylz format }
+  c: Char;
   enc, pretty: Boolean;
   what, kind: string;
   i: Integer;
@@ -745,7 +748,8 @@ begin
 
     blocks := 0;
     nStored := 0;
-    nV3 := 0;
+    for c := '2' to '5' do
+      nFmt[c] := 0;
     raw := 0;
     while True do
     begin
@@ -774,17 +778,14 @@ begin
         kind := 'sylz'
       else
       begin
-        { a sylz block's first u32: bit 31 set in format v3 }
+        { a sylz block says its format in its first u32 }
         kind := 'sylz v2';
         if payLen >= 4 then
         begin
           Need(@first[0], 4);
-          if first[3] and $80 <> 0 then
-          begin
-            kind := 'sylz v3';
-            Inc(nV3);
-          end;
+          kind := Format('sylz v%d', [SylzBlockFormat(@first[0], 4)]);
         end;
+        Inc(nFmt[kind[Length(kind)]]);
       end;
       if opts.verbosity = vVerbose then
         WriteLn(Format('%8d %12d %11d %11d  %6.2f%%  %s',
@@ -798,8 +799,13 @@ begin
     if enc then
       what := what + Format(' (%d stored; the others'' format shows once decrypted)', [nStored])
     else
-      what := what + Format(' (%d sylz v2, %d sylz v3, %d stored)',
-        [blocks - nV3 - nStored, nV3, nStored]);
+    begin
+      what := what + ' (';
+      for c := '2' to '5' do
+        if (nFmt[c] > 0) or ((c <= '3') and (nFmt['4'] + nFmt['5'] = 0)) then
+          what := what + Format('%d sylz v%s, ', [nFmt[c], c]);
+      what := what + Format('%d stored)', [nStored]);
+    end;
     Row('blocks', what);
     if pretty then
     begin

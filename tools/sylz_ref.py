@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sylz_ref.py - a reference decoder for sylz blocks, formats v2 and v3.
+"""sylz_ref.py - a reference decoder for sylz blocks, formats v2 to v5.
 
 Written from the format description (the wiki's sylz-format page) for
 clarity, not speed: an oracle to check other decoders against (zpaq-std
@@ -54,6 +54,50 @@ TOKENS = [
 LLEXT = 0x10000
 MLEXT = 0x20000
 MINMATCH = 4
+
+# SYLZ_TOKENS4 (src/sylz.pas), formats v4 and v5's built-in table (they are
+# provisional: it may still change): bits 0-7 literal length, 8-15 match
+# length, bit 17 a new offset (2 bytes of the offset stream; clear: the
+# previous sequence's), bit 24 literal length extended, bit 25 match length
+# extended.
+TOKENS4 = [
+    0x0020400, 0x0020500, 0x0020600, 0x0020700, 0x0020800, 0x0020900, 0x0020A00, 0x0020B00,
+    0x0020C00, 0x0020D00, 0x0020E00, 0x0020F00, 0x0021000, 0x0021100, 0x0021200, 0x0021300,
+    0x0021400, 0x0021500, 0x0021600, 0x0021700, 0x0021800, 0x0021900, 0x0021A00, 0x0021B00,
+    0x0021C00, 0x0021D00, 0x0021E00, 0x0021F00, 0x0022000, 0x0020401, 0x0020501, 0x0020601,
+    0x0020701, 0x0020801, 0x0020901, 0x0020A01, 0x0020B01, 0x0020C01, 0x0020D01, 0x0020E01,
+    0x0020F01, 0x0021001, 0x0021101, 0x0021201, 0x0021301, 0x0021401, 0x0021501, 0x0021701,
+    0x0021B01, 0x0021E01, 0x0021F01, 0x0022001, 0x0020402, 0x0020502, 0x0020602, 0x0020702,
+    0x0020802, 0x0020902, 0x0020A02, 0x0020B02, 0x0020C02, 0x0020D02, 0x0020E02, 0x0020F02,
+    0x0021002, 0x0021202, 0x0021502, 0x0021E02, 0x0022002, 0x0020403, 0x0020503, 0x0020603,
+    0x0020703, 0x0020803, 0x0020903, 0x0020A03, 0x0020B03, 0x0020C03, 0x0020D03, 0x0020E03,
+    0x0022003, 0x0020404, 0x0020504, 0x0020604, 0x0020704, 0x0020804, 0x0020904, 0x0020A04,
+    0x0020B04, 0x0020C04, 0x0022004, 0x0020405, 0x0020505, 0x0020605, 0x0020705, 0x0020805,
+    0x0020905, 0x0020A05, 0x0020B05, 0x0020D05, 0x0020406, 0x0020506, 0x0020606, 0x0020706,
+    0x0020806, 0x0020906, 0x0020A06, 0x0020C06, 0x0020407, 0x0020507, 0x0020607, 0x0020707,
+    0x0020807, 0x0020907, 0x0020408, 0x0020508, 0x0020608, 0x0020708, 0x0020808, 0x0020409,
+    0x0020509, 0x0020609, 0x0020709, 0x0020809, 0x002040A, 0x002050A, 0x002060A, 0x002070A,
+    0x002080A, 0x002040B, 0x002050B, 0x002060B, 0x002070B, 0x002140B, 0x002040C, 0x002060C,
+    0x002070C, 0x002140C, 0x002040D, 0x002050D, 0x002060D, 0x002070D, 0x002040E, 0x002060E,
+    0x002040F, 0x002050F, 0x002060F, 0x002070F, 0x002080F, 0x0020410, 0x0020610, 0x0000200,
+    0x0000300, 0x0000400, 0x0000500, 0x0000600, 0x0000700, 0x0000800, 0x0000900, 0x0000A00,
+    0x0000B00, 0x0000C00, 0x0000D00, 0x0000E00, 0x0000F00, 0x0001000, 0x0001100, 0x0001200,
+    0x0001300, 0x0001400, 0x0001500, 0x0001600, 0x0001700, 0x0001800, 0x0001900, 0x0001A00,
+    0x0001B00, 0x0001C00, 0x0001D00, 0x0001E00, 0x0001F00, 0x0002000, 0x0000001, 0x0000401,
+    0x0000501, 0x0000601, 0x0000701, 0x0000801, 0x0000901, 0x0000A01, 0x0000B01, 0x0000C01,
+    0x0000D01, 0x0000E01, 0x0000F01, 0x0001001, 0x0001101, 0x0001301, 0x0001401, 0x0001501,
+    0x0001701, 0x0001B01, 0x0002001, 0x0000002, 0x0000402, 0x0000502, 0x0000602, 0x0000702,
+    0x0000802, 0x0000A02, 0x0000E02, 0x0001202, 0x0001602, 0x0001E02, 0x0002002, 0x0000003,
+    0x0000403, 0x0000503, 0x0000903, 0x0000D03, 0x0000004, 0x0000404, 0x0000504, 0x0000005,
+    0x0000405, 0x0000605, 0x0000705, 0x0000B05, 0x0000006, 0x0000406, 0x0000606, 0x0000A06,
+    0x0000007, 0x0000407, 0x0000507, 0x0000607, 0x0000008, 0x0000009, 0x000000A, 0x000000B,
+    0x000050B, 0x000000C, 0x000040C, 0x000000D, 0x000000E, 0x000000F, 0x0000010, 0x1020500,
+    0x1020600, 0x1020700, 0x1020800, 0x1020900, 0x1000000, 0x1020400, 0x2020400, 0x2000200,
+]
+OFF4 = 0x20000
+LLEXT4 = 0x1000000
+MLEXT4 = 0x2000000
+MINREP = 2
 LIT_CHUNK = 65536
 MAXBITS = 11
 MIN_HUFF_SYMBOLS = 256
@@ -227,16 +271,101 @@ def decode_chunk(b, i, c):
     return bytes(out), p
 
 
-def decode_block(b, n):
-    """One sylz block (v2 or v3) of n decoded bytes."""
+# ── formats v4 and v5 ─────────────────────────────────────────────────────
+
+def table_entry(v):
+    """A chunk table's 16-bit entry as a TOKENS4 value."""
+    ll = v & 31
+    ml = (v >> 5) & 63
+    if v >> 12 or (ll > 16 and ll != 31) or (ml > 32 and ml != 63):
+        raise SylzError("malformed table entry")
+    prev = (v >> 11) & 1
+    e = 0 if prev else OFF4
+    e |= LLEXT4 if ll == 31 else ll
+    if ml == 63:
+        e |= MLEXT4 | (MINREP if prev else MINMATCH) << 8
+    else:
+        e |= ml << 8
+    return e
+
+
+def decode_block4(b, n):
+    """A format v4 or v5 block of n decoded bytes."""
     hdr = u32(b, 0)
-    ctrl_len = hdr & 0x7FFFFFFF
-    if ctrl_len > len(b) - 4:
-        raise SylzError("control length past the block")
-    ctrl = b[4:4 + ctrl_len]
-    i = 4 + ctrl_len
-    if not hdr >> 31:
-        return decode_sequences(ctrl, b[i:], n)   # format v2
+    tok_len = hdr & 0x3FFFFFFF
+    off_len = u32(b, 4)
+    if tok_len > len(b) - 8 or off_len > len(b) - 8 - tok_len or off_len & 1:
+        raise SylzError("stream lengths past the block")
+    tok_end = 8 + tok_len
+    offs = b[tok_end:tok_end + off_len]
+    i = tok_end + off_len
+    if hdr >> 31:
+        lits, i = decode_literal_section(b, i, n)
+        if i != len(b):
+            raise SylzError("the chunks do not take the rest of the block")
+    else:
+        lits = b[i:]
+    out = bytearray()
+    lp = 0   # literals used
+    op = 0   # offset bytes used
+    dist = 1
+    c = 8
+    while c < tok_end:
+        chdr = u32(b[:tok_end], c)
+        c += 4
+        if chdr & 0x40000000:
+            raise SylzError("chunk header bit 30")
+        table = TOKENS4
+        if chdr >> 31:
+            if tok_end - c < 512:
+                raise SylzError("truncated table")
+            table = [table_entry(b[c + 2 * k] | b[c + 2 * k + 1] << 8) for k in range(256)]
+            c += 512
+        cend = c + (chdr & 0x3FFFFFFF)
+        if cend > tok_end:
+            raise SylzError("chunk past the token stream")
+        while c < cend:
+            e = table[b[c]]
+            c += 1
+            ll = e & 0xFF
+            ml = (e >> 8) & 0xFF
+            for flag in (LLEXT4, MLEXT4):
+                if e & flag:
+                    while True:   # 255-runs: at most the chunk's bytes
+                        if c >= cend:
+                            raise SylzError("extension runs past the chunk")
+                        v = b[c]
+                        c += 1
+                        if flag == LLEXT4:
+                            ll += v
+                        else:
+                            ml += v
+                        if v != 255:
+                            break
+            if e & OFF4:
+                if len(offs) - op < 2:
+                    raise SylzError("no offset left")
+                dist = (offs[op] | offs[op + 1] << 8) + 1
+                op += 2
+            if ll > len(lits) - lp or ll > n - len(out):
+                raise SylzError("literal run too long")
+            out += lits[lp:lp + ll]
+            lp += ll
+            if dist > len(out) or ml > n - len(out):
+                raise SylzError("match before the start or past the end")
+            start = len(out) - dist
+            for k in range(ml):   # byte by byte: the match may overlap itself
+                out.append(out[start + k])
+    if op != len(offs):
+        raise SylzError("offsets left over")
+    if len(lits) - lp != n - len(out):
+        raise SylzError("tail literals do not fill the block")
+    out += lits[lp:]
+    return bytes(out)
+
+
+def decode_literal_section(b, i, n):
+    """v3's and v5's coded literals at b[i:]: (literals, next i)."""
     lit_count = u32(b, i)
     if lit_count == 0 or lit_count > n:
         raise SylzError("literal count out of range")
@@ -246,9 +375,25 @@ def decode_block(b, n):
         c = min(LIT_CHUNK, lit_count - len(lits))
         chunk, i = decode_chunk(b, i, c)
         lits += chunk
+    return bytes(lits), i
+
+
+def decode_block(b, n):
+    """One sylz block (v2 to v5) of n decoded bytes."""
+    hdr = u32(b, 0)
+    if hdr & 0x40000000:
+        return decode_block4(b, n)
+    ctrl_len = hdr & 0x7FFFFFFF
+    if ctrl_len > len(b) - 4:
+        raise SylzError("control length past the block")
+    ctrl = b[4:4 + ctrl_len]
+    i = 4 + ctrl_len
+    if not hdr >> 31:
+        return decode_sequences(ctrl, b[i:], n)   # format v2
+    lits, i = decode_literal_section(b, i, n)
     if i != len(b):
         raise SylzError("the chunks do not take the rest of the block")
-    return decode_sequences(ctrl, bytes(lits), n)
+    return decode_sequences(ctrl, lits, n)
 
 
 def main(argv):

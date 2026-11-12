@@ -1,10 +1,10 @@
 { sylzedge — exhaustive edge cases for the sylz compressor and decoder.
 
-  Every input size 0..MAXN, five kinds of data, every level, format v2
-  and v3, and every output capacity 0..SylzBound(n): compress must return
+  Every input size 0..MAXN, five kinds of data, every level, formats v2
+  to v5, and every output capacity 0..SylzBound(n): compress must return
   -1 (and with cap >= SylzBound(n) never does) or a block that fits cap
   and decodes back to the input; nothing may be written past cap, nor
-  past the decoded output (canary bytes). About 5.7 M cases.
+  past the decoded output (canary bytes). About 11 M cases.
 
   Usage: sylzedge   (SYLZ_NOASM=1: Pascal code paths only; SYLZ_C=1: C
   instead of assembler where both exist) }
@@ -73,7 +73,7 @@ begin
     begin
       Fill(kind, n);
       for level := SYLZ_MINLEVEL to SYLZ_MAXLEVEL do
-        for flags := 0 to 1 do
+        for flags := 0 to 3 do   { SYLZ_ENTROPY, SYLZ_V4 }
           for cap := 0 to SylzBound(n) do
           begin
             Inc(cases);

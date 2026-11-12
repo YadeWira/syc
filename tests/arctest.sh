@@ -73,7 +73,13 @@ masked t1.syc > m1; masked t4.syc > m4
 cmp -s m1 m4 || { echo "FAIL: -t 1 and -t 4 archives differ"; fail=1; }
 check "a -ec -9 -b 1 -t 3" 0 "$SYC" a -q -ec -9 -b 1 -t 3 te.syc tree
 check "a to stdout" 0 sh -c "'$SYC' a -q - tree > ts.syc"
-for f in t1 te ts; do check "t $f" 0 "$SYC" t -q -t 2 $f.syc; done
+# sylz formats v4 and v5 (codec 2), and a version of each codec in one archive
+check "a -F 4 -6 -b 1 -t 2" 0 "$SYC" a -q -F 4 -6 -b 1 -t 2 tf.syc tree
+check "a -F 5 -9 -b 1" 0 "$SYC" a -q -F 5 -9 -b 1 tg.syc tree
+cp t1.syc tm.syc
+mkdir -p extra && cp "$first" extra/again
+check "a -F 4, a second version" 0 "$SYC" a -q -F 4 --no-dedup tm.syc extra
+for f in t1 te ts tf tg tm; do check "t $f" 0 "$SYC" t -q -t 2 $f.syc; done
 check "t from stdin" 0 sh -c "'$SYC' t -q - < t1.syc"
 check "l" 0 "$SYC" l t1.syc
 n=$(cd tree && find . -mindepth 1 | wc -l)
@@ -91,6 +97,11 @@ check "x -t 4 (-ec archive)" 0 "$SYC" x -q -t 4 -o o4 te.syc
 treecmp tree o4/tree || fail=1
 check "x from stdin" 0 sh -c "'$SYC' x -q -o os - < ts.syc"
 treecmp tree os/tree || fail=1
+rm -rf of4 og5
+check "x (-F 4 archive)" 0 "$SYC" x -q -t 3 -o of4 tf.syc
+treecmp tree of4/tree || fail=1
+check "x (-F 5 archive)" 0 "$SYC" x -q -o og5 tg.syc
+treecmp tree og5/tree || fail=1
 check "x over existing files" 1 "$SYC" x -q -o o1 t1.syc
 check "x --skip" 0 "$SYC" x -q --skip -o o1 t1.syc
 check "x -f" 0 "$SYC" x -q -f -o o1 t1.syc
@@ -245,6 +256,13 @@ check "d --raw" 0 "$SYC" d -q -f --raw --size "$size" -o raw.out raw.blk
 cmp -s raw.out "$first" || { echo "FAIL: --raw round trip"; fail=1; }
 check "d --raw, wrong size" 3 "$SYC" d -q -f --raw --size "$((size + 1))" -o raw.out raw.blk
 check "d --raw without --size" 2 "$SYC" d -q --raw raw.blk
+for F in 4 5; do
+  check "c --raw -F $F" 0 "$SYC" c -q -f --raw -F $F -7 -o raw$F.blk "$first"
+  check "d --raw (format v$F)" 0 "$SYC" d -q -f --raw --size "$size" -o raw.out raw$F.blk
+  cmp -s raw.out "$first" || { echo "FAIL: --raw round trip, format v$F"; fail=1; }
+  check "c -F $F" 0 "$SYC" c -q -f -F $F -3 -o s$F.sylz "$first"
+  check "t (format v$F stream)" 0 "$SYC" t -q s$F.sylz
+done
 
 # refusals
 echo notanarchive > fake.syc

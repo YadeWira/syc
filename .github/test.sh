@@ -1,7 +1,7 @@
 #!/bin/sh
 # CI: builds the test programs next to out/syc and runs them, then writes
 # hash.txt: the SHA-256 of what syc compresses from a fixed sample (streams
-# and raw blocks, both codecs, every level), which must be the same on
+# and raw blocks, sylz formats v2 to v5, every level), which must be the same on
 # every platform.  Usage: sh .github/test.sh   (FPC: the compiler; FPCOPTS:
 # the options out/syc was built with; WINDOWS=1: only the tests that run
 # there; PYTHON: python3 by default)
@@ -13,7 +13,7 @@ W=$PWD/out/ci
 rm -rf "$W"
 mkdir -p "$W"
 
-tests="cryptotest sycdedup sylzedge"
+tests="cryptotest sycdedup sylzedge sylzvectors"
 [ -n "$WINDOWS" ] || tests="$tests sylzfuzz"   # sylzfuzz: guard pages via mmap
 for t in $tests; do
   # shellcheck disable=SC2086
@@ -73,15 +73,23 @@ for codec in 0 1; do
   out/test_plugin --codec $codec "out/plugin/$pt/$lib" "$W/psample" src/sylz.pas
 done
 
-echo '== the same bytes: streams and raw blocks, sylz and sylzec, every level'
-for L in 0 1 2 3 4 5 6 7 8 9 10; do
-  for ec in '' -ec; do
-    for raw in '' --raw; do
-      # shellcheck disable=SC2086
-      "$SYC" c -q -f $raw $ec -$L -o "$W/c" "$W/sample"
-      [ -n "$raw" ] || { "$SYC" d -q -f -o "$W/d" "$W/c"; cmp "$W/d" "$W/sample"; }
-      "$PY" -c 'import hashlib,sys; f,n=sys.argv[1:]; print(hashlib.sha256(open(f,"rb").read()).hexdigest(), n)' \
-        "$W/c" "-$L$ec$raw" >> "$W/hashes"
+echo '== sylz blocks of every format, read by the reference decoder'
+out/sylzvectors "$W/blocks" >/dev/null
+for d in sylz sylzec sylz4 sylz5; do
+  "$PY" tools/sylz_ref.py --check "$W/blocks/$d"
+done
+
+echo '== the same bytes: streams and raw blocks, sylz formats v2 to v5, every level'
+for fmt in '' '-F 4'; do
+  for L in 0 1 2 3 4 5 6 7 8 9 10; do
+    for ec in '' -ec; do
+      for raw in '' --raw; do
+        # shellcheck disable=SC2086
+        "$SYC" c -q -f $raw $fmt $ec -$L -o "$W/c" "$W/sample"
+        [ -n "$raw" ] || { "$SYC" d -q -f -o "$W/d" "$W/c"; cmp "$W/d" "$W/sample"; }
+        "$PY" -c 'import hashlib,sys; f,n=sys.argv[1:]; print(hashlib.sha256(open(f,"rb").read()).hexdigest(), n)' \
+          "$W/c" "$fmt-$L$ec$raw" >> "$W/hashes"
+      done
     done
   done
 done

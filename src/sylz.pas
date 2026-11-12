@@ -42,7 +42,37 @@
   a branch the decoder can't predict. The 210 exact pairs are the most
   frequent ones (bench/sylztable.pas, over Silesia and a mixed corpus at
   levels 1 and 9), and leave 8-12% of sequences extended. Exact pairs fit
-  fixed 16-byte literal and 32-byte match copies. }
+  fixed 16-byte literal and 32-byte match copies.
+
+  Formats v4 and v5 (SYLZ_V4; provisional until frozen): three streams,
+  tokens, offsets and literals, so that a token is one byte and a
+  sequence takes two offset bytes only when it needs them; v5 is v4 with
+  the literals in v3's chunks. Bit 30 of the first u32 tells them from v2
+  and v3:
+
+    block    := hdr:u32le  offLen:u32le  tokens[tokLen]  offsets[offLen]
+                litsection
+    hdr      := tokLen | (bit 30) | (bit 31: literals entropy-coded, v5)
+    tokens   := chunk*
+    chunk    := chdr:u32le  [table: 256 x u16le]  token-bytes[n]
+    chdr     := n | (bit 31: a table follows)
+    offsets  := (distance - 1):u16le *
+    token    := index into the chunk's table (SYLZ_TOKENS4 without one of
+                its own), whose entry gives a literal length (0..16, or
+                extended), a match length (0..32, or extended) and
+                whether the match is at a new offset (the next two offset
+                bytes) or at the previous sequence's
+    ext      := as in v2, in the token bytes; the match extension counts
+                from 4 at a new offset, from 2 at the previous one
+
+  A match at the previous sequence's offset costs a token and no offset
+  bytes: in structured data a fifth to a half of the matches are such.
+  A token with match length 0 is literals only, and one with no literals
+  at the previous offset continues a match, so what has no code of its
+  own is written as two or three plain tokens, which the decoder's loop
+  takes without a branch, instead of an escape and an extension; only
+  literal runs over 32 and matches over 64 are extended. Each chunk of
+  the token stream can bring a table made from the pairs it uses most. }
 unit sylz;
 
 {$mode objfpc}{$H+}
@@ -4961,11 +4991,10 @@ asm
   movdqu [r10], xmm0             { 16 literal bytes, unconditionally }
   mov edx, eax
   shr edx, 16                    { offset bytes taken: 2 or 0 }
+  cmovz rcx, r12                 { none (shr left ZF): the previous distance }
   add r9, rbx
   add r10, rbx
   add r11, rdx
-  test edx, edx
-  cmovz rcx, r12                 { none: the previous distance }
   movzx ebp, ah                  { match length, 0..32 }
   mov r12, rcx
   mov rsi, r10
@@ -4993,11 +5022,10 @@ asm
   movdqu [r10], xmm0
   mov edx, eax
   shr edx, 16
+  cmovz rcx, r12
   add r9, rbx
   add r10, rbx
   add r11, rdx
-  test edx, edx
-  cmovz rcx, r12
   movzx ebp, ah
   mov r12, rcx
   mov rdx, r10
@@ -5170,6 +5198,8 @@ asm
   pop rbx
 end;
 
+{$endif}
+
 { The sequence at st.tok if it is an escape and fits what is left of the
   streams and the output, copied exactly; false (nothing done) otherwise:
   DecodeSafe4 then finishes the block, or rejects it. }
@@ -5226,7 +5256,79 @@ begin
   Result := True;
 end;
 
-{$endif}
+{ DecodeFast4X64's loop in Pascal, same results: it stops, with
+  everything at the token, at an escape or when no sequence is sure to
+  fit (k = 0); st.status = -1 on corrupt input. }
+procedure DecodeFast4Pas(var st: TDecode4State);
+var
+  tok, offp, lit, op, m: PByte;
+  tokens: PUInt32;
+  e: UInt32;
+  k, c, ml, rep: SizeInt;
+begin
+  tok := st.tok;
+  offp := st.offp;
+  lit := st.lit;
+  op := st.op;
+  rep := st.rep;
+  tokens := st.tokens;
+  st.status := 0;
+  repeat
+    k := st.tend - tok;
+    c := (st.offend - offp) shr 1;
+    if c < k then
+      k := c;
+    c := (st.lend - lit) shr 4;
+    if c < k then
+      k := c;
+    c := (st.oend - op) shr 6;
+    if c < k then
+      k := c;
+    if k <= 0 then
+      Break;
+    repeat
+      e := tokens[tok^];
+      if e > $FFFFFF then
+        Break;   { an escape }
+      Inc(tok);
+      Copy16(op, lit);
+      Inc(op, e and $FF);
+      Inc(lit, e and $FF);
+      if e and SYLZ_TOK4_OFF <> 0 then
+      begin
+        rep := SizeInt(offp[0] or (UInt32(offp[1]) shl 8)) + 1;
+        Inc(offp, 2);
+      end;
+      if rep > op - st.dst then
+      begin
+        st.status := -1;
+        Exit;
+      end;
+      m := op - rep;
+      ml := (e shr 8) and $FF;
+      if rep >= 16 then
+      begin
+        Copy16(op, m);
+        Copy16(op + 16, m + 16);
+        Inc(op, ml);
+      end
+      else
+        while ml > 0 do
+        begin
+          op^ := m^;
+          Inc(op);
+          Inc(m);
+          Dec(ml);
+        end;
+      Dec(k);
+    until k = 0;
+  until k > 0;
+  st.tok := tok;
+  st.offp := offp;
+  st.lit := lit;
+  st.op := op;
+  st.rep := rep;
+end;
 
 {$ifdef SYLZ_C}
 function sylzc_decode4(st: PDecode4State): SizeInt; cdecl; external name 'sylzc_decode4';
@@ -5252,6 +5354,11 @@ begin
   if SylzUseAsm then
     Exit(sylzc_decode4(@st) = 0);
 {$endif}
+  repeat
+    DecodeFast4Pas(st);
+    if st.status < 0 then
+      Exit(False);
+  until not DecodeEscape4(st);
   Result := DecodeSeqs4(st);
 end;
 

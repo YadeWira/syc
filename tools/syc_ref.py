@@ -35,6 +35,7 @@ _spec.loader.exec_module(sylz_ref)
 
 MAX_BLOCK = 1 << 29
 CODEC_SYLZ = 1
+CODEC_SYLZ4 = 2   # sylz blocks of format v4 or v5 (provisional)
 DELETED, FILE, DIR, SYMLINK = 0, 1, 2, 3
 
 
@@ -183,7 +184,7 @@ def read_stream(b, password=None):
     need(1 <= version <= 5, 'stream version %d not known' % version)
     if version >= 4:
         need(len(b) >= 7, 'truncated')
-        need(b[5] == CODEC_SYLZ, 'codec %d not known' % b[5])
+        need(b[5] in (CODEC_SYLZ, CODEC_SYLZ4), 'codec %d not known' % b[5])
         i = 7
     else:
         i = 6
@@ -356,7 +357,8 @@ def read_archive(b, password=None):
         need(u32(b, vstart + 4) == vnum, 'version number')
         time = i64(b, vstart + 8)
         if fmt >= 2:
-            need(b[vstart + 16] == CODEC_SYLZ, 'codec %d not known' % b[vstart + 16])
+            need(b[vstart + 16] in (CODEC_SYLZ, CODEC_SYLZ4),
+                 'codec %d not known' % b[vstart + 16])
             need(b[vstart + 17:vstart + 20] == b'\0\0\0', 'reserved bytes')
         if keys and keys.index_sealed:
             need(b[istart:istart + 4] == b'SYCI', 'bad record magic')

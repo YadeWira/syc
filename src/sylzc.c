@@ -1091,6 +1091,8 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
     uint16_t *tl = st->tl, *ts = st->ts;
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
+    uint16_t *rec = e.rec;   /* v4: emit_fast4's pointers */
+    uint8_t *wlit = e.lit;
     intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit, rep = 1;
 
     if (n < 12 + 1)
@@ -1154,7 +1156,7 @@ found:
             len++;
         }
         if (v4)
-            emit_sequence4(&e, src + anchor, pos - anchor, dist, len);
+            emit_fast4(&e, &rec, &wlit, src + anchor, pos - anchor, dist, len);
         else
             emit_sequence(&e, src + anchor, pos - anchor, dist, len);
         rep = dist;
@@ -1169,6 +1171,11 @@ found:
         anchor = pos;
     }
 done:
+    if (v4) {
+        e.rec = rec;
+        e.lit = wlit;
+        e.rep = rep;
+    }
     st->anchor = anchor;
     st->e = e;
 }

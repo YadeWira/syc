@@ -180,10 +180,7 @@ begin
   input := GuardedAlloc(n);
   MakeInput(input.p, n);
   comp := GuardedAlloc(SylzBound(n));
-  if RandBelow(2) = 0 then
-    flags := 0
-  else
-    flags := SYLZ_ENTROPY;
+  flags := RandBelow(4);   { SYLZ_ENTROPY, SYLZ_V4: formats v2 .. v5 }
   csize := SylzCompressEx(fctx, input.p, n, comp.p, SylzBound(n), level, flags);
   if csize < 0 then
     Fail('compress returned -1 with a SylzBound buffer', n, level);

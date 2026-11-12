@@ -2,7 +2,8 @@
 
   Writes DIR/sylzec/NAME.orig and NAME.LEVEL.blk (format v3: what the
   sylzec plugin's compress() returns, levels 0..10) and DIR/sylz/... the
-  same for format v2 (the sylz plugin). A .blk is the block alone: no size
+  same for format v2 (the sylz plugin), and DIR/sylz4 and DIR/sylz5 for
+  the provisional formats v4 and v5. A .blk is the block alone: no size
   prefix. tools/sylz_ref.py --check DIR/sylzec checks them.
 
   Usage: sylzvectors DIR [TEXT-FILE BINARY-FILE]   (samples for the text
@@ -13,6 +14,10 @@ program sylzvectors;
 
 uses
   SysUtils, Classes, sylz;
+
+const
+  { the formats written: v3 and v2 (the plugins'), v4 and v5 (provisional) }
+  FLAGS: array[0..3] of Integer = (SYLZ_ENTROPY, 0, SYLZ_V4, SYLZ_V4 or SYLZ_ENTROPY);
 
 var
   seed: UInt32 = 12345;
@@ -60,12 +65,15 @@ begin
   SetLength(dst, SylzBound(n) + 1);
   SetLength(back, n + 1);
   SylzCtxInit(ctx);
-  for fmt := 0 to 1 do
+  for fmt := 0 to 3 do
   begin
-    if fmt = 0 then
-      dir := outDir + '/sylzec/'
+    case fmt of
+      0: dir := outDir + '/sylzec/';
+      1: dir := outDir + '/sylz/';
+      2: dir := outDir + '/sylz4/';
     else
-      dir := outDir + '/sylz/';
+      dir := outDir + '/sylz5/';
+    end;
     ForceDirectories(dir);
     if n > 0 then
       SaveFile(dir + name + '.orig', @data[0], n)
@@ -73,10 +81,7 @@ begin
       SaveFile(dir + name + '.orig', nil, 0);
     for level := SYLZ_MINLEVEL to SYLZ_MAXLEVEL do
     begin
-      if fmt = 0 then
-        r := SylzCompressEx(ctx, PByte(data), n, @dst[0], Length(dst), level, SYLZ_ENTROPY)
-      else
-        r := SylzCompressEx(ctx, PByte(data), n, @dst[0], Length(dst), level, 0);
+      r := SylzCompressEx(ctx, PByte(data), n, @dst[0], Length(dst), level, FLAGS[fmt]);
       if r < 0 then
         raise Exception.Create(name + ': compression failed');
       { every vector decodes back here first }
