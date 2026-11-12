@@ -66,6 +66,33 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Commands for developing and reporting (2026-11-12)
+
+syc b (benchmark in memory), s (self-test), r (report), i on .sylz
+streams; --stats, --debug, --paths auto|c|pascal (SYC_PATHS), --color;
+each command also by its word. New units: sycui (terminal, colours,
+times, peak memory, what --debug and --stats collect), sycdev (b, s, r),
+sycvectors (the RFC vectors, shared by tests/cryptotest and the
+self-test), sycbuild (commit and date from build.sh's environment, the
+unit compiled again on every build).
+
+- The self-test runs each generated input at every level of v2 and v3
+  through each path (x86-64: assembler, assembler without BMI2, C,
+  Pascal; elsewhere C and Pascal) and wants the same block from all, 240
+  damaged blocks per path (cut: refused; bits flipped or noise: refused
+  or decoded inside the output, canaries after it), the vectors on the C
+  and Pascal paths, and the commands on a 2.6 MiB file and a small tree
+  in the temporary directory, plain and encrypted. 61 checks, 8 s here
+  (x86-64), 5 s under wine, 27 s on arm64 under qemu; most of it is
+  -ec 9/10 on the Pascal path.
+- TThread.ProcessorCount is 1 on Linux with FPC 3.2.2: sysconf instead.
+  FPC's units have no getrusage: libc's, ru_maxrss at the fifth long
+  (kilobytes on Linux, bytes on macOS).
+- What scripts read did not change: colours, rounded sizes and the
+  progress bar only on a terminal (or --color always); summaries keep
+  their bytes and add the time and the speed after them.
+- crc32 got a run-time switch (CrcUseC) like the other C paths.
+
 ## The same blocks on 32-bit targets (2026-10-29)
 
 zpaq-std's user asked for x86 and x64 to write the same bytes: on 32-bit

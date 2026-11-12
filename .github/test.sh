@@ -31,7 +31,13 @@ echo '== sylzedge'
 out/sylzedge
 SYLZ_NOASM=1 out/sylzedge
 
+echo '== syc s: the self-test of the binary itself; syc r: the report'
+"$SYC" s -q
+"$SYC" r
+
 "$PY" .github/sample.py "$W/sample"
+echo '== clitest'
+SYC=$SYC sh tests/clitest.sh "$W/sample" "$W/clitest"
 if [ -z "$WINDOWS" ]; then
   echo '== sylzfuzz'
   out/sylzfuzz 300 "$W/sample" src/*.pas

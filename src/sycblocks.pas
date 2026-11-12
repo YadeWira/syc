@@ -10,7 +10,7 @@ interface
 uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}termio,{$endif}
-  SysUtils, Classes, Math, sylz;
+  SysUtils, Classes, Math, sylz, sycui;
 
 const
   MAX_BLOCK   = 512 shl 20;
@@ -35,14 +35,16 @@ procedure Fail(code: Integer; const msg: string);
 
 function crc32(crc: UInt32; p: PByte; n: SizeInt): UInt32;
 
+var
+  { the C version of crc32 (when built in); False: the Pascal one }
+  CrcUseC: Boolean = {$ifdef SYLZ_PUREPASCAL}False{$else}True{$endif};
+
 procedure WriteU32(s: TStream; v: UInt32);
 function ReadU32(s: TStream): UInt32;
 { Reads up to n bytes; fewer only at the end of the stream. }
 function ReadFull(s: TStream; p: PByte; n: SizeInt): SizeInt;
 { Moves src over dst in one step, replacing it. }
 function ReplaceFile(const src, dst: string): Boolean;
-{ handle 0, 1 or 2 is a terminal }
-function IsTerminal(std: Integer): Boolean;
 function StdStream(std: Integer): THandleStream;
 
 type
@@ -124,13 +126,14 @@ type
   end;
 
   { A progress line on stderr, rewritten in place at most 5 times a second:
-    percent (when the total is known), bytes, speed, time left. Nothing
-    when disabled. }
+    percent and a bar (when the total is known; the bar on terminals wide
+    enough), bytes, speed, time left. Nothing when disabled. }
   TProgress = class
     enabled: Boolean;
     total, done: Int64;
     started, lastShown: QWord;
     width: Integer;
+    columns: Integer;   { the terminal's width; 0: not a terminal }
     constructor Create(aEnabled: Boolean; aTotal: Int64);
     procedure Add(n: Int64);
     procedure Show;
@@ -218,7 +221,8 @@ var
 begin
 {$ifndef SYLZ_PUREPASCAL}
   { the C version (sylzc.c), same results: FPC ran this loop at ~1.2 GB/s }
-  Exit(sylzc_crc32(crc, p, n, @crcTable[0, 0]));
+  if CrcUseC then
+    Exit(sylzc_crc32(crc, p, n, @crcTable[0, 0]));
 {$endif}
   crc := not crc;
   while n >= 8 do
@@ -279,25 +283,6 @@ begin
     MOVEFILE_REPLACE_EXISTING);
 {$else}
   Result := RenameFile(src, dst);
-{$endif}
-end;
-
-function StdHandle(std: Integer): THandle;
-begin
-  case std of
-    0: Result := StdInputHandle;
-    1: Result := StdOutputHandle;
-  else
-    Result := StdErrorHandle;
-  end;
-end;
-
-function IsTerminal(std: Integer): Boolean;
-begin
-{$ifdef windows}
-  Result := GetFileType(StdHandle(std)) = FILE_TYPE_CHAR;
-{$else}
-  Result := IsATTY(StdHandle(std)) = 1;
 {$endif}
 end;
 
@@ -538,6 +523,9 @@ begin
   total := aTotal;
   started := GetTickCount64;
   lastShown := started;
+  { a bar only where the line is rewritten in place and there is room }
+  if enabled and IsTerminal(2) then
+    columns := TermWidth(2);
 end;
 
 procedure TProgress.Add(n: Int64);
@@ -556,30 +544,47 @@ begin
 end;
 
 procedure TProgress.Show;
+const
+  BAR = 24;
 var
   secs, speed, left: Double;
-  line: string;
+  line, shown: string;
+  pct, filled: Integer;
 begin
   secs := (GetTickCount64 - started) / 1000;
   if secs <= 0 then
     secs := 0.001;
   speed := done / secs;
+  shown := '';
   if total > 0 then
   begin
-    line := Format('%3d%%  %s / %s  %s/s', [Min(100, done * 100 div total), Human(done),
-      Human(total), Human(speed)]);
+    pct := Min(100, done * 100 div total);
+    line := Format('%3d%%  ', [pct]);
+    if columns >= 78 then
+    begin
+      filled := pct * BAR div 100;
+      line := line + '[' + StringOfChar('=', filled) + StringOfChar(' ', BAR - filled) + ']  ';
+      shown := Format('%3d%%  ', [pct]) + '[' + Paint(2, stBar, StringOfChar('=', filled))
+        + StringOfChar(' ', BAR - filled) + ']  ';
+    end;
+    line := line + Format('%s / %s  %s/s', [Human(done), Human(total), Human(speed)]);
     if (speed > 0) and (done < total) then
     begin
       left := (total - done) / speed;
       line := line + Format('  %d:%.2d left', [Trunc(left) div 60, Trunc(left) mod 60]);
     end;
+    { the same line, its bar coloured }
+    if shown <> '' then
+      shown := shown + Copy(line, 6 + BAR + 4 + 1, MaxInt);
   end
   else
     line := Format('%s  %s/s', [Human(done), Human(speed)]);
+  if shown = '' then
+    shown := line;
   if Length(line) < width then
-    line := line + StringOfChar(' ', width - Length(line));
-  width := Length(line);
-  Write(StdErr, #13, line);
+    shown := shown + StringOfChar(' ', width - Length(line));
+  width := Max(width, Length(line));
+  Write(StdErr, #13, shown);
 end;
 
 procedure TProgress.Finish;

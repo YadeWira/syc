@@ -19,10 +19,15 @@ unit sycstream;
 interface
 
 uses
-  SysUtils, Classes, Math, sylz, syccrypto, sycblocks, syccli, sycenc, sycarc;
+  SysUtils, Classes, Math, sylz, syccrypto, sycblocks, sycui, syccli, sycenc, sycarc;
 
 { runs syc c, d or t on every operand; returns the exit code }
 function RunStreamCommand(const opts: TOptions): Integer;
+{ path is a file that starts as a .sylz stream does }
+function IsStreamFile(const path: string): Boolean;
+{ syc i on a stream: its header and its blocks' sizes, read without
+  decompressing (or a password); returns the exit code }
+function StreamInfo(const opts: TOptions; const path: string): Integer;
 
 implementation
 
@@ -161,6 +166,7 @@ begin
       pipe.jobs[i].Reserve(blockSize, SylzBound(blockSize));
     if enc then
     begin
+      Phase('c: the key (Argon2id)');
       hdr := StreamPrefix(FORMAT_ENC, CODEC_SYLZ, Byte(opts.level));
       pw := GetPassword(opts, True, name);
       sealer := TStreamSealer.Create;
@@ -178,6 +184,7 @@ begin
       fout.WriteBuffer(hdr[0], Length(hdr));
       written := Length(hdr);
     end;
+    Phase('c: read, compress, write ' + name);
     total := 0;
     blocks := 0;
     eof := False;
@@ -186,6 +193,7 @@ begin
     while not eof do
     begin
       slot := blocks mod pipe.Slots;
+      SetWhere(name, blocks, blocks * Int64(blockSize));
       if blocks >= pipe.Slots then
         WriteSlot(slot);
       pipe.jobs[slot].n := ReadFull(fin, pipe.jobs[slot].raw, blockSize);
@@ -284,6 +292,7 @@ begin
   try
     if enc then
     begin
+      Phase('d: the key (Argon2id)');
       prefix := StreamPrefix(hdr[4], hdr[5], hdr[6]);
       SetLength(rec, KEYREC_SIZE);
       if ReadFull(fin, @rec[0], KEYREC_SIZE) <> KEYREC_SIZE then
@@ -295,11 +304,13 @@ begin
       Wipe(@pw[0], Length(pw));
       pipe.SetPre(@sealer.OpenJob, True);
     end;
+    Phase('d: read, decompress ' + name);
     at := 0;
     blocks := 0;
     try
       while True do
       begin
+        SetWhere(name, blocks, at);
         rawLen := ReadU32(fin);
         if rawLen = 0 then
           Break;
@@ -414,6 +425,14 @@ begin
   total := size;
 end;
 
+function EcNote(flags: Integer): string;
+begin
+  if flags and SYLZ_ENTROPY <> 0 then
+    Result := ' -ec (sylz format v3)'
+  else
+    Result := ' (sylz format v2)';
+end;
+
 { One operand. Returns its exit code; a usage error is raised instead. }
 function RunOne(const opts: TOptions; const input: string): Integer;
 var
@@ -425,8 +444,13 @@ var
   magic: array of Byte;
   got: SizeInt;
   arcPath, suffix: string;
+  t0: UInt64;
+  inSize: Int64;   { the input file's size; -1: stdin }
 begin
+  inSize := -1;
   Result := EXIT_OK;
+  t0 := NowNs;
+  written := 0;
   if opts.raw then
     suffix := RAW_SUFFIX
   else
@@ -457,14 +481,14 @@ begin
         outPath := ChangeFileExt(input, '')
       else
       begin
-        WriteLn(StdErr, 'syc: ', input, ': no ', suffix, ' suffix, skipped (give -o or -O)');
+        WriteLn(StdErr, WarnTag, input, ': no ', suffix, ' suffix, skipped (give -o or -O)');
         Exit(EXIT_WARN);
       end;
       if not fromStdin and SameFileName(ExpandFileName(input), ExpandFileName(outPath)) then
         Fail(EXIT_USAGE, input + ': the output is the input');
       if FileExists(outPath) and not opts.force then
       begin
-        WriteLn(StdErr, 'syc: ', outPath, ' exists, skipped (-f overwrites)');
+        WriteLn(StdErr, WarnTag, outPath, ' exists, skipped (-f overwrites)');
         Exit(EXIT_WARN);
       end;
     end
@@ -486,12 +510,15 @@ begin
         except
           on E: EFOpenError do
           begin
-            WriteLn(StdErr, 'syc: ', input, ': cannot open, skipped');
+            WriteLn(StdErr, WarnTag, input, ': cannot open, skipped');
             Exit(EXIT_WARN);
           end;
         end;
       if fin is TFileStream then
-        prog := TProgress.Create(opts.progress, fin.Size)
+      begin
+        inSize := fin.Size;
+        prog := TProgress.Create(opts.progress, fin.Size);
+      end
       else
         prog := TProgress.Create(opts.progress, 0);
       if toStdout then
@@ -568,21 +595,33 @@ begin
     if opts.removeInput and not fromStdin and not toStdout and (opts.cmd <> 't') then
       if not SysUtils.DeleteFile(input) then
       begin
-        WriteLn(StdErr, 'syc: ', input, ': cannot delete');
+        WriteLn(StdErr, WarnTag, input, ': cannot delete');
         Result := EXIT_WARN;
       end;
 
+    ClearWhere;
+    if opts.cmd = 'c' then
+      StatAdd(total, written)
+    else if inSize >= 0 then
+      StatAdd(inSize, total)
+    else
+      StatAdd(0, total);
     if opts.verbosity <> vQuiet then
       case opts.cmd of
         'c': if opts.raw then
-               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%), one sylz block: decode with --raw --size %d',
-                 [inName, total, written, written * 100.0 / Max(total, 1), total]))
+               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)%s, one sylz block: decode with --raw --size %d',
+                 [inName, total, written, written * 100.0 / Max(total, 1), TimeAndSpeed(total, t0), total]))
              else
-               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)',
-                 [inName, total, written, written * 100.0 / Max(total, 1)]));
-        'd': WriteLn(StdErr, Format('%s: %d bytes', [inName, total]));
-        't': WriteLn(StdErr, Format('%s: ok, %d bytes', [inName, total]));
+               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)%s',
+                 [inName, total, written, written * 100.0 / Max(total, 1), TimeAndSpeed(total, t0)]));
+        'd': WriteLn(StdErr, Format('%s: %d bytes%s', [inName, total, TimeAndSpeed(total, t0)]));
+        't': WriteLn(StdErr, Format('%s: %s, %d bytes%s', [inName, Paint(2, stOk, 'ok'), total,
+               TimeAndSpeed(total, t0)]));
       end;
+    if (opts.verbosity = vVerbose) and (opts.cmd = 'c') and not opts.raw then
+      WriteLn(StdErr, Format('  level %d%s, blocks of %d MiB, %d thread(s), %s -> %s',
+        [opts.level, EcNote(opts.flags), opts.blockMiB, opts.threads, HumanSize(total),
+         HumanSize(written)]));
   except
     { no partial output left behind; an existing output stays as it was }
     on E: Exception do
@@ -595,6 +634,176 @@ begin
         Fail(EXIT_FATAL, inName + ': out of memory');
       Fail(EXIT_FATAL, inName + ': ' + E.Message);
     end;
+  end;
+end;
+
+{ ── syc i on a stream ──────────────────────────────────────────────────── }
+
+function IsStreamFile(const path: string): Boolean;
+var
+  fs: TFileStream;
+  m: array[0..3] of Byte;
+begin
+  Result := False;
+  if (path = '-') or not FileExists(path) then
+    Exit;
+  try
+    fs := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
+    try
+      Result := (ReadFull(fs, @m[0], 4) = 4) and (CompareByte(m[0], MAGIC[1], 4) = 0);
+    finally
+      fs.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
+
+function StreamInfo(const opts: TOptions; const path: string): Integer;
+var
+  fs: TFileStream;
+  hdr: array[0..6] of Byte;
+  rec: array[0..KEYREC_SIZE - 1] of Byte;
+  first: array[0..3] of Byte;
+  rawLen, packedField, sum, payLen, gen, bestGen, memKiB: UInt32;
+  blocks, nStored, nV3, raw, at, pos, extra: Int64;
+  enc, pretty: Boolean;
+  what, kind: string;
+  i: Integer;
+
+  procedure Need(p: Pointer; n: SizeInt);
+  begin
+    if ReadFull(fs, p, n) <> n then
+      Fail(EXIT_CORRUPT, path + ': truncated');
+  end;
+
+  procedure Row(const name, value: string);
+  begin
+    WriteLn(Paint(1, stHead, Format('%-12s', [name])), value);
+  end;
+
+begin
+  Result := EXIT_OK;
+  fs := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
+  try
+    Need(@hdr[0], 6);
+    if (hdr[4] < 1) or (hdr[4] > FORMAT_ENC) then
+      Fail(EXIT_CORRUPT, Format('%s: stream format version %d not supported by syc %s',
+        [path, hdr[4], SYC_VERSION]));
+    { versions 1-3: "SYZ0", the version, the level; 4 and 5 have the codec
+      between them }
+    if hdr[4] >= 4 then
+    begin
+      if hdr[5] <> CODEC_SYLZ then
+        Fail(EXIT_CORRUPT, Format('%s: codec %d not supported by syc %s', [path, hdr[5], SYC_VERSION]));
+      Need(@hdr[6], 1);
+    end
+    else
+      hdr[6] := hdr[5];
+    enc := hdr[4] = FORMAT_ENC;
+    extra := 0;
+    what := Format('%s stream, format version %d, codec sylz, written at level %d',
+      [STREAM_SUFFIX, hdr[4], hdr[6]]);
+    if enc then
+    begin
+      { the key record: "SYCK", flags, then two slots; the one of the
+        highest generation holds the current password's parameters }
+      Need(@rec[0], KEYREC_SIZE);
+      bestGen := 0;
+      memKiB := 0;
+      for i := 0 to 1 do
+      begin
+        gen := LEtoN(PUInt32(@rec[8 + i * SLOT_SIZE])^);
+        if gen > bestGen then
+        begin
+          bestGen := gen;
+          memKiB := LEtoN(PUInt32(@rec[8 + i * SLOT_SIZE + 8])^);
+        end;
+      end;
+      what := what + Format('; encrypted (XChaCha20-Poly1305, key from Argon2id over %d MiB)',
+        [memKiB shr 10]);
+      extra := SEAL_SIZE;
+    end
+    else
+      what := what + '; not encrypted';
+    WriteLn(Paint(1, stHead, path), ': ', what);
+    pretty := IsTerminal(1) and (opts.verbosity <> vVerbose);
+    if opts.verbosity = vVerbose then
+      WriteLn(Paint(1, stHead, '   block    at offset         raw      stored    ratio  kind'));
+
+    blocks := 0;
+    nStored := 0;
+    nV3 := 0;
+    raw := 0;
+    while True do
+    begin
+      pos := fs.Position;
+      SetWhere(path, blocks, pos);
+      Need(@rawLen, 4);
+      rawLen := LEtoN(rawLen);
+      if rawLen = 0 then
+        Break;
+      Need(@packedField, 4);
+      Need(@sum, 4);
+      packedField := LEtoN(packedField);
+      payLen := packedField and PAYLOAD_MASK;
+      if (rawLen > MAX_BLOCK) or (payLen > MAX_BLOCK)
+         or ((packedField and STORED_FLAG <> 0) and (payLen <> rawLen)) then
+        Fail(EXIT_CORRUPT, Format('%s: corrupt block header at offset %d', [path, pos]));
+      at := fs.Position;
+      if at + extra + payLen > fs.Size then
+        Fail(EXIT_CORRUPT, path + ': truncated');
+      if packedField and STORED_FLAG <> 0 then
+      begin
+        kind := 'stored';
+        Inc(nStored);
+      end
+      else if enc then
+        kind := 'sylz'
+      else
+      begin
+        { a sylz block's first u32: bit 31 set in format v3 }
+        kind := 'sylz v2';
+        if payLen >= 4 then
+        begin
+          Need(@first[0], 4);
+          if first[3] and $80 <> 0 then
+          begin
+            kind := 'sylz v3';
+            Inc(nV3);
+          end;
+        end;
+      end;
+      if opts.verbosity = vVerbose then
+        WriteLn(Format('%8d %12d %11d %11d  %6.2f%%  %s',
+          [blocks, pos, rawLen, payLen, payLen * 100.0 / rawLen, kind]));
+      fs.Position := at + extra + payLen;
+      Inc(raw, rawLen);
+      Inc(blocks);
+    end;
+    ClearWhere;
+    what := IntToStr(blocks);
+    if enc then
+      what := what + Format(' (%d stored; the others'' format shows once decrypted)', [nStored])
+    else
+      what := what + Format(' (%d sylz v2, %d sylz v3, %d stored)',
+        [blocks - nV3 - nStored, nV3, nStored]);
+    Row('blocks', what);
+    if pretty then
+    begin
+      Row('raw size', Format('%s (%d bytes)', [HumanSize(raw), raw]));
+      Row('stored size', Format('%s (%d bytes), %.2f%%', [HumanSize(fs.Size), fs.Size,
+        fs.Size * 100.0 / Max(raw, 1)]));
+    end
+    else
+    begin
+      Row('raw size', Format('%d bytes', [raw]));
+      Row('stored size', Format('%d bytes, %.2f%%', [fs.Size, fs.Size * 100.0 / Max(raw, 1)]));
+    end;
+    if opts.verbosity <> vQuiet then
+      WriteLn(Paint(1, stDim, '(sizes as the headers give them; syc t checks the data)'));
+  finally
+    fs.Free;
   end;
 end;
 
@@ -616,7 +825,7 @@ begin
       begin
         if E.code = EXIT_USAGE then
           raise;
-        WriteLn(StdErr, 'syc: ', E.Message);
+        ShowError(E, E.code);
         r := E.code;
       end;
     end;

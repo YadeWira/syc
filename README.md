@@ -190,12 +190,37 @@ out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N thread
 out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)
 out/syc t file.sylz        # check it, write nothing
 tar c dir | out/syc c > dir.tar.sylz       # no FILE: stdin -> stdout
+out/syc i file.sylz        # its format, level, blocks and sizes (-v: each block)
 out/syc h a                # every option of a command
-out/sylzbench -l 1,9 FILE  # in-memory benchmark, lzbench-style
 ```
 
-An existing output is not overwritten without `-f`. Exit status: 0 ok,
-1 an input skipped, 2 usage, 3 corrupt data, 4 I/O error.
+Each command also goes by its word (`syc add`, `extract`, `list`, `info`,
+`compress`, `decompress`, `test`, `key`). On a terminal there is a progress
+bar, and `l -l` and `i` round their sizes (`-v`: exact); into a pipe or a
+file the output is plain, as before. An existing output is not overwritten
+without `-f`. Exit status: 0 ok, 1 an input skipped, 2 usage, 3 corrupt
+data, 4 I/O error.
+
+For developing syc, and for reporting a problem with it:
+
+```sh
+out/syc b FILE             # benchmark: every level in memory (--levels 1,4,9; -ec; --time S)
+out/syc s                  # self-test: is this build right on this machine?
+out/syc r                  # report: build, machine, self-test, for a bug report
+out/syc c --stats file     # at the end: bytes, time, speed, threads, peak memory
+out/syc t --debug file     # an error's kind and where it happened; each phase's time
+out/syc c --paths pascal file   # the reference Pascal instead of assembler and C:
+                                #   the same bytes, or a fast path has a bug
+out/syc -V                 # the version, the commit, the compiler, the paths in use
+out/sylzbench -l 1,9 FILE  # the benchmark as a program of its own, lzbench-style
+```
+
+`syc s` runs the codec at every level and format through every code path
+built in, damaged blocks, the checksums, hashes and ciphers against their
+known answers, and a stream and an archive through the commands, in a few
+seconds. `syc r` lists the `SYC_*` variables that are set by name only,
+never their values. `--color auto|always|never` (and `NO_COLOR`) decides
+the colours.
 
 Each block carries a CRC32 of its data, checked on decompression.
 
@@ -243,15 +268,19 @@ Roundtrips random, structured and real data at every level, decodes
 corrupted and truncated blocks against guard-page buffers (any read or
 write out of bounds faults), alternates the assembler and Pascal paths,
 and checks the two compressors agree byte for byte. Unix only (uses
-mmap). `.github/test.sh` runs every test the way CI does.
+mmap). `tests/clitest.sh` checks the commands and switches above;
+`.github/test.sh` runs every test the way CI does, `syc s` and `syc r`
+included.
 
 ## Layout
 
 ```
 src/           sylz codec (sylz.pas, and sylzc.c: its C part), its Huffman
-               coder (sylzhuf.pas), the syc CLI (syc.pas)
+               coder (sylzhuf.pas), the syc CLI (syc.pas; sycdev.pas: bench,
+               self-test, report; sycui.pas: terminal, colours, times)
 bench/         sylzbench, sylzstats (sequence histograms of a block)
-tests/         sylzfuzz, sylzedge, sylzvectors (test vectors for other decoders)
+tests/         sylzfuzz, sylzedge, sylzvectors (test vectors for other decoders),
+               arctest.sh and clitest.sh (the commands end to end)
 tools/         sylz_ref.py: a reference decoder in Python
 plugin/        zpaq-std codec plugin and its test
 build.sh       (and build-c.sh, which compiles the C part for the target)
