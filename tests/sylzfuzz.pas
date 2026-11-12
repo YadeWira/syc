@@ -104,9 +104,9 @@ var
   alphabet: UInt32;
 begin
   if Length(samples) > 0 then
-    kind := RandBelow(6)
+    kind := RandBelow(7)
   else
-    kind := RandBelow(5);
+    kind := RandBelow(6);
   case kind of
     0: { random }
       for i := 0 to n - 1 do
@@ -142,6 +142,14 @@ begin
           buf[i] := buf[i - 1 - SizeInt(RandBelow(Min(i - 1, 70000)))]
         else
           buf[i] := Byte(Rand);
+    5: { skewed bytes with few matches, and a stretch of them repeated:
+         literal runs longer than a Huffman chunk, coded }
+      begin
+        for i := 0 to n - 1 do
+          buf[i] := Byte(Rand and Rand and Rand);
+        if n > 3000 then
+          Move(buf[0], buf[n div 2], 1 + RandBelow(1000));
+      end;
   else { slice of a real file }
     s := samples[RandBelow(Length(samples))];
     if Length(s) = 0 then

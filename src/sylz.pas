@@ -5101,17 +5101,59 @@ type
     rep: SizeInt;                            { 72: in/out, the previous distance }
     status: SizeInt;                         { 80: out, 0 = stopped, -1 = corrupt }
     tokens: PUInt32;                         { 88: in, the chunk's table }
+    { format v5 (the fast loops do not read these): the literal chunks not
+      decoded yet, the literals in them, and the buffer lit .. lend is in }
+    litSrc, litSrcEnd: PByte;
+    litLeft: SizeInt;
+    litBuf: PByte;
   end;
   PDecode4State = ^TDecode4State;
 
-{ The rest of a chunk's sequences, exact and fully checked: tokens (with
-  their extensions) up to st.tend, 2-byte offsets from st.offp for those
-  that take one. False on corrupt input. }
+const
+  { Format v5's literal chunks are decoded one at a time, when the
+    sequences get to them, into a buffer of one chunk that stays in the
+    cache; the whole literal stream decoded first went out to memory and
+    came back (silesia.tar, -ec 0: 35 MB of it). The buffer starts with
+    room for the literals of the chunk before that are not used yet:
+    under LITBUF_KEEP, where the fast loops stop. }
+  LITBUF_KEEP = 16;
+  LITBUF_SIZE = LITBUF_KEEP + LIT_CHUNK + 16;
+
+{ Format v5: the next literal chunk, after the literals decoded and not
+  used yet. False on corrupt input, or with no chunk left. }
+function RefillLits4(var st: TDecode4State): Boolean;
+var
+  keep, c, r: SizeInt;
+begin
+  Result := False;
+  keep := st.lend - st.lit;
+  if (st.litLeft <= 0) or (keep > LITBUF_KEEP) then
+    Exit;
+  c := st.litLeft;
+  if c > LIT_CHUNK then
+    c := LIT_CHUNK;
+  Move(st.lit^, (st.litBuf + LITBUF_KEEP - keep)^, keep);
+  r := HufDecodeChunk(st.litSrc, st.litSrcEnd - st.litSrc, st.litBuf + LITBUF_KEEP, c);
+  if r < 0 then
+    Exit;
+  Inc(st.litSrc, r);
+  Dec(st.litLeft, c);
+  st.lit := st.litBuf + LITBUF_KEEP - keep;
+  st.lend := st.litBuf + LITBUF_KEEP + c;
+  Result := True;
+end;
+
+{ A chunk's sequences from st.tok on, exact and fully checked: tokens
+  (with their extensions), 2-byte offsets from st.offp for those that
+  take one. It goes on to st.tend, or stops after a sequence whose
+  literals went on into the next literal chunk (format v5): the fast loop
+  has literals again. False on corrupt input. }
 function DecodeSeqs4(var st: TDecode4State): Boolean;
 var
   tok, offp, lit, op, m: PByte;
   e: UInt32;
-  ll, ml, rep: SizeInt;
+  ll, ml, rep, c: SizeInt;
+  refilled: Boolean;
 begin
   Result := False;
   tok := st.tok;
@@ -5119,7 +5161,8 @@ begin
   lit := st.lit;
   op := st.op;
   rep := st.rep;
-  while tok < st.tend do
+  refilled := False;
+  while (tok < st.tend) and not refilled do
   begin
     e := st.tokens[tok^];
     Inc(tok);
@@ -5136,8 +5179,21 @@ begin
       rep := SizeInt(offp[0] or (UInt32(offp[1]) shl 8)) + 1;
       Inc(offp, 2);
     end;
-    if (ll > st.lend - lit) or (ll > st.oend - op) then
+    if ll > st.oend - op then
       Exit;
+    while ll > st.lend - lit do
+    begin
+      { what is decoded of the run, then the next literal chunk }
+      c := st.lend - lit;
+      Move(lit^, op^, c);
+      Inc(op, c);
+      Dec(ll, c);
+      st.lit := st.lend;
+      if not RefillLits4(st) then
+        Exit;
+      lit := st.lit;
+      refilled := True;
+    end;
     Move(lit^, op^, ll);
     Inc(op, ll);
     Inc(lit, ll);
@@ -5995,7 +6051,7 @@ end;
 
 { The sequence at st.tok if it is an escape and fits what is left of the
   streams and the output, copied exactly; false (nothing done) otherwise:
-  DecodeSafe4 then finishes the block, or rejects it. }
+  DecodeSeqs4 then does it, or rejects it. }
 function DecodeEscape4(var st: TDecode4State): Boolean;
 var
   p, m: PByte;
@@ -6130,49 +6186,53 @@ function sylzc_decode4(st: PDecode4State): SizeInt; cdecl; external name 'sylzc_
 { One chunk of sequences: st.tok .. st.tend with the table st.tokens. }
 function DecodeChunk4(var st: TDecode4State): Boolean;
 begin
+  Result := False;
+  repeat
+    { the fast loop stops at an escape it has no room for, when the
+      literals decoded so far run short, and near the ends of the streams }
 {$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm and not SylzPreferC then
-  begin
-    { the fast loop stops at an escape it has no room for, or at the
-      chunk's last sequences: DecodeEscape4, then DecodeSeqs4, exactly }
-    repeat
-      DecodeFast4X64(@st);
-      if st.status < 0 then
-        Exit(False);
-    until not DecodeEscape4(st);
-    Exit(DecodeSeqs4(st));
-  end;
+    if SylzUseAsm and not SylzPreferC then
+      DecodeFast4X64(@st)
+    else
 {$endif}
 {$ifdef SYLZ_C}
-  if SylzUseAsm then
-    Exit(sylzc_decode4(@st) = 0);
+    if SylzUseAsm then
+      st.status := sylzc_decode4(@st)
+    else
 {$endif}
-  repeat
-    DecodeFast4Pas(st);
+      DecodeFast4Pas(st);
     if st.status < 0 then
-      Exit(False);
-  until not DecodeEscape4(st);
-  Result := DecodeSeqs4(st);
+      Exit;
+    if st.tok >= st.tend then
+      Break;
+    if DecodeEscape4(st) then
+      Continue;
+    if (st.litLeft > 0) and (st.lend - st.lit < LITBUF_KEEP) then
+    begin
+      if not RefillLits4(st) then
+        Exit;
+      Continue;
+    end;
+    { exactly: to the chunk's end, or past a literal run that goes on in
+      the next literal chunk }
+    if not DecodeSeqs4(st) then
+      Exit;
+  until st.tok >= st.tend;
+  Result := True;
 end;
 
-{ A format v4 block's streams into dst: the token chunks at sec, each
-  with SYLZ_TOKENS4 or its own table, then the tail literals. }
-function DecodeStreams4(sec, secEnd, offp, offend, lit, lend, dst: PByte;
-  dstLen: SizeInt): SizeInt;
+{ A format v4 block's sequences into st.op .. st.oend: the token chunks
+  sec .. secEnd, each with SYLZ_TOKENS4 or its own table, then the tail
+  literals. The caller sets the offsets, the literals and the output in
+  st. }
+function DecodeStreams4(var st: TDecode4State; sec, secEnd: PByte): Boolean;
 var
-  st: TDecode4State;
   own: TTable4;
   w: UInt32;
   i: Integer;
+  c: SizeInt;
 begin
-  Result := -1;
-  st.offp := offp;
-  st.lit := lit;
-  st.op := dst;
-  st.offend := offend;
-  st.lend := lend;
-  st.oend := dst + dstLen;
-  st.dst := dst;
+  Result := False;
   st.rep := 1;
   while sec < secEnd do
   begin
@@ -6201,11 +6261,24 @@ begin
       Exit;
     sec := st.tend;
   end;
-  { every offset used; the rest of the literals is the block's tail }
-  if (st.offp <> offend) or (lend - st.lit <> st.oend - st.op) then
+  { every offset used; the rest of the literals, decoded or still in
+    their chunks, is the block's tail }
+  if st.offp <> st.offend then
     Exit;
-  Move(st.lit^, st.op^, lend - st.lit);
-  Result := dstLen;
+  repeat
+    c := st.lend - st.lit;
+    if c > st.oend - st.op then
+      Exit;
+    Move(st.lit^, st.op^, c);
+    Inc(st.op, c);
+    st.lit := st.lend;
+    if st.litLeft = 0 then
+      Break;
+    if not RefillLits4(st) then
+      Exit;
+  until False;
+  { the output filled, and the literal chunks took the rest of the block }
+  Result := (st.op = st.oend) and (st.litSrc = st.litSrcEnd);
 end;
 
 procedure SylzDCtxInit(out dctx: TSylzDCtx);
@@ -6226,12 +6299,12 @@ var
   hdr: UInt32;
   ctrlLen, offLen, litCount, pos, c, r: SizeInt;
   ctrl, cend, send, p: PByte;
+  st: TDecode4State;
 begin
   if n < HEADER_SIZE then
     Exit(-1);
   hdr := PUInt32(src)^;
   send := src + n;
-  offLen := -1;   { not v4 }
   if hdr and HDR_V4 <> 0 then
   begin
     { v4: tokens, offsets, literals (raw, or v3's chunks with bit 31: v5) }
@@ -6244,21 +6317,54 @@ begin
       Exit(-1);
     ctrl := src + HEADER4_SIZE;
     cend := ctrl + ctrlLen + offLen;   { where the literal section starts }
+    st.offp := cend - offLen;
+    st.offend := cend;
+    st.op := dst;
+    st.oend := dst + dstLen;
+    st.dst := dst;
     if hdr and HDR_ENTROPY = 0 then
-      Exit(DecodeStreams4(ctrl, cend - offLen, cend - offLen, cend, cend, send, dst, dstLen));
-  end
-  else
-  begin
-    ctrlLen := hdr and HDR_CTRLMASK;
-    if ctrlLen > n - HEADER_SIZE then
-      Exit(-1);
-    ctrl := src + HEADER_SIZE;
-    cend := ctrl + ctrlLen;
-    if hdr and HDR_ENTROPY = 0 then
-      Exit(DecodeStreams(ctrl, cend, cend, send, dst, dstLen));
+    begin
+      st.lit := cend;
+      st.lend := send;
+      st.litSrc := nil;
+      st.litSrcEnd := nil;
+      st.litLeft := 0;
+      st.litBuf := nil;
+    end
+    else
+    begin
+      { v5: the literal chunks are decoded as the sequences get to them }
+      if send - cend < 4 then
+        Exit(-1);
+      litCount := PUInt32(cend)^;
+      if (litCount > dstLen) or (litCount <= 0) then
+        Exit(-1);
+      if dctx.litsSize < LITBUF_SIZE then
+      begin
+        FreeMem(dctx.lits);
+        dctx.lits := GetMem(LITBUF_SIZE);
+        dctx.litsSize := LITBUF_SIZE;
+      end;
+      st.litBuf := dctx.lits;
+      st.lit := dctx.lits;
+      st.lend := dctx.lits;
+      st.litSrc := cend + 4;
+      st.litSrcEnd := send;
+      st.litLeft := litCount;
+    end;
+    if DecodeStreams4(st, ctrl, cend - offLen) then
+      Exit(dstLen);
+    Exit(-1);
   end;
+  ctrlLen := hdr and HDR_CTRLMASK;
+  if ctrlLen > n - HEADER_SIZE then
+    Exit(-1);
+  ctrl := src + HEADER_SIZE;
+  cend := ctrl + ctrlLen;
+  if hdr and HDR_ENTROPY = 0 then
+    Exit(DecodeStreams(ctrl, cend, cend, send, dst, dstLen));
 
-  { v3 / v5: decode the literal chunks first, then the sequences over them }
+  { v3: decode the literal chunks first, then the sequences over them }
   if send - cend < 4 then
     Exit(-1);
   litCount := PUInt32(cend)^;
@@ -6285,11 +6391,7 @@ begin
   end;
   if p <> send then   { the chunks must take the rest of the block exactly }
     Exit(-1);
-  if offLen >= 0 then
-    Result := DecodeStreams4(ctrl, cend - offLen, cend - offLen, cend,
-      dctx.lits, dctx.lits + litCount, dst, dstLen)
-  else
-    Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
+  Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
 end;
 
 function SylzBlockFormat(src: PByte; n: SizeInt): Integer;

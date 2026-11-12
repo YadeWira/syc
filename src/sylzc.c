@@ -390,17 +390,19 @@ DECODER_INLINE uint8_t *copy_short(uint8_t *op, uintptr_t off, intptr_t ml)
     return op + ml;
 }
 
-/* One chunk of format v4's sequences (DecodeChunk4 in sylz.pas): 0, or
-   -1 on corrupt input.
+/* The fast loop of format v4's decoder (DecodeFast4Pas in sylz.pas): 0
+   when it stops, with everything at the token it stopped at, or -1 on
+   corrupt input.
 
-   The fast loop: a sequence with an exact code takes one token, at most
+   A sequence with an exact code takes one token, at most
    2 offset bytes and 16 literals, and writes inside 64 bytes of output
    (16 literal bytes, then 32 match bytes after at most 16 literals), so
    k = min(tokens, offset bytes / 2, literals / 16, output / 64) of them
    need no bounds check: the inner loop counts k down. The offset is read
    whether the token takes one or not, and chosen without a branch. An
-   escape is checked on its own, then k is counted again. What is left
-   when k = 0 goes through the exact, fully checked loop (DecodeSeqs4). */
+   escape is checked on its own, then k is counted again. The loop stops
+   when k = 0 or an escape has no room for the wide copies: the caller
+   (DecodeChunk4) takes it from there. */
 DECODER_INLINE intptr_t decode4_core(sylzc_d4 *st)
 {
     const uint32_t *tokens = st->tokens;
@@ -467,7 +469,7 @@ escape:
             /* room for the wide copies: 16 literal bytes past the run, 64
                output bytes past the sequence */
             if (ll < 0 || ll > lend - lit - 16 || ll + ml > oend - op - 64)
-                break;   /* the checked loop does this sequence exactly */
+                break;   /* the caller does this sequence exactly */
             if (e & 0xFF0000) {
                 /* k > 0: the offset stream has these 2 bytes */
                 off = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
@@ -497,46 +499,6 @@ escape:
             } else
                 op = copy_short(op, off, ml);
         }
-    }
-    /* DecodeSeqs4 in sylz.pas */
-    while (tok < tend) {
-        uint32_t e = tokens[*tok++];
-        intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
-        if (e & TOK4_LLEXT) {
-            uint8_t b;
-            do {
-                if (tok >= tend)
-                    return -1;
-                b = *tok++;
-                ll += b;
-            } while (b == 255);
-        }
-        if (e & TOK4_MLEXT) {
-            uint8_t b;
-            do {
-                if (tok >= tend)
-                    return -1;
-                b = *tok++;
-                ml += b;
-            } while (b == 255);
-        }
-        if (e & 0xFF0000) {
-            if (offend - offp < 2)
-                return -1;
-            rep = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
-            offp += 2;
-        }
-        if (ll > lend - lit || ll > oend - op)
-            return -1;
-        for (intptr_t i = 0; i < ll; i++)
-            op[i] = lit[i];
-        op += ll;
-        lit += ll;
-        if ((intptr_t)rep > op - dst || ml > oend - op)
-            return -1;
-        const uint8_t *m = op - rep;
-        while (ml-- > 0)
-            *op++ = *m++;
     }
     st->tok = tok;
     st->offp = offp;
