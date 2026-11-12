@@ -445,9 +445,9 @@ var
   got: SizeInt;
   arcPath, suffix: string;
   t0: UInt64;
-  fin_size: Int64;   { the input file's size; -1: stdin }
+  inSize: Int64;   { the input file's size; -1: stdin }
 begin
-  fin_size := -1;
+  inSize := -1;
   Result := EXIT_OK;
   t0 := NowNs;
   written := 0;
@@ -516,7 +516,7 @@ begin
         end;
       if fin is TFileStream then
       begin
-        fin_size := fin.Size;
+        inSize := fin.Size;
         prog := TProgress.Create(opts.progress, fin.Size);
       end
       else
@@ -602,8 +602,8 @@ begin
     ClearWhere;
     if opts.cmd = 'c' then
       StatAdd(total, written)
-    else if fin_size >= 0 then
-      StatAdd(fin_size, total)
+    else if inSize >= 0 then
+      StatAdd(inSize, total)
     else
       StatAdd(0, total);
     if opts.verbosity <> vQuiet then
