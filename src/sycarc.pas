@@ -31,7 +31,7 @@ implementation
 uses
   {$ifdef unix}BaseUnix,{$endif}
   {$ifdef windows}Windows,{$endif}
-  Math, sylz, blake2s, syccdc, syccrypto, sycblocks, sycenc, sycfs, sycfmt;
+  Math, sylz, blake2s, syccdc, syccrypto, sycblocks, sycui, sycenc, sycfs, sycfmt;
 
 { ── small helpers ──────────────────────────────────────────────────────── }
 
@@ -60,22 +60,9 @@ begin
     Result := FormatDateTime('yyyy-mm-dd hh:nn', dt);
 end;
 
-{ 1234567 -> "1.2 MB" }
-function HumanSize(n: Int64): string;
-begin
-  if n < 10000 then
-    Result := IntToStr(n) + ' B'
-  else if n < 10000000 then
-    Result := Format('%.1f kB', [n / 1e3])
-  else if n < Int64(10000000000) then
-    Result := Format('%.1f MB', [n / 1e6])
-  else
-    Result := Format('%.1f GB', [n / 1e9]);
-end;
-
 procedure Warn(const opts: TOptions; const msg: string);
 begin
-  WriteLn(StdErr, 'syc: ', msg);
+  WriteLn(StdErr, WarnTag, msg);
 end;
 
 procedure Note(const opts: TOptions; const msg: string);
@@ -1439,7 +1426,7 @@ procedure WarnDamaged(a: TArchive; var code: Integer);
 begin
   if a.damaged then
   begin
-    WriteLn(StdErr, 'syc: ', a.name, ': data after the last complete version (an interrupted',
+    WriteLn(StdErr, WarnTag, a.name, ': data after the last complete version (an interrupted',
       ' syc a?), ignored');
     code := Max(code, EXIT_WARN);
   end;
@@ -1481,7 +1468,10 @@ var
   vhead: array[0..VHEAD_SIZE - 1] of Byte;
   fs: TFileStream;
   hdrB, pw, rec: TBytes;
+  t0: UInt64;
 begin
+  t0 := NowNs;
+  Phase('a: the archive as it is, the files');
   arcPath := opts.operands[0];
   toStdout := arcPath = '-';
   appending := not toStdout and FileExists(arcPath);
@@ -1536,7 +1526,7 @@ begin
         goodEnd := arc.dataStart;
       if goodEnd < arc.size then
       begin
-        WriteLn(StdErr, Format('syc: %s: %d bytes after the last complete version (an interrupted '
+        WriteLn(StdErr, WarnTag, Format('%s: %d bytes after the last complete version (an interrupted '
           + 'syc a) are cut', [arcPath, arc.size - goodEnd]));
       end;
       FreeAndNil(arc);
@@ -1727,6 +1717,8 @@ begin
         if a.entries[i].kind = ET_FILE then
           Inc(total, a.entries[i].meta.size);
       a.prog := TProgress.Create(opts.progress, total);
+      Phase('a: read, hash, compress');
+      SetWhere(arcPath, -1, -1);
       a.ReadAll;
       for i := 0 to a.count - 1 do
       begin
@@ -1779,11 +1771,17 @@ begin
       end;
       tmpPath := '';
     end;
+    StatAdd(a.totalIn, a.pos - vstart);
     if opts.verbosity <> vQuiet then
+    begin
       WriteLn(StdErr, Format('%s: version %d: %d files, %d directories, %d links added or changed, '
         + '%d deleted, %d unchanged; %d bytes read, %d written, %d in repeated fragments',
         [arcPath, vnum, a.nFiles, a.nDirs, a.nLinks, nDeleted, nSame, a.totalIn, a.pos - vstart,
          a.dupBytes]));
+      WriteLn(StdErr, Format('%s: %s -> %s (%.2f%%)%s', [arcPath, HumanSize(a.totalIn),
+        HumanSize(a.pos - vstart), (a.pos - vstart) * 100.0 / Max(a.totalIn, 1),
+        TimeAndSpeed(a.totalIn, t0)]));
+    end;
     Result := a.status;
   except
     on E: Exception do
@@ -1869,9 +1867,15 @@ var
   st: TEntries;
   filters: array of string;
   i, n, v, upTo: SizeInt;
-  shown: Int64;
+  shown, shownFiles, shownBytes: Int64;
+  pretty: Boolean;
 begin
   Result := EXIT_OK;
+  { on a terminal: colours, rounded sizes and a total; into a pipe or a
+    file the plain lines, as scripts read them }
+  pretty := IsTerminal(1);
+  shownFiles := 0;
+  shownBytes := 0;
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
     filters[i - 1] := StoredPath(opts.operands[i]);
@@ -1907,17 +1911,26 @@ begin
       line := st[i].path;
       if st[i].kind = ET_DELETED then
       begin
-        WriteLn(Format('%5d  %s', [st[i].ver, line + '  (deleted)']));
+        WriteLn(Format('%5d  %s', [st[i].ver, line + Paint(1, stDim, '  (deleted)')]));
         Inc(shown);
         Continue;
       end;
       if st[i].kind = ET_DIR then
-        line := line + '/'
+        line := Paint(1, stDir, line + '/')
       else if st[i].kind = ET_SYMLINK then
-        line := line + ' -> ' + st[i].meta.target;
+        line := Paint(1, stLink, line) + ' -> ' + st[i].meta.target
+      else
+      begin
+        Inc(shownFiles);
+        Inc(shownBytes, st[i].meta.size);
+      end;
       if opts.longList then
-        line := Format('%s %14d  %s  %s', [ModeString(st[i]), st[i].meta.size,
-          FormatTime(st[i].meta.mtime div 1000000000, False), line]);
+        if pretty and (opts.verbosity <> vVerbose) then
+          line := Format('%s %10s  %s  %s', [ModeString(st[i]), HumanSize(st[i].meta.size),
+            FormatTime(st[i].meta.mtime div 1000000000, False), line])
+        else
+          line := Format('%s %14d  %s  %s', [ModeString(st[i]), st[i].meta.size,
+            FormatTime(st[i].meta.mtime div 1000000000, False), line]);
       if opts.allVersions then
         line := Format('%5d  %s', [st[i].ver, line]);
       WriteLn(line);
@@ -1925,9 +1938,12 @@ begin
     end;
     if (Length(filters) > 0) and (shown = 0) then
     begin
-      WriteLn(StdErr, 'syc: nothing matches');
+      WriteLn(StdErr, WarnTag, 'nothing matches');
       Result := Max(Result, EXIT_WARN);
-    end;
+    end
+    else if pretty and opts.longList and (opts.verbosity <> vQuiet) then
+      WriteLn(Paint(1, stDim, Format('%d entries, %d files, %s (%d bytes)',
+        [shown, shownFiles, HumanSize(shownBytes), shownBytes])));
   finally
     a.Free;
     if tmp <> '' then
@@ -1945,16 +1961,36 @@ var
   files, dirs, links, deleted, added, newData, stored: Int64;
   st: TEntries;
   totalFiles, totalSize, uniq: Int64;
+  pretty: Boolean;
+  nBlocks, rawBytes, packedBytes: Int64;
+  what: string;
 begin
   Result := EXIT_OK;
   a := OpenArchive(opts.operands[0], tmp, False, opts);
   try
     WarnDamaged(a, Result);
-    WriteLn(Format('%s: %d version(s), %d bytes, fragments %d / %d / %d KiB (min / average / max)',
-      [a.name, Length(a.versions), a.size, a.prm.minSize shr 10, a.prm.avgSize shr 10,
+    { on a terminal rounded sizes (-v: exact); elsewhere the exact ones,
+      as scripts read them }
+    pretty := IsTerminal(1) and (opts.verbosity <> vVerbose);
+    WriteLn(Paint(1, stHead, a.name), Format(': %d version(s), %d bytes, fragments %d / %d / %d KiB (min / average / max)',
+      [Length(a.versions), a.size, a.prm.minSize shr 10, a.prm.avgSize shr 10,
        a.prm.maxSize shr 10]));
+    if opts.verbosity = vVerbose then
+    begin
+      what := Format('archive format %d', [a.fmt]);
+      if a.enc and a.indexEnc then
+        what := what + ', encrypted (data and index)'
+      else if a.enc then
+        what := what + ', encrypted (data; the index is readable)'
+      else
+        what := what + ', not encrypted';
+      WriteLn(what);
+    end;
     WriteLn;
-    WriteLn('version  date                   files   dirs  links  deleted           added        new data          stored');
+    if pretty then
+      WriteLn(Paint(1, stHead, 'version  date                   files   dirs  links  deleted       added    new data      stored'))
+    else
+      WriteLn('version  date                   files   dirs  links  deleted           added        new data          stored');
     for i := 0 to High(a.versions) do
       with a.versions[i] do
       begin
@@ -1973,8 +2009,30 @@ begin
         for j := 0 to High(idx.frags) do
           Inc(newData, idx.frags[j].size);
         stored := commitPos + COMMIT_SIZE - vstart;
-        WriteLn(Format('%7d  %s  %6d %6d %6d %8d %15d %15d %15d',
-          [vnum, FormatTime(time, True), files, dirs, links, deleted, added, newData, stored]));
+        if pretty then
+          WriteLn(Format('%7d  %s  %6d %6d %6d %8d %11s %11s %11s',
+            [vnum, FormatTime(time, True), files, dirs, links, deleted, HumanSize(added),
+             HumanSize(newData), HumanSize(stored)]))
+        else
+          WriteLn(Format('%7d  %s  %6d %6d %6d %8d %15d %15d %15d',
+            [vnum, FormatTime(time, True), files, dirs, links, deleted, added, newData, stored]));
+        if opts.verbosity = vVerbose then
+        begin
+          { the version's blocks, and its index }
+          nBlocks := 0;
+          rawBytes := 0;
+          packedBytes := 0;
+          for j := 0 to High(a.blocks) do
+            if a.blocks[j].ver = i then
+            begin
+              Inc(nBlocks);
+              Inc(rawBytes, a.blocks[j].rawLen);
+              Inc(packedBytes, a.blocks[j].bytes);
+            end;
+          WriteLn(Format('         %d block(s): %d -> %d bytes (%.2f%%); %d new fragment(s); index %d bytes; at offset %d',
+            [nBlocks, rawBytes, packedBytes, packedBytes * 100.0 / Max(rawBytes, 1),
+             Length(idx.frags), indexBytes, vstart]));
+        end;
       end;
     st := a.State(Length(a.versions));
     totalFiles := 0;
@@ -2050,6 +2108,7 @@ var
   nb, b, done: SizeInt;
   checkedBytes, total: Int64;
   prog: TProgress;
+  t0: UInt64;
 
   { the block in slot s: decoded, its CRC and its fragments' hashes
     checked by the job }
@@ -2061,6 +2120,7 @@ var
     pipe.Finish(s);
     job := pipe.jobs[s];
     blk := @a.blocks[done];
+    SetWhere(name, done, blk^.pos);
     if (not job.ok) and (job.failed = -1) then
       a.Corrupt(Format('the block at offset %d does not authenticate (changed, moved or from '
         + 'another archive)', [blk^.pos]));
@@ -2077,6 +2137,8 @@ var
   s: SizeInt;
 begin
   Result := EXIT_OK;
+  t0 := NowNs;
+  Phase('t: the index of ' + name);
   a := TArchive.Open(path, name, False, True, opts);
   pipe := nil;
   prog := nil;
@@ -2093,6 +2155,7 @@ begin
     for b := 0 to nb - 1 do
       Inc(total, a.blocks[b].rawLen);
     prog := TProgress.Create(opts.progress, total);
+    Phase('t: the blocks of ' + name);
     done := 0;
     checkedBytes := 0;
     for b := 0 to nb - 1 do
@@ -2106,9 +2169,12 @@ begin
     while done < nb do
       CheckSlot(done mod pipe.Slots);
     prog.Finish;
+    ClearWhere;
+    StatAdd(a.size, checkedBytes);
     if opts.verbosity <> vQuiet then
-      WriteLn(StdErr, Format('%s: ok, %d version(s), %d fragments, %d bytes checked',
-        [name, Length(a.versions), Length(a.fragSize), checkedBytes]));
+      WriteLn(StdErr, Format('%s: %s, %d version(s), %d fragments, %d bytes checked%s',
+        [name, Paint(2, stOk, 'ok'), Length(a.versions), Length(a.fragSize), checkedBytes,
+         TimeAndSpeed(checkedBytes, t0)]));
   finally
     if prog <> nil then
       prog.Finish;
@@ -2231,7 +2297,10 @@ var
   fout: TStream;
   exists: Boolean;
   total: Int64;
+  t0: UInt64;
 begin
+  t0 := NowNs;
+  Phase('x: the index, what to extract');
   x := TExtractor.Create;
   x.opts := opts;
   x.status := EXIT_OK;
@@ -2254,7 +2323,7 @@ begin
     SetLength(sel, n);
     if (Length(filters) > 0) and (n = 0) then
     begin
-      WriteLn(StdErr, 'syc: nothing matches');
+      WriteLn(StdErr, WarnTag, 'nothing matches');
       Exit(Max(x.status, EXIT_WARN));
     end;
 
@@ -2283,7 +2352,7 @@ begin
         local := LocalPath(x.outDir, sel[i].path);
         if not x.SafeParents(sel[i].path) then
         begin
-          WriteLn(StdErr, 'syc: ', local, ': a directory on the way is a symlink, skipped');
+          WriteLn(StdErr, WarnTag, local, ': a directory on the way is a symlink, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Continue;
@@ -2295,7 +2364,7 @@ begin
           Continue;
         if DirectoryExists(local) and not IsLink(local) then
         begin
-          WriteLn(StdErr, 'syc: ', local, ': a directory is in the way, skipped');
+          WriteLn(StdErr, WarnTag, local, ': a directory is in the way, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
         end
@@ -2306,7 +2375,7 @@ begin
           act[i] := acSkip;
           if not opts.skipExisting then
           begin
-            WriteLn(StdErr, 'syc: ', local, ' exists, skipped (-f replaces, --skip is silent)');
+            WriteLn(StdErr, WarnTag, local, ' exists, skipped (-f replaces, --skip is silent)');
             x.status := Max(x.status, EXIT_WARN);
           end;
         end;
@@ -2340,6 +2409,8 @@ begin
       if (act[i] <> acSkip) and (sel[i].kind = ET_FILE) then
         Inc(total, sel[i].meta.size);
     x.prog := TProgress.Create(opts.progress, total);
+    Phase('x: read, decompress, write');
+    SetWhere(x.a.name, -1, -1);
     for k := 0 to x.pipe.Slots - 1 do
       x.StartAccess(k);
 
@@ -2367,7 +2438,7 @@ begin
             begin
               if not ForceDirectories(local) then
               begin
-                WriteLn(StdErr, 'syc: ', local, ': cannot create the directory');
+                WriteLn(StdErr, WarnTag, local, ': cannot create the directory');
                 x.status := Max(x.status, EXIT_WARN);
               end;
               Inc(x.nDirs);
@@ -2377,7 +2448,7 @@ begin
               part := ExtractFileDir(local);
               if (part <> '') and not ForceDirectories(part) then
               begin
-                WriteLn(StdErr, 'syc: ', part, ': cannot create the directory');
+                WriteLn(StdErr, WarnTag, part, ': cannot create the directory');
                 Fail(EXIT_FATAL, 'cannot go on: the files under it would be out of order');
               end;
               try
@@ -2385,7 +2456,7 @@ begin
               except
                 on EFCreateError do
                 begin
-                  WriteLn(StdErr, 'syc: ', local, ': cannot create, skipped');
+                  WriteLn(StdErr, WarnTag, local, ': cannot create, skipped');
                   x.status := Max(x.status, EXIT_WARN);
                   fout := TDiscard.Create;
                   try
@@ -2408,14 +2479,14 @@ begin
               if (act[i] = acReplace) and not RemoveFile(local) then
               begin
                 SysUtils.DeleteFile(local + TMP_SUFFIX);
-                WriteLn(StdErr, 'syc: ', local, ': cannot replace it');
+                WriteLn(StdErr, WarnTag, local, ': cannot replace it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
               if not ReplaceFile(local + TMP_SUFFIX, local) then
               begin
                 SysUtils.DeleteFile(local + TMP_SUFFIX);
-                WriteLn(StdErr, 'syc: ', local, ': cannot create it (from ', local + TMP_SUFFIX, ')');
+                WriteLn(StdErr, WarnTag, local, ': cannot create it (from ', local + TMP_SUFFIX, ')');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
@@ -2435,13 +2506,13 @@ begin
             ForceDirectories(part);
           if (act[i] = acReplace) and not RemoveFile(local) then
           begin
-            WriteLn(StdErr, 'syc: ', local, ': cannot replace it');
+            WriteLn(StdErr, WarnTag, local, ': cannot replace it');
             x.status := Max(x.status, EXIT_WARN);
             Continue;
           end;
           if not MakeSymlink(sel[i].meta, local) then
           begin
-            WriteLn(StdErr, 'syc: ', local, ': cannot create the symlink');
+            WriteLn(StdErr, WarnTag, local, ': cannot create the symlink');
             x.status := Max(x.status, EXIT_WARN);
             Continue;
           end;
@@ -2453,9 +2524,10 @@ begin
       for i := n - 1 downto 0 do
         if (act[i] <> acSkip) and (sel[i].kind = ET_DIR) then
           ApplyMeta(LocalPath(x.outDir, sel[i].path), sel[i].meta, opts.noPerms, opts.noOwner);
+      StatAdd(x.a.size, x.bytesOut);
       if opts.verbosity <> vQuiet then
-        WriteLn(StdErr, Format('%s: %d files, %d directories, %d links extracted (%d bytes)',
-          [x.a.name, x.nFiles, x.nDirs, x.nLinks, x.bytesOut]));
+        WriteLn(StdErr, Format('%s: %d files, %d directories, %d links extracted (%d bytes)%s',
+          [x.a.name, x.nFiles, x.nDirs, x.nLinks, x.bytesOut, TimeAndSpeed(x.bytesOut, t0)]));
     end;
     Result := x.status;
   finally

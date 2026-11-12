@@ -13,6 +13,17 @@ FPC=${FPC:-fpc}
 . ./build-c.sh
 mkdir -p out/units
 build_c out/units "$@"
+# what syc -V and syc report say it was built from (src/sycbuild.pas, compiled
+# again each time); SYC_COMMIT in the environment overrides, for a build
+# outside a git checkout
+if [ -z "$SYC_COMMIT" ]; then
+  SYC_COMMIT=$(git rev-parse --short=12 HEAD 2>/dev/null) || SYC_COMMIT=unknown
+  SYC_COMMIT_DATE=$(git log -1 --format=%cs 2>/dev/null) || SYC_COMMIT_DATE=unknown
+  [ "$SYC_COMMIT" = unknown ] || git diff --quiet HEAD 2>/dev/null ||
+    SYC_COMMIT="$SYC_COMMIT, with changes"
+fi
+export SYC_COMMIT SYC_COMMIT_DATE="${SYC_COMMIT_DATE:-unknown}"
+rm -f out/units/sycbuild.*
 for prog in src/syc.pas bench/sylzbench.pas; do
   "$FPC" -O3 -XX -Xs -CX -vewn -FUout/units -Foout/units -Fusrc -FEout "$@" "$prog"
 done

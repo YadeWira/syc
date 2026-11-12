@@ -21,7 +21,7 @@ implementation
 uses
   {$ifdef unix}Unix,{$endif}
   {$ifdef windows}Windows,{$endif}
-  SysUtils, Classes, Math, syccrypto, sycblocks, sycenc, sycfmt;
+  SysUtils, Classes, Math, syccrypto, sycblocks, sycui, sycenc, sycfmt;
 
 const
   STREAM_MAGIC = 'SYZ0';
@@ -62,7 +62,7 @@ begin
   except
     on E: EFOpenError do
     begin
-      WriteLn(StdErr, 'syc: ', name, ': cannot open for writing, skipped');
+      WriteLn(StdErr, WarnTag, name, ': cannot open for writing, skipped');
       Exit(EXIT_WARN);
     end;
   end;
@@ -134,18 +134,20 @@ begin
     for i := 0 to High(opts.operands) do
     begin
       try
+        SetWhere(opts.operands[i], -1, -1);
         r := ChangeOne(opts, opts.operands[i], oldPw, newPw);
       except
         on E: ESycError do
         begin
           if E.code = EXIT_USAGE then
             raise;
-          WriteLn(StdErr, 'syc: ', E.Message);
+          ShowError(E, E.code);
           r := E.code;
         end;
         on E: EStreamError do
         begin
-          WriteLn(StdErr, 'syc: ', opts.operands[i], ': ', E.Message);
+          E.Message := opts.operands[i] + ': ' + E.Message;
+          ShowError(E, EXIT_FATAL);
           r := EXIT_FATAL;
         end;
       end;
