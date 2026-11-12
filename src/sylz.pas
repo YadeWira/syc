@@ -120,7 +120,7 @@ type
     flags: Integer;      { of the current call }
     offs: PByte;         { format v4: the offset stream's scratch buffer }
     offsSize: SizeInt;
-    recs: PUInt32;       { format v4: a chunk's sequences }
+    recs: PUInt16;       { format v4: a chunk's sequences }
   end;
 
 
@@ -405,6 +405,13 @@ const
   TAB4_EXT    = 31;
   TAB4_EXT_ML = 63;
   TAB4_REP    = $800;
+  { levels 0..3 count one sequence in this many for a chunk's table }
+  FAST_SAMPLE4 = 8;
+  { A recorded sequence: three u16, literals, match length, distance - 1;
+    literals = REC4_ESC: the lengths follow as two u32 (and 4 unused
+    bytes), REC4_LONG records in all. }
+  REC4_ESC  = $FFFF;
+  REC4_LONG = 3;
 
 type
   { The codes of a token table; sylzc.c reads it by these offsets. exact:
@@ -430,19 +437,21 @@ type
     v4: Boolean;      { format v4: ctrl holds tokens only, offsets go to offs }
     offs, off: PByte;
     rep: SizeInt;     { v4: the previous sequence's distance }
-    { v4: the sequences not yet written as tokens, (literals, match,
-      distance) each; the distance before them; the last chunk's codes
-      (TCodes4) and a count of the chunks, for the optimal parser's prices }
-    recs, rec, recEnd: PUInt32;
+    { v4: the sequences not yet written as tokens (PutRec4); the distance
+      before them; the last chunk's codes and a count of the chunks, for
+      the optimal parser's prices }
+    recs, rec, recEnd: PUInt16;
     tokRep: SizeInt;
     codes: TCodes4;
     codesGen: SizeInt;
+    sample: SizeInt;  { chunk tables from one sequence in this many }
+    roomy: Boolean;   { dst holds SylzBound(n): no sequence can run out of room }
     failed: Boolean;  { a flush called from C found no room }
   end;
   PEmit = ^TEmit;
 
 procedure EmitInit(out e: TEmit; dst: PByte; cap: SizeInt; scratch, srcEnd: PByte;
-  flags: Integer; offs: PByte; recs: PUInt32);
+  flags: Integer; offs: PByte; recs: PUInt16);
 begin
   e.v4 := flags and SYLZ_V4 <> 0;
   e.offs := offs;
@@ -450,9 +459,11 @@ begin
   e.rep := 1;
   e.recs := recs;
   e.rec := recs;
-  e.recEnd := recs + 3 * CHUNK4_SEQS;
+  e.recEnd := recs + 3 * (CHUNK4_SEQS - REC4_LONG);
+  e.roomy := False;
   e.tokRep := 1;
   e.codesGen := 0;
+  e.sample := 1;
   e.failed := False;
   e.srcEnd := srcEnd;
   e.entropy := flags and SYLZ_ENTROPY <> 0;
@@ -856,40 +867,81 @@ end;
 { The recorded sequences as a chunk of the token stream: its header, its
   table if one of its own pays for itself, its tokens; their offsets to
   the offset stream. False when dst has no room. }
+{ The record at r: its lengths and distance; r moves past it. }
+procedure GetRec4(var r: PUInt16; out ll, ml, dist: SizeInt); inline;
+begin
+  ll := r[0];
+  ml := r[1];
+  dist := SizeInt(r[2]) + 1;
+  Inc(r, 3);
+  if ll = REC4_ESC then
+  begin
+    ll := PUInt32(r)^;
+    ml := PUInt32(r + 2)^;
+    Inc(r, 6);
+  end;
+end;
+
+{$ifdef SYLZ_C}
+type
+  { sylzc_put4 in sylzc.c: fixed field order }
+  TPut4C = record
+    rec, rend: PUInt16;
+    p, off: PByte;             { in/out: token and offset write pointers }
+    prev: SizeInt;             { in/out: the distance before the records }
+    codes: Pointer;            { TCodes4 }
+  end;
+
+procedure sylzc_put_chunk4(st: Pointer); cdecl; external name 'sylzc_put_chunk4';
+{$endif}
+
+{ The recorded sequences as a chunk of the token stream: its header, its
+  table if one of its own pays for itself, its tokens; their offsets to
+  the offset stream. False when dst has no room. }
 function FlushChunk4(var e: TEmit): Boolean;
 var
   cnt: TPairCounts4;
   t: TTable4;
   c: TCodes4;
-  r, rend: PUInt32;
-  head, p, limit: PByte;
-  prev, k, row, col, ll, ml, miss, staticMiss, i: SizeInt;
+  r, rend: PUInt16;
+  head, p, limit, off: PByte;
+  prev, k, row, col, ll, ml, dist, miss, staticMiss, i, code: SizeInt;
   staticOk, own: Boolean;
+{$ifdef SYLZ_C}
+  pc: TPut4C;
+{$endif}
 begin
   Result := True;
   if e.rec = e.recs then
     Exit;
   rend := e.rec;
   e.rec := e.recs;
-  { the kind of each sequence (into bit 31 of its distance), and what it
-    looks up }
+  { what the sequences look up: all of them, or one record in e.sample
+    (the fast levels: the count costs as much as the search saves; a
+    record with its lengths in the next ones is then read as it is, and
+    so are those: a few stray counts) }
   FillChar(cnt, SizeOf(cnt), 0);
-  prev := e.tokRep;
   r := e.recs;
-  while r < rend do
-  begin
-    k := Ord(SizeInt(r[2]) = prev);
-    prev := r[2];
-    ll := r[0];
-    ml := r[1];
-    if PairOf4(ll, ml, row, col) then
-      Inc(cnt[k, row, col]);
-    r[2] := r[2] or (UInt32(k) shl 31);
-    Inc(r, 3);
-  end;
-  e.tokRep := prev;
+  prev := e.tokRep;
+  if e.sample = 1 then
+    while r < rend do
+    begin
+      GetRec4(r, ll, ml, dist);
+      if PairOf4(ll, ml, row, col) then
+        Inc(cnt[Ord(dist = prev), row, col]);
+      prev := dist;
+    end
+  else
+    while r < rend do
+    begin
+      if r > e.recs then
+        prev := SizeInt(r[-1]) + 1;
+      if PairOf4(r[0], r[1], row, col) then
+        Inc(cnt[Ord(SizeInt(r[2]) + 1 = prev), row, col]);
+      Inc(r, 3 * e.sample);
+    end;
   miss := BuildTable4(cnt, t, c, staticMiss, staticOk);
-  own := not staticOk or (miss + TABLE4_BYTES < staticMiss);
+  own := not staticOk or ((miss - staticMiss) * e.sample + TABLE4_BYTES < 0);
   { room: what is left of dst after the offsets and literals so far }
   limit := e.oend - (e.off - e.offs) - (e.lit - e.lits);
   head := e.ctrl;
@@ -910,25 +962,51 @@ begin
     e.codes := Codes4;
   Inc(e.codesGen);
   r := e.recs;
+  prev := e.tokRep;
+  off := e.off;
+{$ifdef SYLZ_C}
+  if SylzUseAsm and e.roomy then
+  begin
+    pc.rec := r;
+    pc.rend := rend;
+    pc.p := p;
+    pc.off := off;
+    pc.prev := prev;
+    pc.codes := @e.codes;
+    sylzc_put_chunk4(@pc);
+    p := pc.p;
+    off := pc.off;
+    prev := pc.prev;
+    r := rend;
+  end;
+{$endif}
   while r < rend do
   begin
-    ll := r[0];
-    ml := r[1];
-    k := r[2] shr 31;
+    GetRec4(r, ll, ml, dist);
+    k := Ord(dist = prev);
+    prev := dist;
     { the tokens of a sequence, at most: 2 and a literal extension, 3 and
       the rest of a split match or a match extension; and its offset }
-    if p + 8 + ll div 255 + ml div 255 + 2 > limit then
+    if p + 8 + ll shr 8 + ml shr 8 + 2 > limit then
       Exit(False);
-    p := PutTokens4(e.codes, p, k, ll, ml);
-    if k = 0 then
+    code := 255;
+    if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
+      code := e.codes.exact[k, ll, ml];
+    if code <> 255 then
     begin
-      e.off[0] := Byte(r[2] - 1);
-      e.off[1] := Byte((r[2] - 1) shr 8);
-      Inc(e.off, 2);
-      Dec(limit, 2);
-    end;
-    Inc(r, 3);
+      p^ := Byte(code);
+      Inc(p);
+    end
+    else
+      p := PutTokens4(e.codes, p, k, ll, ml);
+    { written either way, kept if the sequence takes it }
+    off[0] := Byte(dist - 1);
+    off[1] := Byte((dist - 1) shr 8);
+    Inc(off, 2 - 2 * k);
+    Dec(limit, 2 - 2 * k);
   end;
+  e.off := off;
+  e.tokRep := prev;
   i := p - head - 4;
   if own then
   begin
@@ -941,17 +1019,28 @@ begin
 end;
 
 { EmitSequence for format v4: the sequence is recorded, and its literals
-  copied; FlushChunk4 writes the tokens and offsets of CHUNK4_SEQS
+  copied; FlushChunk4 writes the tokens and offsets of a chunk of
   sequences at a time. A match at the previous sequence's offset may be
   as short as SYLZ_MINREP. }
 function EmitSequence4(var e: TEmit; lit: PByte; litLen, dist, matchLen: SizeInt): Boolean;
 begin
-  if (e.rec = e.recEnd) and not FlushChunk4(e) then
+  if (e.rec >= e.recEnd) and not FlushChunk4(e) then
     Exit(False);
-  e.rec[0] := UInt32(litLen);
-  e.rec[1] := UInt32(matchLen);
-  e.rec[2] := UInt32(dist);
-  Inc(e.rec, 3);
+  e.rec[2] := UInt16(dist - 1);
+  if (litLen < REC4_ESC) and (matchLen <= $FFFF) then
+  begin
+    e.rec[0] := UInt16(litLen);
+    e.rec[1] := UInt16(matchLen);
+    Inc(e.rec, 3);
+  end
+  else
+  begin
+    e.rec[0] := REC4_ESC;
+    e.rec[1] := 0;
+    PUInt32(e.rec + 3)^ := UInt32(litLen);
+    PUInt32(e.rec + 5)^ := UInt32(matchLen);
+    Inc(e.rec, 3 * REC4_LONG);
+  end;
   e.rep := dist;
   if (litLen <= 16) and (lit + 16 <= e.srcEnd) then
     Copy16(e.lit, lit)
@@ -1563,7 +1652,7 @@ type
     srcEnd: PByte;
     exact: PByte;              { ExactCode }
     rep: SizeInt;              { format v4: the previous sequence's distance }
-    rec, recEnd: PUInt32;      { v4: where the next sequence is recorded }
+    rec, recEnd: PUInt16;      { v4: where the next sequence is recorded }
     flush: Pointer;            { v4: called with this record when rec = recEnd }
     owner: Pointer;            { v4: the TEmit }
   end;
@@ -1644,6 +1733,8 @@ begin
   begin
     FillChar(table^, SizeOf(UInt16) shl hashLog, 0);
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+    e.roomy := cap >= SylzBound(n);
+    e.sample := FAST_SAMPLE4;
 {$ifdef SYLZ_ASM_X64}
     if SylzUseAsm and not e.v4 and not SylzPreferC and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
     begin
@@ -2313,6 +2404,8 @@ begin
     hashLog := MID_MAXLOG;
   FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+  e.roomy := cap >= SylzBound(n);
+  e.sample := FAST_SAMPLE4;
 {$ifdef SYLZ_ASM_X64}
   if SylzUseAsm and not e.v4 and not SylzPreferC and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
   begin
@@ -2862,6 +2955,7 @@ begin
   for i := 0 to (1 shl HC_HASHLOG) - 1 do
     s.head[i] := 0;
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+  e.roomy := cap >= SylzBound(n);
 {$ifdef SYLZ_C}
   { the parse in C (FPC kept its many live values on the stack), over the
     assembler chain search on x86_64 }
@@ -3915,6 +4009,7 @@ begin
   b.cut := p.btCut;
   b.maxLen := p.btMaxLen;
   EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+  e.roomy := cap >= SylzBound(n);
   Result := CompressOptCore(src, n, e, b, ctx.opt, p, nil, nil);
 end;
 
@@ -3997,10 +4092,12 @@ begin
     ResetTree;
     { nothing is emitted in this pass, but the parse depends on the format }
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+    e.roomy := cap >= SylzBound(n);
     CompressOptCore(src, n, e, b, ctx.opt, p, nil, hist);
     LiteralPrices(hist, regions, prices);
     ResetTree;
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+    e.roomy := cap >= SylzBound(n);
     Result := CompressOptCore(src, n, e, b, ctx.opt, p, prices, nil);
   finally
     FreeMem(prices);
@@ -4046,7 +4143,7 @@ begin
     ctx.offs := GetMem(ctx.offsSize);
   end;
   if (flags and SYLZ_V4 <> 0) and (ctx.recs = nil) then
-    ctx.recs := GetMem(3 * SizeOf(UInt32) * CHUNK4_SEQS);
+    ctx.recs := GetMem(3 * SizeOf(UInt16) * CHUNK4_SEQS);
   if level < SYLZ_MINLEVEL then
     level := SYLZ_MINLEVEL;
   if flags and SYLZ_ENTROPY <> 0 then

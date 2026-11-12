@@ -592,7 +592,8 @@ static uint64_t read64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8
 
 /* CountMatch in sylz.pas: the common prefix of a and b, a not read at or
    past limit (b is behind a) */
-static intptr_t count_match(const uint8_t *a, const uint8_t *b, const uint8_t *limit)
+static inline __attribute__((always_inline)) intptr_t count_match_inl(const uint8_t *a,
+    const uint8_t *b, const uint8_t *limit)
 {
     const uint8_t *start = a;
     while (limit - a >= 8) {
@@ -619,6 +620,11 @@ static intptr_t count_match(const uint8_t *a, const uint8_t *b, const uint8_t *l
     return a - start;
 }
 
+static intptr_t count_match(const uint8_t *a, const uint8_t *b, const uint8_t *limit)
+{
+    return count_match_inl(a, b, limit);
+}
+
 /* FastDist in sylz.pas: the distance from pos to a stored low-16-bit
    position, 0 meaning 65536 */
 static intptr_t fast_dist(intptr_t pos, uint16_t stored)
@@ -633,7 +639,7 @@ typedef struct {
     const uint8_t *srcEnd;        /* bounds the wide literal reads */
     const uint8_t *exact;         /* ExactCode[0..EXACT_LL][0..EXACT_M] */
     intptr_t rep;                 /* format v4: the previous sequence's distance */
-    uint32_t *rec, *recEnd;       /* v4: where the next sequence is recorded */
+    uint16_t *rec, *recEnd;       /* v4: where the next sequence is recorded */
     void (*flush)(void *);        /* v4: called with this struct when rec == recEnd */
     void *owner;                  /* v4: sylz.pas's TEmit */
 } sylzc_emit;
@@ -699,17 +705,32 @@ static void emit_sequence(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
     e->lit += litLen;
 }
 
-/* EmitSequence4 in sylz.pas: the sequence is recorded (sylz.pas writes
-   the tokens, a chunk at a time) and its literals copied */
+/* EmitSequence4 in sylz.pas: the sequence is recorded (three u16:
+   literals, match length, distance - 1; literals = 0xFFFF: the lengths
+   follow as two u32) and its literals copied. sylz.pas writes the
+   tokens, a chunk at a time. */
 static void emit_sequence4(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
                            intptr_t dist, intptr_t matchLen)
 {
-    if (e->rec == e->recEnd)
+    uint16_t *r;
+    if (e->rec >= e->recEnd)
         e->flush(e);
-    e->rec[0] = (uint32_t)litLen;
-    e->rec[1] = (uint32_t)matchLen;
-    e->rec[2] = (uint32_t)dist;
-    e->rec += 3;
+    r = e->rec;
+    r[2] = (uint16_t)(dist - 1);
+    if (__builtin_expect(litLen < 0xFFFF && matchLen <= 0xFFFF, 1)) {
+        r[0] = (uint16_t)litLen;
+        r[1] = (uint16_t)matchLen;
+        e->rec = r + 3;
+    } else {
+        uint32_t v;
+        r[0] = 0xFFFF;
+        r[1] = 0;
+        v = (uint32_t)litLen;
+        __builtin_memcpy(r + 3, &v, 4);
+        v = (uint32_t)matchLen;
+        __builtin_memcpy(r + 5, &v, 4);
+        e->rec = r + 9;
+    }
     e->rep = dist;
     if (litLen <= 16 && e->srcEnd - lit >= 16)
         copy16(e->lit, lit);
@@ -717,6 +738,150 @@ static void emit_sequence4(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
         for (intptr_t i = 0; i < litLen; i++)
             e->lit[i] = lit[i];
     e->lit += litLen;
+}
+
+/* emit_sequence4 for a loop that keeps the record and literal write
+   pointers in registers (rec, lit: its locals; e's copies are current
+   only around a flush). The caller keeps the previous distance itself. */
+static inline __attribute__((always_inline)) void emit_fast4(sylzc_emit *e,
+    uint16_t **prec, uint8_t **plit, const uint8_t *lit, intptr_t litLen,
+    intptr_t dist, intptr_t matchLen)
+{
+    uint16_t *r = *prec;
+    uint8_t *w = *plit;
+    if (__builtin_expect(r >= e->recEnd, 0)) {
+        e->rec = r;
+        e->lit = w;
+        e->flush(e);
+        r = e->rec;
+    }
+    r[2] = (uint16_t)(dist - 1);
+    if (__builtin_expect(litLen < 0xFFFF && matchLen <= 0xFFFF, 1)) {
+        r[0] = (uint16_t)litLen;
+        r[1] = (uint16_t)matchLen;
+        r += 3;
+    } else {
+        uint32_t v;
+        r[0] = 0xFFFF;
+        r[1] = 0;
+        v = (uint32_t)litLen;
+        __builtin_memcpy(r + 3, &v, 4);
+        v = (uint32_t)matchLen;
+        __builtin_memcpy(r + 5, &v, 4);
+        r += 9;
+    }
+    *prec = r;
+    if (__builtin_expect(litLen <= 16 && e->srcEnd - lit >= 16, 1))
+        copy16(w, lit);
+    else
+        for (intptr_t i = 0; i < litLen; i++)
+            w[i] = lit[i];
+    *plit = w + litLen;
+}
+
+/* PutPair4 in sylz.pas */
+static uint8_t *put_pair4(const struct sylzc_codes4 *t, uint8_t *p, int k,
+                          intptr_t ll, intptr_t ml)
+{
+    int c = t->exact[k][ll][ml];
+    if (c == 255) {
+        *p++ = t->exact[1][ll][0];
+        c = t->exact[k][0][ml];
+    }
+    *p++ = (uint8_t)c;
+    return p;
+}
+
+/* PutTokens4 in sylz.pas, past its first case: a sequence with no exact
+   code */
+static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 *t,
+    uint8_t *p, int k, intptr_t ll, intptr_t ml)
+{
+    intptr_t part;
+    if (ml <= MAX_ML4 && t->llx[k][ml] != 255
+        && (ll > LIT_SPLIT4 || (ll > MAX_LL4 && k == 0 && ml == MINMATCH))) {
+        *p++ = t->llx[k][ml];
+        put_ext(&p, ll);
+        return p;
+    }
+    if (ll > LIT_SPLIT4) {
+        *p++ = t->litx;
+        put_ext(&p, ll);
+        ll = 0;
+    } else if (ll > MAX_LL4) {
+        *p++ = t->exact[1][MAX_LL4][0];
+        ll -= MAX_LL4;
+    }
+    if (ml > ML_SPLIT4) {
+        if (ll > 0)
+            *p++ = t->exact[1][ll][0];
+        *p++ = t->mlx[k];
+        put_ext(&p, ml - (k ? MINREP : MINMATCH));
+    } else if (ml > MAX_ML4) {
+        part = MAX_ML4;
+        if (ml - part < MINREP)
+            part = ml - MINREP;
+        p = put_pair4(t, p, k, ll, part);
+        ml -= part;
+        while (ml > 0) {
+            part = ml;
+            if (part > MAX_ML4) {
+                part = MAX_ML4;
+                if (ml - part < MINREP)
+                    part = ml - MINREP;
+            }
+            *p++ = t->exact[1][0][part];
+            ml -= part;
+        }
+    } else
+        p = put_pair4(t, p, k, ll, ml);
+    return p;
+}
+
+/* TPut4C in sylz.pas */
+typedef struct {
+    const uint16_t *rec, *rend;
+    uint8_t *p, *off;             /* in/out: token and offset write pointers */
+    intptr_t prev;                /* in/out: the distance before the records */
+    const struct sylzc_codes4 *codes;
+} sylzc_put4;
+
+/* FlushChunk4's last loop in sylz.pas, without its room checks (the
+   caller has room for SylzBound): the recorded sequences' tokens and
+   offsets */
+void sylzc_put_chunk4(sylzc_put4 *st)
+{
+    const uint16_t *r = st->rec, *rend = st->rend;
+    const struct sylzc_codes4 *t = st->codes;
+    uint8_t *p = st->p, *off = st->off;
+    intptr_t prev = st->prev;
+    while (r < rend) {
+        intptr_t ll = r[0], ml = r[1], dist = (intptr_t)r[2] + 1;
+        int k, code = 255;
+        r += 3;
+        if (__builtin_expect(ll == 0xFFFF, 0)) {
+            uint32_t v;
+            __builtin_memcpy(&v, r, 4);
+            ll = v;
+            __builtin_memcpy(&v, r + 2, 4);
+            ml = v;
+            r += 6;
+        }
+        k = dist == prev;
+        prev = dist;
+        if (ll <= MAX_LL4 && ml <= MAX_ML4)
+            code = t->exact[k][ll][ml];
+        if (__builtin_expect(code != 255, 1))
+            *p++ = (uint8_t)code;
+        else
+            p = put_tokens4(t, p, k, ll, ml);
+        off[0] = (uint8_t)(dist - 1);
+        off[1] = (uint8_t)((dist - 1) >> 8);
+        off += 2 - 2 * k;
+    }
+    st->p = p;
+    st->off = off;
+    st->prev = prev;
 }
 
 /* ── levels 0-1 ───────────────────────────────────────────────────────── */
@@ -811,6 +976,8 @@ void sylzc_compress_fast4(sylzc_fast *st)
     uint16_t *table = st->table;
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
+    uint16_t *rec = e.rec;
+    uint8_t *wlit = e.lit;
     intptr_t anchor = 0, ip, fwd, ref = 0, d, len, probes, mflimit, rep = 1;
     uint32_t h, fwdH;
 
@@ -847,8 +1014,8 @@ void sylzc_compress_fast4(sylzc_fast *st)
             ref--;
         }
         for (;;) {
-            len = MINMATCH + count_match(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
-            emit_sequence4(&e, src + anchor, ip - anchor, ip - ref, len);
+            len = MINMATCH + count_match_inl(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
+            emit_fast4(&e, &rec, &wlit, src + anchor, ip - anchor, ip - ref, len);
             rep = ip - ref;
             ip += len;
             anchor = ip;
@@ -866,6 +1033,9 @@ void sylzc_compress_fast4(sylzc_fast *st)
         fwdH = hash_fast(src + ip, hashLog);
     }
 done:
+    e.rec = rec;
+    e.lit = wlit;
+    e.rep = rep;
     st->anchor = anchor;
     st->e = e;
 }
