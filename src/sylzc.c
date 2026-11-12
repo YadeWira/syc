@@ -647,7 +647,7 @@ typedef struct {
 #define MAX_LL4    16
 #define MAX_ML4    32
 #define LIT_SPLIT4 32
-#define ML_SPLIT4  96
+#define ML_SPLIT4  64
 struct sylzc_codes4 {
     uint8_t exact[2][MAX_LL4 + 1][MAX_ML4 + 1];
     uint8_t litx, llx4;

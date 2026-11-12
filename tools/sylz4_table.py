@@ -20,7 +20,7 @@ MLEXT = 0x2000000
 MAX_LL = 16          # exact codes: literals 0..16, match up to 32
 MAX_ML = 32
 LIT_SPLIT = 32       # literal runs up to here are split, longer ones extended
-ML_SPLIT = 96        # the same for matches
+ML_SPLIT = 64        # the same for matches
 MINMATCH = 4
 MINREP = 2
 
