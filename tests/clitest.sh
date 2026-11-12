@@ -84,7 +84,7 @@ check "i on an encrypted stream" 0 "$SYC" i -v enc.sylz
 has "i: encrypted" out.txt 'format version 5.*encrypted (XChaCha20-Poly1305, key from Argon2id over 8 MiB)'
 has "i -v: a line per block" out.txt '^ *0 '
 check "i -v on an -ec stream" 0 "$SYC" i -v e-auto.sylz
-has "i -v: the blocks' format" out.txt 'sylz v[23]$\|sylz v[23].$'
+has "i -v: the blocks' format" out.txt '  sylz v[23]'
 check "i on an archive" 0 "$SYC" i w.syc
 has "i: the archive's versions" out.txt '^ *1  [0-9][0-9][0-9][0-9]-'
 check "i -v on an archive" 0 "$SYC" i -v w.syc
