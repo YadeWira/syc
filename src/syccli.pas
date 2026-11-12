@@ -320,8 +320,8 @@ begin
     ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do,');
   WriteLn('              9-10 price literals by their Huffman codes');
   WriteLn('  -F, --format N   the sylz block format: 2 (default; 3 with -ec), or 4');
-  WriteLn('              (5 with -ec): smaller at every level, experimental: read');
-  WriteLn('              by syc ', SYC_VERSION, ' only until it is frozen');
+  WriteLn('              (5 with -ec): smaller at every level. Not frozen yet:');
+  WriteLn('              until it is, only this version of syc is sure to read it');
 end;
 
 procedure PasswordUsage(cmd: Char);
@@ -499,7 +499,7 @@ begin
         WriteLn('  -O, --stdout           write to stdout');
         WriteLn('  -f, --force            overwrite an existing output; write to a terminal');
         WriteLn('  --rm                   delete FILE once it is compressed');
-        WriteLn('  --raw                  one bare sylz block (v2, v3 with -ec), what the');
+        WriteLn('  --raw                  one bare sylz block (v2, v3 with -ec; -F), what the');
         WriteLn('                         zpaq-std plugins'' compress() returns: no header,');
         WriteLn('                         size or CRC; FILE up to ', MAX_BLOCK shr 20, ' MiB, -> FILE', RAW_SUFFIX);
         WriteLn('  -q, --quiet / -v, --verbose');

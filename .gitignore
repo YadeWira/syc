@@ -14,3 +14,6 @@
 /hash.txt
 credenciales.md
 handoff.md
+
+# Python bytecode
+__pycache__/

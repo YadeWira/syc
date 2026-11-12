@@ -1672,6 +1672,288 @@ asm
   pop rbp
   pop rbx
 end;
+
+type
+  { In/out state of format v4's assembler fast compressor; fixed field
+    order. It returns with more = 1 when the records are full, at a match
+    it has found (ip, ref): the caller flushes them and calls again. }
+  TFast4EncState = record
+    src, iend, mflimit: PByte;   {  0,  8, 16: in }
+    table: PUInt16;              { 24: in }
+    rec: PUInt16;                { 32: in/out, where the next record goes }
+    lit: PByte;                  { 40: in/out, literal write pointer }
+    anchor: PByte;               { 48: in/out (first: src) }
+    recEnd: PUInt16;             { 56: in }
+    hashShift: Int64;            { 64: in, 64 - hash table log }
+    ip: PByte;                   { 72: in/out (first: src + 1) }
+    rep: SizeInt;                { 80: in/out, the previous distance (first: 1) }
+    ref: PByte;                  { 88: out, with more }
+    more: SizeInt;               { 96: in/out (first: 0) }
+  end;
+  PFast4EncState = ^TFast4EncState;
+
+{ CompressFastCore4 in x86_64 assembler: CompressFastX64 with the previous
+  distance tried one byte on at each probe, and each sequence recorded
+  (EmitSequence4) instead of written as a token. The same output byte for
+  byte (tests check it). The stack also holds the previous distance and
+  the records' end. }
+procedure CompressFast4X64(st: PFast4EncState); assembler; nostackframe;
+asm
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  push rax                        { [rsp+40]: state }
+  push qword ptr [rax + 80]       { [rsp+32]: the previous distance }
+  mov rcx, 889523592379
+  push rcx                        { [rsp+24]: hash multiplier }
+  push qword ptr [rax + 56]       { [rsp+16]: where the records end }
+  push qword ptr [rax + 64]       { [rsp+8]: hash shift }
+  push qword ptr [rax + 16]       { [rsp]: mflimit }
+  mov rcx, [rsp + 8]              { cl = hash shift, for the whole routine }
+  mov r10, [rax]
+  mov r13, [rax + 8]
+  mov r11, [rax + 24]
+  mov r14, [rax + 32]
+  mov r15, [rax + 40]
+  mov r9, [rax + 48]              { anchor }
+  mov r8, [rax + 72]              { ip }
+  cmp qword ptr [rax + 96], 0
+  je @fresh
+  mov rax, [rax + 88]             { back after a flush: the match it stopped at }
+  jmp @emit
+@fresh:
+  mov rdx, [r8]
+  shl rdx, 64 - 8 * FAST_HASH_BYTES
+  imul rdx, [rsp + 24]
+  shr rdx, cl
+  mov edi, edx                    { fwdH = hash(ip) }
+
+@search:
+  mov rbx, r8                     { fwd = ip }
+  mov ebp, 1 shl SKIP_STRENGTH    { probes; step = probes shr SKIP_STRENGTH }
+@probe:
+  mov esi, edi                    { h = fwdH }
+  mov r8, rbx                     { ip = fwd }
+  mov rdx, rbp
+  shr rdx, SKIP_STRENGTH
+  add rbx, rdx                    { fwd += step }
+  add rbp, 1
+  cmp rbx, [rsp]
+  ja @last
+  movzx eax, word ptr [r11 + rsi * 2]   { low 16 bits of the candidate's position }
+  mov rdx, [rbx]
+  shl rdx, 64 - 8 * FAST_HASH_BYTES
+  imul rdx, [rsp + 24]
+  shr rdx, cl
+  mov edi, edx                    { fwdH = hash(fwd) }
+  mov rdx, r8
+  sub rdx, r10                    { pos = ip - src }
+  mov [r11 + rsi * 2], dx         { table[h] = pos (low 16 bits) }
+  sub edx, eax
+  and edx, $FFFF                  { distance mod 2^16 ... }
+  mov r12d, 65536
+  test edx, edx
+  cmovz edx, r12d                 { ... with 0 meaning 65536 }
+  { the previous distance, one byte on }
+  lea rax, [r8 + 1]
+  sub rax, [rsp + 32]
+  cmp rax, r10
+  jb @noRep                       { it reaches before the start of the input }
+  mov r12d, [rax]
+  cmp r12d, [r8 + 1]
+  jne @noRep
+  add r8, 1
+  jmp @back
+@noRep:
+  mov rax, r8
+  sub rax, rdx                    { ref = ip - distance }
+  cmp rax, r10
+  jb @probe                       { before the start of the input }
+  mov edx, [rax]
+  cmp edx, [r8]
+  jne @probe
+
+@back:
+  { extend the match backwards over the pending literals }
+  cmp r8, r9
+  jbe @emit
+  cmp rax, r10
+  jbe @emit
+  movzx edx, byte ptr [r8 - 1]
+  cmp dl, [rax - 1]
+  jne @emit
+  sub r8, 1
+  sub rax, 1
+  jmp @back
+
+@emit:
+  cmp r14, [rsp + 16]
+  jae @full                       { no room for a record: flushed, then back here }
+  { match end -> r12 }
+  lea r12, [r8 + SYLZ_MINMATCH]
+  lea rdx, [rax + SYLZ_MINMATCH]
+@cm8:
+  lea rsi, [r12 + 8]
+  cmp rsi, r13
+  ja @cmTail
+  mov rsi, [r12]
+  xor rsi, [rdx]
+  jnz @cmDiff
+  add r12, 8
+  add rdx, 8
+  jmp @cm8
+@cmDiff:
+  bsf rsi, rsi
+  shr esi, 3
+  add r12, rsi
+  jmp @cmDone
+@cmTail:
+  cmp r12, r13
+  jae @cmDone
+  movzx esi, byte ptr [r12]
+  cmp sil, [rdx]
+  jne @cmDone
+  add r12, 1
+  add rdx, 1
+  jmp @cmTail
+@cmDone:
+  { the record, as EmitSequence4 writes it: literals, match length,
+    distance - 1 }
+  mov rbx, r8
+  sub rbx, r9
+  mov rbp, r12
+  sub rbp, r8
+  mov rdx, r8
+  sub rdx, rax
+  mov [rsp + 32], rdx             { the previous distance from here on }
+  sub rdx, 1
+  mov [r14 + 4], dx
+  cmp rbx, REC4_ESC
+  jae @recLong
+  cmp rbp, $FFFF
+  ja @recLong
+  mov [r14], bx
+  mov [r14 + 2], bp
+  add r14, 6
+  jmp @recDone
+@recLong:
+  mov word ptr [r14], REC4_ESC    { the lengths as two u32 after it }
+  mov word ptr [r14 + 2], 0
+  mov [r14 + 6], ebx
+  mov [r14 + 10], ebp
+  add r14, 18
+@recDone:
+  { literals to the scratch stream: 16-byte steps when the reads stay
+    inside the input, else byte by byte }
+  test rbx, rbx
+  jz @litDone
+  lea rdx, [r9 + rbx + 16]
+  cmp rdx, r13
+  ja @litBytes
+  mov rsi, r9
+  mov rdi, r15
+  mov rdx, rbx
+@lit16:
+  movdqu xmm0, [rsi]
+  movdqu [rdi], xmm0
+  add rsi, 16
+  add rdi, 16
+  sub rdx, 16
+  jg @lit16
+  jmp @litDone
+@litBytes:
+  xor edx, edx
+@litByte:
+  movzx esi, byte ptr [r9 + rdx]
+  mov [r15 + rdx], sil
+  add rdx, 1
+  cmp rdx, rbx
+  jb @litByte
+@litDone:
+  add r15, rbx
+  mov r8, r12                     { ip = match end }
+  mov r9, r12                     { anchor = ip }
+  cmp r8, [rsp]
+  ja @last
+  { table[hash(ip - 2)] = ip - 2 - src }
+  mov rdx, [r8 - 2]
+  shl rdx, 64 - 8 * FAST_HASH_BYTES
+  imul rdx, [rsp + 24]
+  shr rdx, cl
+  lea r12, [r8 - 2]
+  sub r12, r10
+  mov [r11 + rdx * 2], r12w
+  { a match right here needs no literals }
+  mov rdx, [r8]
+  shl rdx, 64 - 8 * FAST_HASH_BYTES
+  imul rdx, [rsp + 24]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov r12, r8
+  sub r12, r10
+  mov [r11 + rdx * 2], r12w
+  sub r12d, eax
+  and r12d, $FFFF
+  mov edx, 65536
+  test r12d, r12d
+  cmovz r12d, edx
+  mov rax, r8
+  sub rax, r12
+  cmp rax, r10
+  jb @next
+  mov r12d, [rax]
+  cmp r12d, [r8]
+  je @emit
+@next:
+  add r8, 1
+  mov rdx, [r8]
+  shl rdx, 64 - 8 * FAST_HASH_BYTES
+  imul rdx, [rsp + 24]
+  shr rdx, cl
+  mov edi, edx
+  jmp @search
+
+@full:
+  mov rdx, [rsp + 40]
+  mov [rdx + 72], r8
+  mov [rdx + 88], rax
+  mov qword ptr [rdx + 96], 1
+  jmp @out
+@last:
+  mov rdx, [rsp + 40]
+  mov qword ptr [rdx + 96], 0
+@out:
+  pop rcx                         { mflimit }
+  pop rcx                         { hash shift }
+  pop rcx                         { the records' end }
+  pop rcx                         { multiplier }
+  pop rcx                         { the previous distance }
+  pop rax                         { state }
+  mov [rax + 80], rcx
+  mov [rax + 32], r14
+  mov [rax + 40], r15
+  mov [rax + 48], r9
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop r12
+  pop rbp
+  pop rbx
+end;
 {$endif}
 
 {$ifdef SYLZ_C}
@@ -1751,6 +2033,7 @@ var
   hashLog: Integer;
 {$ifdef SYLZ_ASM_X64}
   st: TFastEncState;
+  s4: TFast4EncState;
 {$endif}
 {$ifdef SYLZ_C}
   sc: TFastCState;
@@ -1797,6 +2080,35 @@ begin
       e.ctrl := sc.e.ctrl;
       e.lit := sc.e.lit;
       Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
+    end;
+{$endif}
+{$ifdef SYLZ_ASM_X64}
+    if SylzUseAsm and e.v4 and not SylzPreferC and (cap >= SylzBound(n))
+       and (n >= SEARCH_TAIL + 1) then
+    begin
+      s4.src := src;
+      s4.iend := src + n;
+      s4.mflimit := src + n - SEARCH_TAIL;
+      s4.table := table;
+      s4.lit := e.lit;
+      s4.anchor := src;
+      s4.recEnd := e.recEnd;
+      s4.hashShift := 64 - hashLog;
+      s4.ip := src + 1;
+      s4.rep := 1;
+      s4.more := 0;
+      repeat
+        s4.rec := e.rec;
+        CompressFast4X64(@s4);
+        e.rec := s4.rec;
+        e.lit := s4.lit;
+        if s4.more = 0 then
+          Break;
+        if not FlushChunk4(e) then   { the records were full }
+          Exit(-1);
+      until False;
+      e.rep := s4.rep;
+      Exit(EmitFinish(e, s4.anchor, src + n - s4.anchor));
     end;
 {$endif}
 {$ifdef SYLZ_C}

@@ -66,6 +66,80 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## sylz formats v4 and v5 (2026-11-12, provisional)
+
+Asked for: formats better than v2 and v3 in everything. What they are
+(the full description: wiki, sylz format; `--format 4`, codec 2 in
+streams and archives):
+
+- three streams: tokens (a byte each), offsets (2 bytes, only for the
+  sequences that need them), literals; v5 = v4 with v3's Huffman chunks;
+- a token can take the previous sequence's offset again, for no offset
+  bytes, from 2 bytes of match;
+- sequences with no code of their own are split into plain tokens (a
+  literal-only token, a token that goes on at the previous offset)
+  instead of taking an escape; only runs over 32 literals and matches
+  over 64 are extended;
+- the token stream comes in chunks of 131072 sequences, each with the
+  built-in table or its own (512 bytes), made from the pairs it uses.
+
+How it got there, each step measured on silesia.tar and the mixed corpus
+(CPU 20 or 26; the machine was shared, speeds +-5%):
+
+- **Repeat offset.** A greedy parser that tries the previous offset one
+  byte on (zstd's fast levels do) makes 19-27% of its sequences repeats;
+  priced at a token each: 44.38 -> 42.65% (silesia), 67.0 -> 65.4%
+  (mixed). Repeats of 3 bytes: 42.49 / 64.73%; of 2: 42.45 / 64.21%,
+  with 35% more sequences. The format allows 2; only the optimal parser
+  uses them, where a code exists.
+- **The same sequences in the new layout** (v2's parse, repeats only
+  where two offsets happened to be equal: 4-5%): 0.45-0.7 points
+  smaller, and a C decoder 10% slower than v2's C one.
+- **Escapes.** With the first table (trained on those parses) 16.6% of
+  level 1's sequences took an escape, each a mispredicted branch: 6.7%
+  were pairs inside the exact region without a code, 4.4% matches of
+  33-64, 3.2% runs of 17-32 literals; 1.1% really long. Split into
+  plain tokens they cost the same bytes (+0.03 points) and the decoder
+  takes them in its fast loop: branch misses per decode 2.44 M -> 1.16 M
+  (perf). Split thresholds (literals / match): 16/32 2772 MB/s, 32/32
+  2909, 32/64 3065, 32/96 3065, 32/160 3063 (level 1, assembler): 32/64.
+- **The decoder.** C, a counted inner loop (k sequences fit: no checks):
+  2313 -> 2870 MB/s, where v2's C decoder makes 2600. Assembler, with
+  the escapes handled in it: 3070-3200. perf, cycles per MB decoded, v2
+  / v4: level 1 0.99 / 0.93 M, level 3 1.05 / 1.06, level 6 1.01 / 1.02;
+  instructions +7-16% (more tokens), branch misses -55-65%.
+- **Every level.** Levels 2-3: the previous offset one byte on, before
+  the tables. 4-8: at the previous offset a match is taken unless the
+  chains have one over 2 bytes longer (not searched for past 32 bytes).
+  9-10: a DP of its own (OptDp4Pas, sylzc_opt_dp4): each node carries its
+  path's last distance, tried first at every position.
+- **Per file** the first version won only where repeats are common
+  (mozilla -8.6%, nci -4.3%, ooffice -3.1% at level 1) and lost 0.1-0.7%
+  on text, x-ray, osdb, sao, at every level: a long literal run cost a
+  byte more than in v2 (fixed: escapes "run extended + this match"), and
+  the repeat codes took the place of pairs those files need. A table
+  per chunk of 65536 / 262144 sequences, simulated: -0.3 to -1.1% on
+  every file tried; a table made from the previous chunk (no second
+  pass) keeps most of it but lost 0.7% on xml (its content changes).
+  So: sequences are recorded (6 bytes each) and written as tokens a
+  chunk at a time, with the table made from that chunk. Level 1 / 6 / 9,
+  v4 against v2: dickens -0.14 / +0.07 / 0.00%, mozilla -9.2 / -6.3 /
+  -7.3%, mr +0.11 / +0.10 / +0.05%, nci -6.4 / -2.4 / -5.5%, ooffice
+  -3.8 / -3.5 / -4.2%, osdb -0.4 / -0.5 / -0.5%, reymont -0.5 / -0.2 /
+  -0.4%, samba -1.6 / -0.7 / -3.4%, sao -0.5 / -0.7 / -0.1%, webster
+  -0.4 / -0.2 / -0.2%, xml -2.0 / -0.2 / -0.8%, x-ray -0.03 / -0.02 /
+  -0.03%.
+- **Compression speed** is what is not there yet. The recording and the
+  second pass cost levels 0-1 about 10% (flush 3.5% in C after counting
+  one sequence in 8 for the table at levels 0-3, 6-byte records, the
+  token pass in C); the repeat check costs little (checking only the
+  first probe after a match: +2%). v2's loops are assembler; v4's are C:
+  level 1 346 MB/s against 475 (v2 in C: 419).
+
+lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
+format (lz4: multithreading in the library; zxc: format v9 frozen, its
+API and CLI).
+
 ## Commands for developing and reporting (2026-11-12)
 
 syc b (benchmark in memory), s (self-test), r (report), i on .sylz

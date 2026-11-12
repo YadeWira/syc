@@ -9,7 +9,7 @@ for modest hardware.
 | CI | [![CI][ciBadge]][ciLink] |
 | Latest release | [![Release][relBadge]][relLink] |
 | Language | Free Pascal 3.2.2, with C and assembler beside a Pascal reference |
-| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional |
+| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional; sylz blocks v2 and v3 frozen, v4 and v5 provisional |
 
 [ciBadge]: https://github.com/YadeWira/syc/actions/workflows/ci.yml/badge.svg "Continuous Integration"
 [ciLink]: https://github.com/YadeWira/syc/actions/workflows/ci.yml
@@ -25,7 +25,7 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.5.x, pre-release.** Every release stays a pre-release until
+**Status: v0.6.x, pre-release.** Every release stays a pre-release until
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
@@ -187,6 +187,7 @@ out/syc a -p secret.syc docs/        # encrypted (asks for the password; or --pa
 out/syc k secret.syc                 # a new password, in place (no recompression)
 
 out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads)
+out/syc c -F 4 file        # the same in sylz format v4 (provisional): smaller
 out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)
 out/syc t file.sylz        # check it, write nothing
 tar c dir | out/syc c > dir.tar.sylz       # no FILE: stdin -> stdout
@@ -204,7 +205,7 @@ data, 4 I/O error.
 For developing syc, and for reporting a problem with it:
 
 ```sh
-out/syc b FILE             # benchmark: every level in memory (--levels 1,4,9; -ec; --time S)
+out/syc b FILE             # benchmark: every level in memory (--levels 1,4,9; -ec; -F 4; --time S)
 out/syc s                  # self-test: is this build right on this machine?
 out/syc r                  # report: build, machine, self-test, for a bug report
 out/syc c --stats file     # at the end: bytes, time, speed, threads, peak memory

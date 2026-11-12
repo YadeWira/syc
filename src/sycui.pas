@@ -433,8 +433,11 @@ begin
   WriteLn(StdErr, Paint(2, stHead, 'stats'));
   Row('in', Format('%d bytes (%s)', [statIn, HumanSize(statIn)]));
   Row('out', Format('%d bytes (%s)', [statOut, HumanSize(statOut)]));
-  if statIn > 0 then
-    Row('out / in', Format('%.2f%%', [statOut * 100.0 / statIn]));
+  { the compressed side over the other, whichever way the data went }
+  if (statIn > 0) and (statOut <= statIn) then
+    Row('out / in', Format('%.2f%%', [statOut * 100.0 / statIn]))
+  else if statOut > 0 then
+    Row('in / out', Format('%.2f%%', [statIn * 100.0 / statOut]));
   Row('time', HumanTime(secs));
   if secs >= 0.001 then
     Row('speed', Format('%s in, %s out', [HumanSpeed(statIn, secs), HumanSpeed(statOut, secs)]));
