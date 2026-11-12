@@ -184,6 +184,11 @@ begin
         levels[i] := StrToInt(parts[i]);
       Inc(argi, 2);
     end
+    else if ParamStr(argi) = '-v4' then
+    begin
+      flags := flags or SYLZ_V4;
+      Inc(argi);
+    end
     else if ParamStr(argi) = '-ec' then
     begin
       flags := flags or SYLZ_ENTROPY;

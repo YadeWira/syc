@@ -341,6 +341,247 @@ intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
 }
 #endif
 
+/* ── format v4's decoder ──────────────────────────────────────────────── */
+
+/* SYLZ_TOKENS4 entries: bits 0..7 literals, 8..15 match length, 16..23
+   the offset bytes the sequence takes (2 or 0), 24 / 25 the extension
+   flags */
+#define TOK4_LLEXT 0x1000000u
+#define TOK4_MLEXT 0x2000000u
+
+/* DecodeSafe4 in sylz.pas */
+DECODER_INLINE intptr_t decode4_safe(const uint8_t *tok, const uint8_t *tend,
+                             const uint8_t *offp, const uint8_t *offend,
+                             const uint8_t *lit, const uint8_t *lend,
+                             uint8_t *op, uint8_t *oend, uint8_t *dst,
+                             const uint32_t *tokens, intptr_t rep)
+{
+    while (tok < tend) {
+        uint32_t e = tokens[*tok++];
+        intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
+        if (e & TOK4_LLEXT) {
+            uint8_t b;
+            do {
+                if (tok >= tend)
+                    return -1;
+                b = *tok++;
+                ll += b;
+            } while (b == 255);
+        }
+        if (e & TOK4_MLEXT) {
+            uint8_t b;
+            do {
+                if (tok >= tend)
+                    return -1;
+                b = *tok++;
+                ml += b;
+            } while (b == 255);
+        }
+        if (e & 0xFF0000) {
+            if (offend - offp < 2)
+                return -1;
+            rep = (intptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
+            offp += 2;
+        }
+        if (ll > lend - lit || ll > oend - op)
+            return -1;
+        for (intptr_t i = 0; i < ll; i++)
+            op[i] = lit[i];
+        op += ll;
+        lit += ll;
+        if (rep > op - dst || ml > oend - op)
+            return -1;
+        const uint8_t *m = op - rep;
+        while (ml-- > 0)
+            *op++ = *m++;
+    }
+    if (offp != offend || lend - lit != oend - op)
+        return -1;
+    while (lit < lend)
+        *op++ = *lit++;
+    return oend - dst;
+}
+
+/* A match copy for a distance under 16 (ml may be 0: nothing kept) */
+DECODER_INLINE uint8_t *copy_short(uint8_t *op, uintptr_t off, intptr_t ml)
+{
+    static const uint8_t period[8] = {0, 8, 8, 9, 8, 10, 12, 14};
+    const uint8_t *m = op - off;
+    if (off >= 8) {
+        do {
+            copy8(op, m);
+            op += 8;
+            m += 8;
+            ml -= 8;
+        } while (ml > 0);
+        return op + ml;
+    }
+    /* off < 8: the first 8 bytes one by one; they repeat with period off,
+       so the rest copies from the nearest multiple of off that is >= 8 */
+    op[0] = m[0]; op[1] = m[1]; op[2] = m[2]; op[3] = m[3];
+    op[4] = m[4]; op[5] = m[5]; op[6] = m[6]; op[7] = m[7];
+    op += 8;
+    m = op - period[off];
+    ml -= 8;
+    while (ml > 0) {
+        copy8(op, m);
+        op += 8;
+        m += 8;
+        ml -= 8;
+    }
+    return op + ml;
+}
+
+/* The fast loop. A sequence with an exact code takes one token, at most
+   2 offset bytes and 16 literals, and writes inside 64 bytes of output
+   (16 literal bytes, then 32 match bytes after at most 16 literals), so
+   k = min(tokens, offset bytes / 2, literals / 16, output / 64) of them
+   need no bounds check: the inner loop counts k down. The offset is read
+   whether the token takes one or not, and chosen without a branch. An
+   escape is checked on its own, then k is counted again. */
+DECODER_INLINE intptr_t decode4_core(const uint8_t *tok, const uint8_t *tend,
+                      const uint8_t *offp, const uint8_t *offend,
+                      const uint8_t *lit, const uint8_t *lend,
+                      uint8_t *dst, intptr_t dstLen, const uint32_t *tokens_)
+{
+    const uint32_t *tokens = tokens_;
+    uint8_t *op = dst, *oend = dst + dstLen;
+    uintptr_t rep = 1;
+
+    for (;;) {
+        intptr_t k = tend - tok, c;
+        c = (offend - offp) >> 1;
+        if (c < k) k = c;
+        c = (lend - lit) >> 4;
+        if (c < k) k = c;
+        c = (oend - op) >> 6;
+        if (c < k) k = c;
+        if (k <= 0)
+            break;
+        do {
+            uint32_t e = tokens[*tok];
+            uintptr_t off = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
+            uintptr_t nb = (e >> 16) & 0xFF;   /* 2 or 0 */
+            if (__builtin_expect(e > 0xFFFFFF, 0))
+                goto escape;
+            tok++;
+            copy16(op, lit);
+            op += e & 0xFF;
+            lit += e & 0xFF;
+            offp += nb;
+            off = nb ? off : rep;
+            rep = off;
+            if (__builtin_expect(off > (uintptr_t)(op - dst), 0))
+                return -1;
+            if (__builtin_expect(off >= 16, 1)) {
+                const uint8_t *m = op - off;
+                copy16(op, m);
+                copy16(op + 16, m + 16);
+                op += (e >> 8) & 0xFF;
+            } else
+                op = copy_short(op, off, (e >> 8) & 0xFF);
+        } while (--k);
+        continue;
+escape:
+        {
+            /* extended field(s): read through m, so giving up leaves
+               everything at the token, nothing written yet */
+            uint32_t e = tokens[*tok];
+            const uint8_t *m = tok + 1;
+            intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
+            uintptr_t off = rep;
+            if (e & TOK4_LLEXT) {
+                do {
+                    if (m >= tend) { ll = -1; break; }
+                    ll += *m++;
+                } while (m[-1] == 255);
+            }
+            if ((e & TOK4_MLEXT) && ll >= 0) {
+                do {
+                    if (m >= tend) { ll = -1; break; }
+                    ml += *m++;
+                } while (m[-1] == 255);
+            }
+            /* room for the wide copies: 16 literal bytes past the run, 64
+               output bytes past the sequence */
+            if (ll < 0 || ll > lend - lit - 16 || ll + ml > oend - op - 64)
+                break;   /* decode4_safe does this sequence exactly */
+            if (e & 0xFF0000) {
+                /* k > 0: the offset stream has these 2 bytes */
+                off = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
+                offp += 2;
+            }
+            tok = m;
+            do {
+                copy16(op, lit);
+                op += 16;
+                lit += 16;
+                ll -= 16;
+            } while (ll > 0);
+            op += ll;
+            lit += ll;
+            rep = off;
+            if (off > (uintptr_t)(op - dst))
+                return -1;
+            if (off >= 16) {
+                const uint8_t *s = op - off;
+                do {
+                    copy16(op, s);
+                    op += 16;
+                    s += 16;
+                    ml -= 16;
+                } while (ml > 0);
+                op += ml;
+            } else
+                op = copy_short(op, off, ml);
+        }
+    }
+    return decode4_safe(tok, tend, offp, offend, lit, lend, op, oend, dst, tokens, (intptr_t)rep);
+}
+
+#if defined(__i386__) && !defined(SYLZC_NO_SSE2)
+__attribute__((target("sse2")))
+static intptr_t decode4_sse2(const uint8_t *tok, const uint8_t *tend,
+                             const uint8_t *offp, const uint8_t *offend,
+                             const uint8_t *lit, const uint8_t *lend,
+                             uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode4_core(tok, tend, offp, offend, lit, lend, dst, dstLen, tokens);
+}
+
+static intptr_t decode4_i686(const uint8_t *tok, const uint8_t *tend,
+                             const uint8_t *offp, const uint8_t *offend,
+                             const uint8_t *lit, const uint8_t *lend,
+                             uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode4_core(tok, tend, offp, offend, lit, lend, dst, dstLen, tokens);
+}
+
+intptr_t sylzc_decode4(const uint8_t *tok, const uint8_t *tend,
+                       const uint8_t *offp, const uint8_t *offend,
+                       const uint8_t *lit, const uint8_t *lend,
+                       uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    int kind = decoder_kind;
+    if (kind == 0) {
+        unsigned a, b, c, d;
+        kind = __get_cpuid(1, &a, &b, &c, &d) && (d & bit_SSE2) ? 2 : 1;
+        decoder_kind = kind;
+    }
+    if (kind == 2)
+        return decode4_sse2(tok, tend, offp, offend, lit, lend, dst, dstLen, tokens);
+    return decode4_i686(tok, tend, offp, offend, lit, lend, dst, dstLen, tokens);
+}
+#else
+intptr_t sylzc_decode4(const uint8_t *tok, const uint8_t *tend,
+                       const uint8_t *offp, const uint8_t *offend,
+                       const uint8_t *lit, const uint8_t *lend,
+                       uint8_t *dst, intptr_t dstLen, const uint32_t *tokens)
+{
+    return decode4_core(tok, tend, offp, offend, lit, lend, dst, dstLen, tokens);
+}
+#endif
+
 /* ── compressor helpers ───────────────────────────────────────────────── */
 
 #define MINMATCH  4
@@ -349,6 +590,7 @@ intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
 #define ESC_ML    210
 #define ESC_LL    226
 #define ESC_BOTH  255
+#define MINREP    2      /* v4: shortest match at the previous offset */
 
 static uint32_t read32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
 static uint64_t read64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
@@ -395,7 +637,23 @@ typedef struct {
     uint8_t *ctrl, *lit;          /* control and literal write pointers */
     const uint8_t *srcEnd;        /* bounds the wide literal reads */
     const uint8_t *exact;         /* ExactCode[0..EXACT_LL][0..EXACT_M] */
+    uint8_t *off;                 /* format v4: offset write pointer */
+    intptr_t rep;                 /* v4: the previous sequence's distance */
+    const struct sylzc_codes4 *codes4;   /* v4: Codes4 */
 } sylzc_emit;
+
+/* TCodes4 in sylz.pas: format v4's codes. exact[0 new offset / 1
+   previous offset][literals][match], 255 = no code; the escapes */
+#define MAX_LL4    16
+#define MAX_ML4    32
+#define LIT_SPLIT4 32
+#define ML_SPLIT4  96
+struct sylzc_codes4 {
+    uint8_t exact[2][MAX_LL4 + 1][MAX_ML4 + 1];
+    uint8_t litx, llx4;
+    uint8_t mlx[2];
+    uint8_t litSplit, mlSplit;
+};
 
 static void put_ext(uint8_t **pp, intptr_t v)
 {
@@ -436,6 +694,88 @@ static void emit_sequence(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
     }
     e->ctrl = p;
     /* the scratch buffer has 16 spare bytes */
+    if (litLen <= 16 && e->srcEnd - lit >= 16)
+        copy16(e->lit, lit);
+    else
+        for (intptr_t i = 0; i < litLen; i++)
+            e->lit[i] = lit[i];
+    e->lit += litLen;
+}
+
+/* PutPair4 in sylz.pas */
+static uint8_t *put_pair4(const struct sylzc_codes4 *t, uint8_t *p, int k,
+                          intptr_t ll, intptr_t ml)
+{
+    int c = t->exact[k][ll][ml];
+    if (c == 255) {
+        *p++ = t->exact[1][ll][0];
+        c = t->exact[k][0][ml];
+    }
+    *p++ = (uint8_t)c;
+    return p;
+}
+
+/* EmitSplit4 in sylz.pas: the tokens of a sequence with no exact code */
+static __attribute__((noinline)) uint8_t *emit_split4(const struct sylzc_codes4 *t,
+    uint8_t *p, int k, intptr_t ll, intptr_t ml)
+{
+    intptr_t part;
+    if (k == 0 && ml == MINMATCH && ll > MAX_LL4) {
+        *p++ = t->llx4;
+        put_ext(&p, ll);
+        return p;
+    }
+    if (ll > t->litSplit) {
+        *p++ = t->litx;
+        put_ext(&p, ll);
+        ll = 0;
+    } else if (ll > MAX_LL4) {
+        *p++ = t->exact[1][MAX_LL4][0];
+        ll -= MAX_LL4;
+    }
+    if (ml > t->mlSplit) {
+        if (ll > 0)
+            *p++ = t->exact[1][ll][0];
+        *p++ = t->mlx[k];
+        put_ext(&p, ml - (k ? MINREP : MINMATCH));
+    } else if (ml > MAX_ML4) {
+        part = MAX_ML4;
+        if (ml - part < MINREP)
+            part = ml - MINREP;
+        p = put_pair4(t, p, k, ll, part);
+        ml -= part;
+        while (ml > 0) {
+            part = ml;
+            if (part > MAX_ML4) {
+                part = MAX_ML4;
+                if (ml - part < MINREP)
+                    part = ml - MINREP;
+            }
+            *p++ = t->exact[1][0][part];
+            ml -= part;
+        }
+    } else
+        p = put_pair4(t, p, k, ll, ml);
+    return p;
+}
+
+/* EmitSequence4 in sylz.pas without its capacity check */
+static void emit_sequence4(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
+                           intptr_t dist, intptr_t matchLen)
+{
+    const struct sylzc_codes4 *t = e->codes4;
+    int k = dist == e->rep;
+    int code = 255;
+    e->rep = dist;
+    e->off[0] = (uint8_t)(dist - 1);
+    e->off[1] = (uint8_t)((dist - 1) >> 8);
+    e->off += 2 - 2 * k;
+    if (litLen <= MAX_LL4 && matchLen <= MAX_ML4)
+        code = t->exact[k][litLen][matchLen];
+    if (code != 255)
+        *e->ctrl++ = (uint8_t)code;
+    else
+        e->ctrl = emit_split4(t, e->ctrl, k, litLen, matchLen);
     if (litLen <= 16 && e->srcEnd - lit >= 16)
         copy16(e->lit, lit);
     else
@@ -528,6 +868,73 @@ done:
     st->e = e;
 }
 
+/* CompressFastCore4 in sylz.pas, same output byte for byte. */
+void sylzc_compress_fast4(sylzc_fast *st)
+{
+    const uint8_t *src = st->src;
+    intptr_t n = st->n;
+    uint16_t *table = st->table;
+    int hashLog = (int)st->hashLog;
+    sylzc_emit e = st->e;
+    intptr_t anchor = 0, ip, fwd, ref = 0, d, len, probes, mflimit, rep = 1;
+    uint32_t h, fwdH;
+
+    if (n < 12 + 1)
+        goto done;
+    mflimit = n - 12;
+    ip = 1;
+    fwdH = hash_fast(src + ip, hashLog);
+    for (;;) {
+        fwd = ip;
+        probes = 1 << SKIP_STRENGTH;
+        for (;;) {
+            h = fwdH;
+            ip = fwd;
+            fwd += probes >> SKIP_STRENGTH;
+            probes++;
+            if (fwd > mflimit)
+                goto done;
+            d = fast_dist(ip, table[h]);
+            fwdH = hash_fast(src + fwd, hashLog);
+            table[h] = (uint16_t)ip;
+            /* the previous offset, one byte on */
+            if (rep <= ip + 1 && read32(src + ip + 1 - rep) == read32(src + ip + 1)) {
+                ip++;
+                ref = ip - rep;
+                break;
+            }
+            ref = ip - d;
+            if (d <= ip && read32(src + ref) == read32(src + ip))
+                break;
+        }
+        while (ip > anchor && ref > 0 && src[ip - 1] == src[ref - 1]) {
+            ip--;
+            ref--;
+        }
+        for (;;) {
+            len = MINMATCH + count_match(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
+            emit_sequence4(&e, src + anchor, ip - anchor, ip - ref, len);
+            rep = ip - ref;
+            ip += len;
+            anchor = ip;
+            if (ip > mflimit)
+                goto done;
+            table[hash_fast(src + ip - 2, hashLog)] = (uint16_t)(ip - 2);
+            h = hash_fast(src + ip, hashLog);
+            d = fast_dist(ip, table[h]);
+            table[h] = (uint16_t)ip;
+            ref = ip - d;
+            if (d > ip || read32(src + ref) != read32(src + ip))
+                break;
+        }
+        ip++;
+        fwdH = hash_fast(src + ip, hashLog);
+    }
+done:
+    st->anchor = anchor;
+    st->e = e;
+}
+
 /* ── levels 2-3 ───────────────────────────────────────────────────────── */
 
 static uint32_t hash4(uint32_t v, int hashLog)
@@ -570,21 +977,31 @@ typedef struct {
     sylzc_emit e;
 } sylzc_mid;
 
-/* CompressMidCore in sylz.pas, same output byte for byte. */
-void sylzc_compress_mid(sylzc_mid *st)
+/* CompressMidCore in sylz.pas, same output byte for byte; v4 is a
+   constant in each of the two functions made from it. */
+static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st, const int v4)
 {
     const uint8_t *src = st->src;
     intptr_t n = st->n;
     uint16_t *tl = st->tl, *ts = st->ts;
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
-    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit;
+    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit, rep = 1;
 
     if (n < 12 + 1)
         goto done;
     mflimit = n - 12;
     pos = 0;
     while (pos < mflimit) {
+        if (v4 && rep <= pos + 1 && read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
+            /* the previous offset, one byte on, taken as it is */
+            tl[mid_hash_long(src + pos, hashLog)] = (uint16_t)pos;
+            ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
+            pos++;
+            dist = rep;
+            len = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+            goto found;
+        }
         dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
         if (dist > 0)
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
@@ -626,11 +1043,16 @@ void sylzc_compress_mid(sylzc_mid *st)
                 }
             }
         }
+found:
         while (pos > anchor && pos > dist && src[pos - 1] == src[pos - 1 - dist]) {
             pos--;
             len++;
         }
-        emit_sequence(&e, src + anchor, pos - anchor, dist, len);
+        if (v4)
+            emit_sequence4(&e, src + anchor, pos - anchor, dist, len);
+        else
+            emit_sequence(&e, src + anchor, pos - anchor, dist, len);
+        rep = dist;
         mend = pos + len;
         if (mend < mflimit) {
             tl[mid_hash_long(src + pos + 1, hashLog)] = (uint16_t)(pos + 1);
@@ -644,6 +1066,16 @@ void sylzc_compress_mid(sylzc_mid *st)
 done:
     st->anchor = anchor;
     st->e = e;
+}
+
+void sylzc_compress_mid(sylzc_mid *st)
+{
+    compress_mid_core(st, 0);
+}
+
+void sylzc_compress_mid4(sylzc_mid *st)
+{
+    compress_mid_core(st, 1);
 }
 
 /* ── levels 4-8: the hash-chain search ────────────────────────────────── */
