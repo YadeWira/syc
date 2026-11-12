@@ -12,3 +12,5 @@
 
 # CI output (.github/test.sh)
 /hash.txt
+credenciales.md
+handoff.md

@@ -3642,6 +3642,8 @@ begin
   try
     FillChar(hist^, regions * 256 * SizeOf(UInt32), 0);
     ResetTree;
+    { nothing is emitted in this pass, but the parse depends on the format }
+    EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs);
     CompressOptCore(src, n, e, b, ctx.opt, p, nil, hist);
     LiteralPrices(hist, regions, prices);
     ResetTree;
