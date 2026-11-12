@@ -1221,6 +1221,8 @@ void sylzc_bt_insert(sylzc_bt *b)
 /* ── levels 4-8: lz4hc's parse ────────────────────────────────────────── */
 
 #define HCW_OPTIMAL_ML 18
+#define HC_REP_ENOUGH 32   /* format v4: see CompressHCCore in sylz.pas */
+#define HC_REP_GAIN 2
 
 /* In/out of sylzc_compress_hc (THcCState in sylz.pas). search is the
    chain search to use: the x86_64 assembler one (it follows the C calling
@@ -1242,18 +1244,22 @@ static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intp
 }
 
 /* Emit in CompressHCCore: a match shorter than MINMATCH stays literals */
-static void hc_emit(sylzc_hcparse *st, intptr_t p, intptr_t len, intptr_t r)
+static inline __attribute__((always_inline)) void hc_emit(sylzc_hcparse *st, intptr_t p,
+    intptr_t len, intptr_t r, const int v4)
 {
     if (len < MINMATCH)
         return;
-    emit_sequence(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
+    if (v4)
+        emit_sequence4(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
+    else
+        emit_sequence(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
     st->anchor = p + len;
 }
 
 /* CompressHCCore in sylz.pas (LZ4HC_compress_hashChain), same output; the
    state machine as there: 0 search at pos, 2 / 3 lz4hc's _Search2 /
    _Search3. The caller set s's src, iend, nextToInsert and attempts. */
-void sylzc_compress_hc(sylzc_hcparse *st)
+static inline __attribute__((always_inline)) void compress_hc_core(sylzc_hcparse *st, const int v4)
 {
     sylzc_hc *s = st->s;
     intptr_t n = s->iend - s->src;
@@ -1268,7 +1274,23 @@ void sylzc_compress_hc(sylzc_hcparse *st)
     mfl = n - 12;
     while (pos < mfl) {
         if (state == 0) {
-            ml = hc_find(st, pos, pos, MINMATCH - 1);
+            intptr_t rp = st->e.rep;
+            if (v4 && pos > st->anchor && rp <= pos
+                && read32(s->src + pos - rp) == read32(s->src + pos)) {
+                /* a match at the previous offset: taken unless the chains
+                   have one over HC_REP_GAIN bytes longer */
+                intptr_t rl = MINMATCH + count_match(s->src + pos + MINMATCH,
+                    s->src + pos - rp + MINMATCH, s->iend);
+                ml = 0;
+                if (rl < HC_REP_ENOUGH)
+                    ml = hc_find(st, pos, pos, MINMATCH - 1);
+                if (rl + HC_REP_GAIN >= ml) {
+                    hc_emit(st, pos, rl, pos - rp, v4);
+                    pos += rl;
+                    continue;
+                }
+            } else
+                ml = hc_find(st, pos, pos, MINMATCH - 1);
             if (ml < MINMATCH) {
                 pos++;
                 continue;
@@ -1285,7 +1307,7 @@ void sylzc_compress_hc(sylzc_hcparse *st)
             } else
                 ml2 = ml;
             if (ml2 == ml) {
-                hc_emit(st, pos, ml, ref);
+                hc_emit(st, pos, ml, ref, v4);
                 pos += ml;
                 state = 0;
                 continue;
@@ -1321,8 +1343,8 @@ void sylzc_compress_hc(sylzc_hcparse *st)
             /* no better match: ML1 then ML2 */
             if (start2 < pos + ml)
                 ml = start2 - pos;
-            hc_emit(st, pos, ml, ref);
-            hc_emit(st, start2, ml2, ref2);
+            hc_emit(st, pos, ml, ref, v4);
+            hc_emit(st, start2, ml2, ref2, v4);
             pos = start2 + ml2;
             state = 0;
             continue;
@@ -1337,7 +1359,7 @@ void sylzc_compress_hc(sylzc_hcparse *st)
                         start2 = start3; ref2 = ref3; ml2 = ml3;
                     }
                 }
-                hc_emit(st, pos, ml, ref);
+                hc_emit(st, pos, ml, ref, v4);
                 pos = start3; ref = ref3; ml = ml3;
                 start0 = start2; ref0 = ref2; ml0 = ml2;
                 state = 2;
@@ -1361,11 +1383,21 @@ void sylzc_compress_hc(sylzc_hcparse *st)
             } else
                 ml = start2 - pos;
         }
-        hc_emit(st, pos, ml, ref);
+        hc_emit(st, pos, ml, ref, v4);
         pos = start2; ref = ref2; ml = ml2;
         start2 = start3; ref2 = ref3; ml2 = ml3;
         state = 3;
     }
+}
+
+void sylzc_compress_hc(sylzc_hcparse *st)
+{
+    compress_hc_core(st, 0);
+}
+
+void sylzc_compress_hc4(sylzc_hcparse *st)
+{
+    compress_hc_core(st, 1);
 }
 
 /* ── levels 9-10: the candidate pass ──────────────────────────────────── */
@@ -1966,3 +1998,149 @@ void sylzc_argon2_fill(const uint64_t *prev, const uint64_t *ref, uint64_t *next
 void __libc_csu_init(void) {}
 void __libc_csu_fini(void) {}
 #endif
+
+/* ── format v4's optimal-parser DP ────────────────────────────────────── */
+
+#define OPT4_ROW_LONG (MAX_LL4 + 1)
+#define OPT4_ROWS     (MAX_LL4 + 2)
+#define OPT4_COLS     (2 * MAX_ML4 + 2)
+#define OPT4_NEVER    (INT32_MAX / 4)
+
+/* TOptDp4Args in sylz.pas */
+typedef struct {
+    int32_t subLen, minRep;
+    int32_t seq, esc, shortOff;   /* penalties, bits */
+    int32_t scale;
+    const int32_t *litPrice;
+    const uint8_t *wsrc;
+    intptr_t before;              /* input bytes before the window */
+    const int32_t *mtab;          /* [kind][row][length] */
+    const struct sylzc_codes4 *codes;
+    int32_t *reps;                /* each node's previous distance */
+} sylzc_dp4args;
+
+/* LitStep4 in sylz.pas */
+static int32_t lit_step4(int32_t ll, const sylzc_dp4args *a)
+{
+    if (ll < LIT_SPLIT4)
+        return ll == MAX_LL4 ? a->scale + a->seq : 0;
+    if (ll == LIT_SPLIT4)
+        return a->scale * ext_bytes(ll + 1) + a->esc;
+    return a->scale * (ext_bytes(ll + 1) - ext_bytes(ll));
+}
+
+/* MatchCost4 in sylz.pas */
+static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4args *a)
+{
+    const struct sylzc_codes4 *c = a->codes;
+    int32_t tok = a->scale + a->seq, first, r;
+    int32_t l = row == OPT4_ROW_LONG ? 0 : row;
+    r = kind == 0 ? 2 * a->scale : 0;
+    if (ml > c->mlSplit) {
+        if (l > 0)
+            r += tok;
+        return r + tok + a->scale * ext_bytes(ml - (kind ? MINREP : MINMATCH)) + a->esc;
+    }
+    first = ml;
+    if (ml > MAX_ML4) {
+        first = MAX_ML4;
+        if (ml - first < MINREP)
+            first = ml - MINREP;
+        r += tok * ((ml - first + MAX_ML4 - 1) / MAX_ML4);
+    }
+    if (c->exact[kind][l][first] != 255)
+        r += tok;
+    else if (ml < MINMATCH)
+        r = OPT4_NEVER;
+    else
+        r += 2 * tok;
+    if (row == OPT4_ROW_LONG && ml < MINMATCH)
+        r = OPT4_NEVER;
+    return r;
+}
+
+/* OptDp4Pas in sylz.pas, same nodes */
+void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
+                   const int32_t *off, const int32_t *cnt, const sylzc_dp4args *a)
+{
+    int32_t *reps = a->reps;
+    const uint8_t *wsrc = a->wsrc;
+    for (int32_t i = 0; i < w; i++) {
+        int32_t k = cnt[i];
+        if (k < 0)
+            continue;
+        int32_t cost = nodes[i].cost;
+        int32_t ll = nodes[i].ll;
+        int32_t r = reps[i];
+        int32_t tc = cost + a->litPrice[wsrc[i]] + lit_step4(ll, a);
+        if (tc < nodes[i + 1].cost) {
+            nodes[i + 1].cost = tc;
+            nodes[i + 1].ll = ll + 1;
+            nodes[i + 1].ml = 0;
+            reps[i + 1] = r;
+        }
+        int32_t row = ll <= MAX_LL4 ? ll : ll <= LIT_SPLIT4 ? ll - MAX_LL4 : OPT4_ROW_LONG;
+        const int32_t *rowN = a->mtab + row * OPT4_COLS;
+        const int32_t *rowR = rowN + OPT4_ROWS * OPT4_COLS;
+        /* the previous distance */
+        if (r <= a->before + i) {
+            int32_t rl = (int32_t)count_match(wsrc + i, wsrc + i - r, wsrc + w);
+            if (rl >= a->minRep) {
+                int32_t base = cost + (r < 16 ? a->shortOff : 0);
+                int32_t ml = a->minRep - 1;
+                while (ml < rl) {
+                    if (ml < a->subLen)
+                        ml++;
+                    else
+                        ml = rl;
+                    int32_t j = i + ml;
+                    if (ml < OPT4_COLS)
+                        tc = base + rowR[ml];
+                    else
+                        tc = base + match_cost4(row, ml, 1, a);
+                    if (tc < nodes[j].cost) {
+                        nodes[j].cost = tc;
+                        nodes[j].ll = 0;
+                        nodes[j].ml = ml;
+                        nodes[j].dist = r;
+                        reps[j] = r;
+                    }
+                }
+            }
+        }
+        if (k == 0)
+            continue;
+        const int32_t *cp = cands + 2 * off[i];
+        int32_t prevLen = MINMATCH - 1;
+        for (int32_t c = 0; c < k; c++) {
+            int32_t len = cp[2 * c], dist = cp[2 * c + 1];
+            if (dist == r) {
+                prevLen = len;   /* priced above, at least as long */
+                continue;
+            }
+            int32_t base = cost + (dist < 16 ? a->shortOff : 0);
+            int32_t ml = prevLen;
+            while (ml < len) {
+                if (ml < a->subLen)
+                    ml++;
+                else
+                    ml = len;
+                int32_t j = i + ml;
+                if (j > w)
+                    break;
+                if (ml < OPT4_COLS)
+                    tc = base + rowN[ml];
+                else
+                    tc = base + match_cost4(row, ml, 0, a);
+                if (tc < nodes[j].cost) {
+                    nodes[j].cost = tc;
+                    nodes[j].ll = 0;
+                    nodes[j].ml = ml;
+                    nodes[j].dist = dist;
+                    reps[j] = dist;
+                }
+            }
+            prevLen = len;
+        }
+    }
+}

@@ -277,6 +277,8 @@ const
   HC_CHAINMASK = HC_CHAINSIZE - 1;
   { hash chain depth of levels 4..8 }
   HC_ATTEMPTS: array[4..8] of Integer = (2, 4, 8, 16, 64);
+  HC_REP_ENOUGH = 32;   { format v4, levels 4..8: see CompressHCCore }
+  HC_REP_GAIN  = 2;
   { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }
   MID_MAXLOG   = 16;
@@ -2313,7 +2315,7 @@ function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
 var
   iend: PByte;
   mfl, pos, anchor, ml, ref, ml0, ref0, start0, ml2, ref2, start2,
-    ml3, ref3, start3, newMl, corr: SizeInt;
+    ml3, ref3, start3, newMl, corr, rl: SizeInt;
   state: Integer;   { 0 search at pos, 2 / 3 lz4hc's _Search2 / _Search3 }
 
   function Emit(p, len, r: SizeInt): Boolean;
@@ -2343,7 +2345,27 @@ begin
     begin
       if state = 0 then
       begin
-        ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+        if e.v4 and (pos > anchor) and (e.rep <= pos)
+           and (Read32(src + pos - e.rep) = Read32(src + pos)) then
+        begin
+          { format v4: a match at the previous offset costs a token and no
+            offset: taken unless the chains have one over HC_REP_GAIN bytes
+            longer (not searched for past HC_REP_ENOUGH) }
+          rl := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
+            src + pos - e.rep + SYLZ_MINMATCH, iend);
+          ml := 0;
+          if rl < HC_REP_ENOUGH then
+            ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+          if rl + HC_REP_GAIN >= ml then
+          begin
+            if not Emit(pos, rl, pos - e.rep) then
+              Exit(-1);
+            pos := pos + rl;
+            Continue;
+          end;
+        end
+        else
+          ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
         if ml < SYLZ_MINMATCH then
         begin
           Inc(pos);
@@ -2481,6 +2503,7 @@ type
   end;
 
 procedure sylzc_compress_hc(st: Pointer); cdecl; external name 'sylzc_compress_hc';
+procedure sylzc_compress_hc4(st: Pointer); cdecl; external name 'sylzc_compress_hc4';
 {$endif}
 
 function CompressHC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
@@ -2505,7 +2528,7 @@ begin
 {$ifdef SYLZ_C}
   { the parse in C (FPC kept its many live values on the stack), over the
     assembler chain search on x86_64 }
-  if SylzUseAsm and not e.v4 and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
+  if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
   begin
     s.src := src;
     s.iend := src + n;
@@ -2517,13 +2540,12 @@ begin
     if not SylzPreferC then
       sc.search := @HcSearchX64;
 {$endif}
-    sc.e.ctrl := e.ctrl;
-    sc.e.lit := e.lit;
-    sc.e.srcEnd := src + n;
-    sc.e.exact := @ExactCode[0, 0];
-    sylzc_compress_hc(@sc);
-    e.ctrl := sc.e.ctrl;
-    e.lit := sc.e.lit;
+    EmitToC(e, sc.e, src + n);
+    if e.v4 then
+      sylzc_compress_hc4(@sc)
+    else
+      sylzc_compress_hc(@sc);
+    EmitFromC(e, sc.e);
     Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
   end;
 {$endif}
@@ -2557,6 +2579,8 @@ type
                                   it, only each candidate's full length }
     skipLen: Integer;           { after a match this long, the positions it
                                   covers start no transitions of their own }
+    minRep: Integer;            { format v4: the shortest match tried at the
+                                  previous offset }
   end;
 
 const
@@ -2570,9 +2594,9 @@ const
     depth 128 and matches of 1024 the ratio stops improving; skipping
     inside long matches costs more ratio than it saves time. }
   OPT_LEVEL9: TSylzOptParams = (btCut: 32; btMaxLen: 256; sufficient: 128;
-    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
   OPT_LEVEL10: TSylzOptParams = (btCut: 256; btMaxLen: 1024; sufficient: 512;
-    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP);
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
 
 type
   TOptNode = record
@@ -2590,7 +2614,7 @@ const
   OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
   OPT_INDEX_BYTES = (OPT_WINDOW + 1) * SizeOf(Int32);   { off, cnt }
   OPT_WORK_BYTES  = OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES
-                    + 2 * OPT_INDEX_BYTES;
+                    + 3 * OPT_INDEX_BYTES;   { off, cnt; format v4: each node's offset }
 
 { The optimal parser's match finder: a binary tree (LZMA's bt4 without
   its 2- and 3-byte hashes). Every position is inserted into a binary
@@ -3048,9 +3072,216 @@ begin
   end;
 end;
 
+{ ── format v4's prices ── }
+
+const
+  { mtab4: [kind, row, match length]: rows 0..MAX_LL4 by the literals the
+    match's token carries, row OPT4_ROW_LONG after a run over LIT_SPLIT4
+    (an extension: no literals left for the token) }
+  OPT4_ROW_LONG = MAX_LL4 + 1;
+  OPT4_ROWS = MAX_LL4 + 2;
+  OPT4_COLS = 2 * MAX_ML4 + 2;   { lengths 0 .. 2 * MAX_ML4 + 1 }
+  OPT4_NEVER = High(Int32) div 4;
+
+type
+  { What format v4's DP needs besides the window; fixed layout, the C
+    version (sylzc_dp4args in sylzc.c) reads it. }
+  TOptDp4Args = record
+    subLen, minRep: Int32;
+    seq, esc, short: Int32;     { penalties, bits }
+    scale: Int32;               { OPT_SCALE }
+    litPrice: PInt32;           { a literal's price by byte value, bits }
+    wsrc: PByte;                { the window's input }
+    before: SizeInt;            { input bytes before the window }
+    mtab: PInt32;               { mtab4 }
+    codes: Pointer;             { Codes4 }
+    reps: PInt32;               { each node's previous distance; reps[0] set }
+  end;
+  POptDp4Args = ^TOptDp4Args;
+
+{ The row of mtab4 for a pending run of ll literals. }
+function Opt4Row(ll: SizeInt): SizeInt; inline;
+begin
+  if ll <= MAX_LL4 then
+    Result := ll
+  else if ll <= LIT_SPLIT4 then
+    Result := ll - MAX_LL4
+  else
+    Result := OPT4_ROW_LONG;
+end;
+
+{ What growing a literal run from ll to ll + 1 costs beyond the byte: the
+  literal-only token of a run over MAX_LL4, then the extension that
+  replaces it past LIT_SPLIT4 (EmitSplit4). }
+function LitStep4(ll: SizeInt; const a: TOptDp4Args): Int32; inline;
+begin
+  if ll < LIT_SPLIT4 then
+  begin
+    if ll = MAX_LL4 then
+      Result := a.scale + a.seq
+    else
+      Result := 0;
+  end
+  else if ll = LIT_SPLIT4 then
+    Result := a.scale * ExtBytes(ll + 1) + a.esc
+  else
+    Result := a.scale * (ExtBytes(ll + 1) - ExtBytes(ll));
+end;
+
+{ The match's share of a sequence as EmitSplit4 codes it: its tokens,
+  its offset bytes (kind 0), its extension; row as Opt4Row gives it. A
+  match under SYLZ_MINMATCH at the previous offset is only worth a token
+  of its own: with none, never. }
+function MatchCost4(row, ml, kind: SizeInt; const a: TOptDp4Args): Int32;
+var
+  tok, first: Int32;
+  l: SizeInt;
+  c: ^TCodes4;
+begin
+  c := a.codes;
+  tok := a.scale + a.seq;
+  l := row;
+  if row = OPT4_ROW_LONG then
+    l := 0;
+  Result := 0;
+  if kind = 0 then
+    Result := 2 * a.scale;
+  if ml > c^.mlSplit then
+  begin
+    if l > 0 then
+      Inc(Result, tok);
+    Inc(Result, tok + a.scale * Int32(ExtBytes(ml - MINML4[kind])) + a.esc);
+    Exit;
+  end;
+  first := ml;
+  if ml > MAX_ML4 then
+  begin
+    first := MAX_ML4;
+    if ml - first < SYLZ_MINREP then
+      first := ml - SYLZ_MINREP;
+    Inc(Result, tok * Int32((ml - first + MAX_ML4 - 1) div MAX_ML4));
+  end;
+  if c^.exact[kind, l, first] <> 255 then
+    Inc(Result, tok)
+  else if ml < SYLZ_MINMATCH then
+    Result := OPT4_NEVER
+  else
+    Inc(Result, 2 * tok);
+  if (row = OPT4_ROW_LONG) and (ml < SYLZ_MINMATCH) then
+    Result := OPT4_NEVER;   { an extended run and 2 or 3 bytes: SylzBound }
+end;
+
+{ OptDpPas for format v4. Each node also carries the distance of the last
+  match on its path (a.reps), which a match can take again for a token
+  and no offset bytes: tried first at every position, every length from
+  a.minRep. }
+procedure OptDp4Pas(nodes: POptNode; w: SizeInt; cands, off, cnt: PInt32;
+  const a: TOptDp4Args);
+var
+  i, j, k, c, ml, len, dist, prevLen, ll, r, rl, row: SizeInt;
+  cost, tc, base: Int32;
+  rowN, rowR, cp: PInt32;
+begin
+  for i := 0 to w - 1 do
+  begin
+    k := cnt[i];
+    if k < 0 then
+      Continue;
+    cost := nodes[i].cost;
+    ll := nodes[i].ll;
+    r := a.reps[i];
+    tc := cost + a.litPrice[a.wsrc[i]] + LitStep4(ll, a);
+    if tc < nodes[i + 1].cost then
+    begin
+      nodes[i + 1].cost := tc;
+      nodes[i + 1].ll := Int32(ll + 1);
+      nodes[i + 1].ml := 0;
+      a.reps[i + 1] := Int32(r);
+    end;
+    row := Opt4Row(ll);
+    rowN := a.mtab + row * OPT4_COLS;
+    rowR := rowN + OPT4_ROWS * OPT4_COLS;
+    { the previous distance }
+    if r <= a.before + i then
+    begin
+      rl := CountMatch(a.wsrc + i, a.wsrc + i - r, a.wsrc + w);
+      if rl >= a.minRep then
+      begin
+        base := cost;
+        if r < 16 then
+          Inc(base, a.short);
+        ml := a.minRep - 1;
+        while ml < rl do
+        begin
+          if ml < a.subLen then
+            Inc(ml)
+          else
+            ml := rl;
+          j := i + ml;
+          if ml < OPT4_COLS then
+            tc := base + rowR[ml]
+          else
+            tc := base + MatchCost4(row, ml, 1, a);
+          if tc < nodes[j].cost then
+          begin
+            nodes[j].cost := tc;
+            nodes[j].ll := 0;
+            nodes[j].ml := Int32(ml);
+            nodes[j].dist := Int32(r);
+            a.reps[j] := Int32(r);
+          end;
+        end;
+      end;
+    end;
+    if k = 0 then
+      Continue;
+    cp := cands + 2 * off[i];
+    prevLen := SYLZ_MINMATCH - 1;
+    for c := 0 to k - 1 do
+    begin
+      len := cp[2 * c];
+      dist := cp[2 * c + 1];
+      if dist = r then
+      begin
+        prevLen := len;   { priced above, at least as long }
+        Continue;
+      end;
+      base := cost;
+      if dist < 16 then
+        Inc(base, a.short);
+      ml := prevLen;
+      while ml < len do
+      begin
+        if ml < a.subLen then
+          Inc(ml)
+        else
+          ml := len;
+        j := i + ml;
+        if j > w then
+          Break;
+        if ml < OPT4_COLS then
+          tc := base + rowN[ml]
+        else
+          tc := base + MatchCost4(row, ml, 0, a);
+        if tc < nodes[j].cost then
+        begin
+          nodes[j].cost := tc;
+          nodes[j].ll := 0;
+          nodes[j].ml := Int32(ml);
+          nodes[j].dist := Int32(dist);
+          a.reps[j] := Int32(dist);
+        end;
+      end;
+      prevLen := len;
+    end;
+  end;
+end;
+
 {$ifdef SYLZ_C}
 procedure sylzc_opt_dp(nodes: POptNode; w: Int32; cands, off, cnt, mtab: PInt32;
   a: POptDpArgs); cdecl; external name 'sylzc_opt_dp';
+procedure sylzc_opt_dp4(nodes: POptNode; w: Int32; cands, off, cnt: PInt32;
+  a: POptDp4Args); cdecl; external name 'sylzc_opt_dp4';
 
 type
   { sylzc_optcands in sylzc.c: fixed field order }
@@ -3109,6 +3340,10 @@ var
   { match prices without the short-offset penalty, by pending run (row
     EXACT_LL + 1: any longer run) and length - MINMATCH }
   mtab: array[0..EXACT_LL + 1, 0..OPT_MTAB_COLS - 1] of Int32;
+  { format v4 }
+  a4: TOptDp4Args;
+  mtab4: array[0..1, 0..OPT4_ROWS - 1, 0..OPT4_COLS - 1] of Int32;
+  lastDist: SizeInt;
 begin
   q.seq := Round(p.pSeq * OPT_SCALE);
   q.esc := Round(p.pEsc * OPT_SCALE);
@@ -3132,6 +3367,27 @@ begin
   path := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES);
   off := PInt32(work + OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES);
   cnt := off + (OPT_WINDOW + 1);
+  lastDist := 1;
+  if e.v4 then
+  begin
+    a4.subLen := p.subLen;
+    a4.minRep := p.minRep;
+    a4.seq := q.seq;
+    a4.esc := q.esc;
+    a4.short := q.short;
+    a4.scale := OPT_SCALE;
+    a4.litPrice := @flat[0];
+    a4.codes := @Codes4;
+    a4.mtab := @mtab4[0, 0, 0];
+    a4.reps := cnt + (OPT_WINDOW + 1);
+    for k := 0 to 1 do
+      for i := 0 to OPT4_ROWS - 1 do
+        for j := 0 to OPT4_COLS - 1 do
+          if j < MINML4[k] then
+            mtab4[k, i, j] := OPT4_NEVER
+          else
+            mtab4[k, i, j] := MatchCost4(i, j, k, a4);
+  end;
 {$ifdef SYLZ_C}
   oc.b := @b;
   oc.insert := @sylzc_bt_insert;
@@ -3219,6 +3475,20 @@ begin
       nodes[0].ml := 0;
       for i := 1 to w do
         nodes[i].cost := High(Int32);
+      if e.v4 then
+      begin
+        a4.wsrc := a.wsrc;
+        a4.litPrice := a.litPrice;
+        a4.before := start;
+        a4.reps[0] := Int32(lastDist);
+{$ifdef SYLZ_C}
+        if SylzUseAsm then
+          sylzc_opt_dp4(nodes, Int32(w), cands, off, cnt, @a4)
+        else
+{$endif}
+          OptDp4Pas(nodes, w, cands, off, cnt, a4);
+      end
+      else
 {$ifdef SYLZ_C}
       if SylzUseAsm then
         sylzc_opt_dp(nodes, Int32(w), cands, off, cnt, @mtab[0, 0], @a)
@@ -3247,6 +3517,7 @@ begin
           CountLiterals(src, anchor, pos, hist)
         else if not EmitSequence(e, src + anchor, pos - anchor, path[3 * t + 2], path[3 * t + 1]) then
           Exit(-1);
+        lastDist := path[3 * t + 2];
         anchor := pos + path[3 * t + 1];
       end;
       if forced then
@@ -3256,6 +3527,7 @@ begin
           CountLiterals(src, anchor, pos, hist)
         else if not EmitSequence(e, src + anchor, pos - anchor, forcedDist, forcedLen) then
           Exit(-1);
+        lastDist := forcedDist;
         anchor := pos + forcedLen;
         start := anchor;
       end
