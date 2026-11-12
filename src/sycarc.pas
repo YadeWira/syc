@@ -1194,7 +1194,7 @@ begin
   begin
     if (head[17] <> 0) or (head[18] <> 0) or (head[19] <> 0) then
       Corrupt(Format('version %d: bad header', [k + 1]));
-    if head[16] <> CODEC_SYLZ then
+    if not (head[16] in [CODEC_SYLZ, CODEC_SYLZ4]) then
       Corrupt(Format('version %d: codec %d not supported by syc %s', [k + 1, head[16], SYC_VERSION]));
   end;
   v^.vnum := LEtoN(PUInt32(@head[4])^);
@@ -1697,6 +1697,8 @@ begin
       if fmt <> ARC_FMT_ENC then
         PInt64(@vhead[8])^ := NtoLE(UnixNow);   { format 3: 0, the time is in the index }
       vhead[16] := CODEC_SYLZ;   { format 2 only: format 1 ends before }
+      if opts.flags and SYLZ_V4 <> 0 then
+        vhead[16] := CODEC_SYLZ4;
       a.fout.WriteBuffer(vhead, vheadSize);
       a.pos := vstart + vheadSize;
 

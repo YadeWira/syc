@@ -56,10 +56,9 @@ end;
 
 function FormatName(flags: Integer): string;
 begin
+  Result := Format('sylz format v%d', [SylzFlagsFormat(flags)]);
   if flags and SYLZ_ENTROPY <> 0 then
-    Result := 'sylz format v3 (-ec)'
-  else
-    Result := 'sylz format v2';
+    Result := Result + ' (-ec)';
 end;
 
 { One file: every level, each block compressed and decompressed until
@@ -862,7 +861,7 @@ begin
     runs := MakeRuns(200000);
     noise := MakeRandom(70000);
     tiny := MakeText(13);
-    for flags := 0 to 1 do
+    for flags := 0 to 3 do   { SYLZ_ENTROPY, SYLZ_V4: formats 2 .. 5 }
     begin
       what := FormatName(flags);
       Phase('s: ' + what);

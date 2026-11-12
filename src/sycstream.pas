@@ -39,6 +39,7 @@ const
                         (syc 0.2.2-); 0 was sylz v1 (syc 0.2.0-0.2.1) }
   FORMAT_ENC   = 5;   { 5: encrypted (wiki: syc encryption) }
   CODEC_SYLZ   = 1;
+  CODEC_SYLZ4  = 2;   { sylz blocks of format v4 or v5 (syc 0.6.0-, experimental) }
   STORED_FLAG  = UInt32($80000000);
   PAYLOAD_MASK = UInt32($7FFFFFFF);
 
@@ -93,6 +94,15 @@ begin
 end;
 
 { the header's bytes, as the key record's AAD takes them }
+{ The codec byte for what these flags write. }
+function CodecOf(flags: Integer): Byte;
+begin
+  if flags and SYLZ_V4 <> 0 then
+    Result := CODEC_SYLZ4
+  else
+    Result := CODEC_SYLZ;
+end;
+
 function StreamPrefix(version, codec, level: Byte): TBytes;
 begin
   Result := nil;
@@ -167,7 +177,7 @@ begin
     if enc then
     begin
       Phase('c: the key (Argon2id)');
-      hdr := StreamPrefix(FORMAT_ENC, CODEC_SYLZ, Byte(opts.level));
+      hdr := StreamPrefix(FORMAT_ENC, CodecOf(opts.flags), Byte(opts.level));
       pw := GetPassword(opts, True, name);
       sealer := TStreamSealer.Create;
       NewKeyRecord(hdr, pw, UInt32(opts.kdfMemMiB) * 1024, 0, sealer.keys, rec);
@@ -180,7 +190,7 @@ begin
     end
     else
     begin
-      hdr := StreamPrefix(FORMAT_VER, CODEC_SYLZ, Byte(opts.level));
+      hdr := StreamPrefix(FORMAT_VER, CodecOf(opts.flags), Byte(opts.level));
       fout.WriteBuffer(hdr[0], Length(hdr));
       written := Length(hdr);
     end;
@@ -281,7 +291,7 @@ begin
   { version 4 and up: hdr[5] is the codec; the level byte follows }
   if hdr[4] >= 4 then
   begin
-    if hdr[5] <> CODEC_SYLZ then
+    if not (hdr[5] in [CODEC_SYLZ, CODEC_SYLZ4]) then
       Fail(EXIT_CORRUPT, Format('%s: codec %d not supported by syc %s', [name, hdr[5], SYC_VERSION]));
     if ReadFull(fin, @hdr[6], 1) <> 1 then
       Fail(EXIT_CORRUPT, name + ': truncated');
@@ -427,10 +437,9 @@ end;
 
 function EcNote(flags: Integer): string;
 begin
+  Result := Format(' (sylz format v%d)', [SylzFlagsFormat(flags)]);
   if flags and SYLZ_ENTROPY <> 0 then
-    Result := ' -ec (sylz format v3)'
-  else
-    Result := ' (sylz format v2)';
+    Result := ' -ec' + Result;
 end;
 
 { One operand. Returns its exit code; a usage error is raised instead. }
@@ -694,7 +703,7 @@ begin
       between them }
     if hdr[4] >= 4 then
     begin
-      if hdr[5] <> CODEC_SYLZ then
+      if not (hdr[5] in [CODEC_SYLZ, CODEC_SYLZ4]) then
         Fail(EXIT_CORRUPT, Format('%s: codec %d not supported by syc %s', [path, hdr[5], SYC_VERSION]));
       Need(@hdr[6], 1);
     end
@@ -704,6 +713,9 @@ begin
     extra := 0;
     what := Format('%s stream, format version %d, codec sylz, written at level %d',
       [STREAM_SUFFIX, hdr[4], hdr[6]]);
+    if (hdr[4] >= 4) and (hdr[5] = CODEC_SYLZ4) then
+      what := Format('%s stream, format version %d, codec sylz (block formats v4 and v5), written at level %d',
+        [STREAM_SUFFIX, hdr[4], hdr[6]]);
     if enc then
     begin
       { the key record: "SYCK", flags, then two slots; the one of the

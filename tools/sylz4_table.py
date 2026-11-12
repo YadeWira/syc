@@ -77,13 +77,13 @@ def sequences(block, table):
 
 
 def pair_of(k, ll, ml):
-    """The (kind, literals, match) pair EmitSequence4 looks up for a
-    sequence, or None when it takes an escape with no pair."""
-    if k == 0 and ml == MINMATCH and ll > MAX_LL:
-        return None
+    """What EmitSequence4 looks up for a sequence: the pair (kind,
+    literals, match), with literals -1 for a run over LIT_SPLIT (an
+    extended run and that match in one token, if there is such a code);
+    None when nothing is looked up."""
     if ll > LIT_SPLIT:
-        ll = 0
-    elif ll > MAX_LL:
+        return (k, -1, ml) if ml <= MAX_ML else None
+    if ll > MAX_LL:
         ll -= MAX_LL
     if ml > ML_SPLIT:
         return None
@@ -115,11 +115,16 @@ def main():
                MLEXT | OFF | MINMATCH << 8,        # match extended, new offset
                MLEXT | MINREP << 8]                # match extended, previous offset
     room = 256 - len(codes) - len(escapes)
+    # (the escape for a long run and a 4-byte match at a new offset is fixed)
+    freq.pop((0, -1, MINMATCH), None)
     best = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:room]
-    codes += [(0 if k else OFF) | ll | ml << 8 for (k, ll, ml), _ in best]
+    codes += [(0 if k else OFF) | (LLEXT if ll < 0 else ll) | ml << 8 for (k, ll, ml), _ in best]
+    escapes = [e for e in escapes if e not in codes]
+    assert len(escapes) == 4
     assert len(codes) == 256 - len(escapes) and len(set(codes)) == len(codes)
-    # new-offset codes, previous-offset codes, escapes; by literals, then match
-    codes.sort(key=lambda e: (0 if e & OFF else 1, e & 0xFF, e >> 8 & 0xFF))
+    # exact codes (new offset, then previous offset; by literals, then match),
+    # then the escapes
+    codes.sort(key=lambda e: (1 if e & LLEXT else 0, 0 if e & OFF else 1, e & 0xFF, e >> 8 & 0xFF))
     codes += escapes
     covered = sum(v for _, v in best) / max(sum(freq.values()), 1e-9)
     print('{ %d pairs with literals, %.1f%% of those asked for }' % (len(best), 100 * covered),

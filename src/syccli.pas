@@ -130,7 +130,7 @@ end;
 {$endif}
 
 type
-  TOptId = (oLevel, oEc, oBlock, oThreads, oOut, oStdout, oForce, oRm,
+  TOptId = (oLevel, oEc, oFormat, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
     oRaw, oSize, oPassword, oPasswordFile, oNewPassword, oNewPasswordFile, oVisibleNames, oKdfMem, oProgress, oNoProgress,
     oLevels, oTime, oStats, oDebug, oPaths, oColor, oQuiet, oVerbose, oHelp);
@@ -143,9 +143,10 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..36] of TOptDef = (
+  OPTION_DEFS: array[0..37] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'acb'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'acb'),
+    (id: oFormat;  short: 'F';  long: 'format';     value: True;  cmds: 'acb'),
     (id: oBlock;   short: 'b';  long: 'block-size'; value: True;  cmds: 'acb'),
     (id: oThreads; short: 't';  long: 'threads';    value: True;  cmds: 'axcdt'),
     (id: oOut;     short: 'o';  long: 'out';        value: True;  cmds: 'xcd'),
@@ -318,6 +319,9 @@ begin
   WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
     ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do,');
   WriteLn('              9-10 price literals by their Huffman codes');
+  WriteLn('  -F, --format N   the sylz block format: 2 (default; 3 with -ec), or 4');
+  WriteLn('              (5 with -ec): smaller at every level, experimental: read');
+  WriteLn('              by syc ', SYC_VERSION, ' only until it is frozen');
 end;
 
 procedure PasswordUsage(cmd: Char);
@@ -730,6 +734,14 @@ begin
           opts.levelSet := True;
         end;
       oEc: opts.flags := opts.flags or SYLZ_ENTROPY;
+      oFormat:
+        { 2 and 4 are the plain formats, 3 and 5 those with -ec }
+        case IntArg(shown, value, 2, 5) of
+          2: opts.flags := opts.flags and not SYLZ_V4;
+          3: opts.flags := opts.flags and not SYLZ_V4 or SYLZ_ENTROPY;
+          4: opts.flags := opts.flags or SYLZ_V4;
+          5: opts.flags := opts.flags or SYLZ_V4 or SYLZ_ENTROPY;
+        end;
       oBlock: opts.blockMiB := IntArg(shown, value, 1, MAX_BLOCK shr 20);
       oThreads: opts.threads := IntArg(shown, value, 1, MAX_THREADS);
       oOut:

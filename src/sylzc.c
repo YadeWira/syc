@@ -650,7 +650,8 @@ typedef struct {
 #define ML_SPLIT4  64
 struct sylzc_codes4 {
     uint8_t exact[2][MAX_LL4 + 1][MAX_ML4 + 1];
-    uint8_t litx, llx4;
+    uint8_t llx[2][MAX_ML4 + 1];
+    uint8_t litx;
     uint8_t mlx[2];
     uint8_t litSplit, mlSplit;
 };
@@ -720,8 +721,9 @@ static __attribute__((noinline)) uint8_t *emit_split4(const struct sylzc_codes4 
     uint8_t *p, int k, intptr_t ll, intptr_t ml)
 {
     intptr_t part;
-    if (k == 0 && ml == MINMATCH && ll > MAX_LL4) {
-        *p++ = t->llx4;
+    if (ml <= MAX_ML4 && t->llx[k][ml] != 255
+        && (ll > t->litSplit || (ll > MAX_LL4 && k == 0 && ml == MINMATCH))) {
+        *p++ = t->llx[k][ml];
         put_ext(&p, ll);
         return p;
     }
@@ -2048,7 +2050,9 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
             first = ml - MINREP;
         r += tok * ((ml - first + MAX_ML4 - 1) / MAX_ML4);
     }
-    if (c->exact[kind][l][first] != 255)
+    if (row == OPT4_ROW_LONG && ml <= MAX_ML4 && c->llx[kind][ml] != 255)
+        ;   /* the run's token is the match's too */
+    else if (c->exact[kind][l][first] != 255)
         r += tok;
     else if (ml < MINMATCH)
         r = OPT4_NEVER;

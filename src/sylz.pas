@@ -183,30 +183,30 @@ const
     $0020F01, $0021001, $0021101, $0021201, $0021301, $0021401, $0021501, $0021701,
     $0021B01, $0021E01, $0021F01, $0022001, $0020402, $0020502, $0020602, $0020702,
     $0020802, $0020902, $0020A02, $0020B02, $0020C02, $0020D02, $0020E02, $0020F02,
-    $0021002, $0021102, $0021202, $0021502, $0021E02, $0022002, $0020403, $0020503,
-    $0020603, $0020703, $0020803, $0020903, $0020A03, $0020B03, $0020C03, $0020D03,
-    $0020E03, $0022003, $0020404, $0020504, $0020604, $0020704, $0020804, $0020904,
-    $0020A04, $0020B04, $0020C04, $0022004, $0020405, $0020505, $0020605, $0020705,
-    $0020805, $0020905, $0020A05, $0020B05, $0020D05, $0022005, $0020406, $0020506,
-    $0020606, $0020706, $0020806, $0020906, $0020A06, $0020C06, $0020407, $0020507,
-    $0020607, $0020707, $0020807, $0020907, $0020408, $0020508, $0020608, $0020708,
-    $0020808, $0020409, $0020509, $0020609, $0020709, $0020809, $002040A, $002050A,
-    $002060A, $002070A, $002080A, $002040B, $002050B, $002060B, $002070B, $002140B,
-    $002040C, $002050C, $002060C, $002070C, $002080C, $002140C, $002040D, $002050D,
-    $002060D, $002070D, $002040E, $002050E, $002060E, $002040F, $002050F, $002060F,
-    $002070F, $002080F, $0020410, $0020610, $0000200, $0000300, $0000400, $0000500,
-    $0000600, $0000700, $0000800, $0000900, $0000A00, $0000B00, $0000C00, $0000D00,
-    $0000E00, $0000F00, $0001000, $0001100, $0001200, $0001300, $0001400, $0001500,
-    $0001600, $0001700, $0001800, $0001900, $0001A00, $0001B00, $0001C00, $0001D00,
-    $0001E00, $0001F00, $0002000, $0000001, $0000401, $0000501, $0000601, $0000701,
-    $0000801, $0000901, $0000A01, $0000B01, $0000C01, $0000D01, $0000E01, $0000F01,
-    $0001001, $0001101, $0001301, $0001401, $0001501, $0001701, $0001B01, $0002001,
-    $0000002, $0000402, $0000502, $0000602, $0000702, $0000802, $0000A02, $0000E02,
-    $0001202, $0001602, $0001E02, $0002002, $0000003, $0000403, $0000503, $0000903,
-    $0000D03, $0000004, $0000404, $0000504, $0000005, $0000405, $0000605, $0000705,
-    $0000B05, $0000006, $0000406, $0000606, $0000A06, $0000007, $0000407, $0000507,
-    $0000607, $0000008, $0000009, $000000A, $000000B, $000050B, $000000C, $000040C,
-    $000000D, $000000E, $000000F, $0000010, $1000000, $1020400, $2020400, $2000200
+    $0021002, $0021202, $0021502, $0021E02, $0022002, $0020403, $0020503, $0020603,
+    $0020703, $0020803, $0020903, $0020A03, $0020B03, $0020C03, $0020D03, $0020E03,
+    $0022003, $0020404, $0020504, $0020604, $0020704, $0020804, $0020904, $0020A04,
+    $0020B04, $0020C04, $0022004, $0020405, $0020505, $0020605, $0020705, $0020805,
+    $0020905, $0020A05, $0020B05, $0020D05, $0020406, $0020506, $0020606, $0020706,
+    $0020806, $0020906, $0020A06, $0020C06, $0020407, $0020507, $0020607, $0020707,
+    $0020807, $0020907, $0020408, $0020508, $0020608, $0020708, $0020808, $0020409,
+    $0020509, $0020609, $0020709, $0020809, $002040A, $002050A, $002060A, $002070A,
+    $002080A, $002040B, $002050B, $002060B, $002070B, $002140B, $002040C, $002060C,
+    $002070C, $002140C, $002040D, $002050D, $002060D, $002070D, $002040E, $002060E,
+    $002040F, $002050F, $002060F, $002070F, $002080F, $0020410, $0020610, $0000200,
+    $0000300, $0000400, $0000500, $0000600, $0000700, $0000800, $0000900, $0000A00,
+    $0000B00, $0000C00, $0000D00, $0000E00, $0000F00, $0001000, $0001100, $0001200,
+    $0001300, $0001400, $0001500, $0001600, $0001700, $0001800, $0001900, $0001A00,
+    $0001B00, $0001C00, $0001D00, $0001E00, $0001F00, $0002000, $0000001, $0000401,
+    $0000501, $0000601, $0000701, $0000801, $0000901, $0000A01, $0000B01, $0000C01,
+    $0000D01, $0000E01, $0000F01, $0001001, $0001101, $0001301, $0001401, $0001501,
+    $0001701, $0001B01, $0002001, $0000002, $0000402, $0000502, $0000602, $0000702,
+    $0000802, $0000A02, $0000E02, $0001202, $0001602, $0001E02, $0002002, $0000003,
+    $0000403, $0000503, $0000903, $0000D03, $0000004, $0000404, $0000504, $0000005,
+    $0000405, $0000605, $0000705, $0000B05, $0000006, $0000406, $0000606, $0000A06,
+    $0000007, $0000407, $0000507, $0000607, $0000008, $0000009, $000000A, $000000B,
+    $000050B, $000000C, $000040C, $000000D, $000000E, $000000F, $0000010, $1020500,
+    $1020600, $1020700, $1020800, $1020900, $1000000, $1020400, $2020400, $2000200
   );
 
 { SylzCompressCtx with flags. Without SYLZ_ENTROPY the output is format v2
@@ -221,6 +221,14 @@ function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   Returns dstLen, or -1 on corrupt input. A v3 block with coded literals
   takes a temporary buffer of its literal count. }
 function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;
+
+{ The format of the block at src, by its header: 2 .. 5, or 0 if it is too
+  short to tell. }
+function SylzBlockFormat(src: PByte; n: SizeInt): Integer;
+
+{ The format SylzCompressEx writes with these flags, 2 .. 5 (with
+  SYLZ_ENTROPY a block may also come out as the format below it). }
+function SylzFlagsFormat(flags: Integer): Integer;
 
 { SylzDecompress with a caller-kept context; same results. }
 function SylzDecompressCtx(var dctx: TSylzDCtx; src: PByte; n: SizeInt; dst: PByte;
@@ -457,11 +465,12 @@ const
 type
   { Built from SYLZ_TOKENS4; sylzc.c reads it by these offsets. exact:
     [0 new offset / 1 previous offset, literals, match], 255 = no code;
-    the escapes: litx literals only, extended; llx4 literals extended and
-    a 4-byte match at a new offset; mlx[kind] match extended. }
+    the escapes: litx literals only, extended; llx[kind, match] literals
+    extended and that match; mlx[kind] match extended. }
   TCodes4 = record
     exact: array[0..1, 0..MAX_LL4, 0..MAX_ML4] of Byte;
-    litx, llx4: Byte;
+    llx: array[0..1, 0..MAX_ML4] of Byte;   { literals extended, this match }
+    litx: Byte;
     mlx: array[0..1] of Byte;
     litSplit, mlSplit: Byte;   { experiment: split thresholds }
   end;
@@ -502,10 +511,12 @@ begin
       Codes4.litx := Byte(code);
       seen := seen or 1;
     end
-    else if e = SYLZ_TOK4_LLEXT or SYLZ_TOK4_OFF or (SYLZ_MINMATCH shl 8) then
+    else if (e and SYLZ_TOK4_MLEXT = 0) and (ll = 0) and (ml >= UInt32(MINML4[k]))
+            and (ml <= MAX_ML4) and (Codes4.llx[k, ml] = 255) then
     begin
-      Codes4.llx4 := Byte(code);
-      seen := seen or 2;
+      Codes4.llx[k, ml] := Byte(code);
+      if (k = 0) and (ml = SYLZ_MINMATCH) then
+        seen := seen or 2;
     end
     else if e = SYLZ_TOK4_MLEXT or SYLZ_TOK4_OFF or (SYLZ_MINMATCH shl 8) then
     begin
@@ -557,11 +568,14 @@ function EmitSplit4(p: PByte; k, ll, ml: SizeInt): PByte;
 var
   part: SizeInt;
 begin
-  if (k = 0) and (ml = SYLZ_MINMATCH) and (ll > MAX_LL4) then
+  if (ml <= MAX_ML4) and (Codes4.llx[k, ml] <> 255)
+     and ((ll > Codes4.litSplit) or ((ll > MAX_LL4) and (k = 0) and (ml = SYLZ_MINMATCH))) then
   begin
-    { one token and its extension: split, a 4-byte match could take more
-      bytes than it saves, and SylzBound would not hold }
-    p^ := Codes4.llx4;
+    { a long run and this match in one token and its extension. (A 4-byte
+      match at a new offset always has that code and takes it from
+      MAX_LL4 literals on: split, it could cost more bytes than it saves,
+      and SylzBound would not hold.) }
+    p^ := Codes4.llx[k, ml];
     Inc(p);
     PutExt(p, ll);
     Exit(p);
@@ -3161,7 +3175,9 @@ begin
       first := ml - SYLZ_MINREP;
     Inc(Result, tok * Int32((ml - first + MAX_ML4 - 1) div MAX_ML4));
   end;
-  if c^.exact[kind, l, first] <> 255 then
+  if (row = OPT4_ROW_LONG) and (ml <= MAX_ML4) and (c^.llx[kind, ml] <> 255) then
+    { the run's token is the match's too }
+  else if c^.exact[kind, l, first] <> 255 then
     Inc(Result, tok)
   else if ml < SYLZ_MINMATCH then
     Result := OPT4_NEVER
@@ -3346,6 +3362,8 @@ var
   lastDist: SizeInt;
 begin
   q.seq := Round(p.pSeq * OPT_SCALE);
+  if e.v4 and (GetEnvironmentVariable('SYLZ4_PSEQ') <> '') then
+    q.seq := StrToInt(GetEnvironmentVariable('SYLZ4_PSEQ'));
   q.esc := Round(p.pEsc * OPT_SCALE);
   q.short := Round(p.pShort * OPT_SCALE);
   for i := 0 to EXACT_LL + 1 do
@@ -3372,6 +3390,8 @@ begin
   begin
     a4.subLen := p.subLen;
     a4.minRep := p.minRep;
+    if GetEnvironmentVariable('SYLZ4_MINREP') <> '' then
+      a4.minRep := StrToInt(GetEnvironmentVariable('SYLZ4_MINREP'));
     a4.seq := q.seq;
     a4.esc := q.esc;
     a4.short := q.short;
@@ -4891,6 +4911,26 @@ begin
       dctx.lits, dctx.lits + litCount, dst, dstLen)
   else
     Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
+end;
+
+function SylzBlockFormat(src: PByte; n: SizeInt): Integer;
+begin
+  if n < HEADER_SIZE then
+    Exit(0);
+  Result := 2;
+  if src[3] and $40 <> 0 then
+    Result := 4;
+  if src[3] and $80 <> 0 then
+    Inc(Result);
+end;
+
+function SylzFlagsFormat(flags: Integer): Integer;
+begin
+  Result := 2;
+  if flags and SYLZ_V4 <> 0 then
+    Result := 4;
+  if flags and SYLZ_ENTROPY <> 0 then
+    Inc(Result);
 end;
 
 function SylzDecompress(src: PByte; n: SizeInt; dst: PByte; dstLen: SizeInt): SizeInt;

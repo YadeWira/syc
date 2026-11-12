@@ -25,6 +25,7 @@ const
   VHEAD_SIZE    = 20;   { format 2; 16 in format 1 }
   VHEAD_SIZE_1  = 16;
   CODEC_SYLZ    = 1;    { blocks are sylz blocks, format v2 or v3 }
+  CODEC_SYLZ4   = 2;    { sylz blocks of format v4 or v5 (syc 0.6.0-, experimental) }
   BLOCKHDR_SIZE = 12;
   COMMIT_SIZE   = 24;
 
