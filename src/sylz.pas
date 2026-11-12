@@ -316,7 +316,7 @@ const
   HC_CHAINMASK = HC_CHAINSIZE - 1;
   { hash chain depth of levels 4..8 }
   HC_ATTEMPTS: array[4..8] of Integer = (2, 4, 8, 16, 64);
-  HC_REP_ENOUGH = 32;   { format v4, levels 4..8: see CompressHCCore }
+  HC_REP_ENOUGH = 16;   { format v4, levels 4..8: see CompressHCCore }
   HC_REP_GAIN  = 2;
   { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }

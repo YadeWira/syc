@@ -1333,7 +1333,7 @@ void sylzc_bt_insert(sylzc_bt *b)
 /* ── levels 4-8: lz4hc's parse ────────────────────────────────────────── */
 
 #define HCW_OPTIMAL_ML 18
-#define HC_REP_ENOUGH 32   /* format v4: see CompressHCCore in sylz.pas */
+#define HC_REP_ENOUGH 16   /* format v4: see CompressHCCore in sylz.pas */
 #define HC_REP_GAIN 2
 
 /* In/out of sylzc_compress_hc (THcCState in sylz.pas). search is the
