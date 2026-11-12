@@ -293,12 +293,29 @@ def decode_block4(b, n):
     """A format v4 or v5 block of n decoded bytes."""
     hdr = u32(b, 0)
     tok_len = hdr & 0x3FFFFFFF
-    off_len = u32(b, 4)
-    if tok_len > len(b) - 8 or off_len > len(b) - 8 - tok_len or off_len & 1:
-        raise SylzError("stream lengths past the block")
-    tok_end = 8 + tok_len
-    offs = b[tok_end:tok_end + off_len]
-    i = tok_end + off_len
+    if tok_len > len(b) - 4:
+        raise SylzError("token stream past the block")
+    tok_end = 4 + tok_len
+    i = tok_end
+    off_count = 0
+    if tok_len:
+        # the offsets' count: 1 to 5 bytes, 7 bits each, low bits first
+        shift = 0
+        while True:
+            if i >= len(b) or shift == 35:
+                raise SylzError("truncated offset count")
+            v = b[i]
+            i += 1
+            if shift == 28 and v > 15:
+                raise SylzError("offset count over 32 bits")
+            off_count |= (v & 127) << shift
+            shift += 7
+            if v < 128:
+                break
+        if off_count > (len(b) - i) // 2:
+            raise SylzError("offsets past the block")
+    offs = b[i:i + 2 * off_count]
+    i += 2 * off_count
     if hdr >> 31:
         lits, i = decode_literal_section(b, i, n)
         if i != len(b):
@@ -309,19 +326,31 @@ def decode_block4(b, n):
     lp = 0   # literals used
     op = 0   # offset bytes used
     dist = 1
-    c = 8
+    c = 4
+    table = list(TOKENS4)   # each block starts with the built-in table
     while c < tok_end:
-        chdr = u32(b[:tok_end], c)
-        c += 4
-        if chdr & 0x40000000:
-            raise SylzError("chunk header bit 30")
-        table = TOKENS4
-        if chdr >> 31:
-            if tok_end - c < 512:
-                raise SylzError("truncated table")
-            table = [table_entry(b[c + 2 * k] | b[c + 2 * k + 1] << 8) for k in range(256)]
-            c += 512
-        cend = c + (chdr & 0x3FFFFFFF)
+        # the chunk's header: 2 bytes, or 4 with bit 1 set
+        if tok_end - c < 2:
+            raise SylzError("truncated chunk header")
+        chdr = b[c] | b[c + 1] << 8
+        c += 2
+        if chdr & 2:
+            if tok_end - c < 2:
+                raise SylzError("truncated chunk header")
+            chdr |= b[c] << 16 | b[c + 1] << 24
+            c += 2
+        if chdr & 1:
+            # entries replaced, from this chunk on
+            if c >= tok_end:
+                raise SylzError("truncated table update")
+            count = b[c] + 1
+            c += 1
+            if tok_end - c < 3 * count:
+                raise SylzError("truncated table update")
+            for k in range(count):
+                table[b[c]] = table_entry(b[c + 1] | b[c + 2] << 8)
+                c += 3
+        cend = c + (chdr >> 2)
         if cend > tok_end:
             raise SylzError("chunk past the token stream")
         while c < cend:
