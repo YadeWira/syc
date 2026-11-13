@@ -779,17 +779,40 @@ static inline __attribute__((always_inline)) void emit_fast4(sylzc_emit *e,
     *plit = w + litLen;
 }
 
-/* PutPair4 in sylz.pas */
-static uint8_t *put_pair4(const struct sylzc_codes4 *t, uint8_t *p, int k,
-                          intptr_t ll, intptr_t ml)
+/* FindSplit4 in sylz.pas: the split of ll literals (up to LIT_SPLIT4)
+   and a match of ml (up to ML_SPLIT4) that has a code, *b literals with
+   the first *m bytes of the match; 0: none (the first one tried) */
+static int find_split4(const struct sylzc_codes4 *t, int k, intptr_t ll, intptr_t ml,
+                       intptr_t *b, intptr_t *m)
 {
-    int c = t->cell[k][ll][ml];
-    if (c == 255) {
-        *p++ = t->cell[1][ll][0];
-        c = t->cell[k][0][ml];
+    intptr_t b0 = ll, bmax = ll, m0 = ml, mmin = ml, i;
+    if (ll > MAX_LL4) {
+        b0 = ll - MAX_LL4;
+        bmax = MAX_LL4;
     }
-    *p++ = (uint8_t)c;
-    return p;
+    if (ml > MAX_ML4) {
+        m0 = MAX_ML4;
+        if (ml - m0 < MINREP)
+            m0 = ml - MINREP;
+        mmin = ml - MAX_ML4;
+        if (mmin < (k ? MINREP : MINMATCH))
+            mmin = k ? MINREP : MINMATCH;
+    }
+    *b = b0;
+    *m = m0;
+    if (t->cell[k][b0][m0] != 255)
+        return 1;
+    for (i = b0 + 1; i <= bmax; i++)
+        if (t->cell[k][i][m0] != 255) {
+            *b = i;
+            return 1;
+        }
+    for (i = m0 - 1; i >= mmin; i--)
+        if (t->cell[k][b0][i] != 255) {
+            *m = i;
+            return 1;
+        }
+    return 0;
 }
 
 /* PutTokens4 in sylz.pas, past its first case: a sequence with no exact
@@ -797,7 +820,7 @@ static uint8_t *put_pair4(const struct sylzc_codes4 *t, uint8_t *p, int k,
 static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 *t,
     uint8_t *p, int k, intptr_t ll, intptr_t ml)
 {
-    intptr_t part;
+    intptr_t b, m;
     if (ll > LIT_SPLIT4) {
         if (ml <= MAX_ML4) {
             if (t->cell[k][ROW4_EXT][ml] != 255) {
@@ -814,40 +837,36 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
         *p++ = t->cell[1][ROW4_EXT][0];
         put_ext(&p, ll);
         ll = 0;
-    } else if (ll > MAX_LL4) {
-        if (k == 0 && ml == MINMATCH) {
-            *p++ = t->cell[0][ROW4_EXT][MINMATCH];
-            put_ext(&p, ll);
-            return p;
-        }
-        *p++ = t->cell[1][MAX_LL4][0];
-        ll -= MAX_LL4;
+    } else if (ll > MAX_LL4 && k == 0 && ml == MINMATCH) {
+        *p++ = t->cell[0][ROW4_EXT][MINMATCH];
+        put_ext(&p, ll);
+        return p;
     }
     if (ml > ML_SPLIT4) {
+        if (ll > MAX_LL4) {
+            *p++ = t->cell[1][MAX_LL4][0];
+            ll -= MAX_LL4;
+        }
         if (ll > 0 && t->cell[k][ll][COL4_EXT] == 255) {
             *p++ = t->cell[1][ll][0];
             ll = 0;
         }
         *p++ = t->cell[k][ll][COL4_EXT];
         put_ext(&p, ml - (k ? MINREP : MINMATCH));
-    } else if (ml > MAX_ML4) {
-        part = MAX_ML4;
-        if (ml - part < MINREP)
-            part = ml - MINREP;
-        p = put_pair4(t, p, k, ll, part);
-        ml -= part;
-        while (ml > 0) {
-            part = ml;
-            if (part > MAX_ML4) {
-                part = MAX_ML4;
-                if (ml - part < MINREP)
-                    part = ml - MINREP;
-            }
-            *p++ = t->cell[1][0][part];
-            ml -= part;
-        }
-    } else
-        p = put_pair4(t, p, k, ll, ml);
+        return p;
+    }
+    if (!find_split4(t, k, ll, ml, &b, &m))
+        b = 0;
+    ll -= b;
+    if (ll > MAX_LL4) {
+        *p++ = t->cell[1][MAX_LL4][0];
+        ll -= MAX_LL4;
+    }
+    if (ll > 0)
+        *p++ = t->cell[1][ll][0];
+    *p++ = t->cell[k][b][m];
+    if (ml > m)
+        *p++ = t->cell[1][0][ml - m];
     return p;
 }
 
@@ -2126,8 +2145,8 @@ void __libc_csu_fini(void) {}
 
 /* ── format v4's optimal-parser DP ────────────────────────────────────── */
 
-#define OPT4_ROW_LONG (MAX_LL4 + 1)
-#define OPT4_ROWS     (MAX_LL4 + 2)
+#define OPT4_ROW_LONG (LIT_SPLIT4 + 1)
+#define OPT4_ROWS     (LIT_SPLIT4 + 2)
 #define OPT4_COLS     (2 * MAX_ML4 + 2)
 #define OPT4_NEVER    (INT32_MAX / 4)
 
@@ -2159,26 +2178,23 @@ static int32_t lit_step4(int32_t ll, const sylzc_dp4args *a)
 static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4args *a)
 {
     const struct sylzc_codes4 *c = a->codes;
-    int32_t tok = a->scale + a->seq, first, r;
-    int32_t l = row == OPT4_ROW_LONG ? 0 : row;
+    int32_t tok = a->scale + a->seq, r;
+    intptr_t l = row == OPT4_ROW_LONG ? 0 : row, b, m;
     r = kind == 0 ? 2 * a->scale : 0;
     if (row == OPT4_ROW_LONG && ml > MAX_ML4 && c->cell[kind][ROW4_EXT][COL4_EXT] != 255)
         return r + a->scale * ext_bytes(ml - (kind ? MINREP : MINMATCH));
     if (ml > ML_SPLIT4) {
+        if (l > MAX_LL4)
+            l -= MAX_LL4;
         if (l > 0 && c->cell[kind][l][COL4_EXT] == 255)
             r += tok;
         return r + tok + a->scale * ext_bytes(ml - (kind ? MINREP : MINMATCH)) + a->esc;
     }
-    first = ml;
-    if (ml > MAX_ML4) {
-        first = MAX_ML4;
-        if (ml - first < MINREP)
-            first = ml - MINREP;
-        r += tok * ((ml - first + MAX_ML4 - 1) / MAX_ML4);
-    }
+    if (ml > MAX_ML4)
+        r += tok;   /* what is left of the match: a token at the previous offset */
     if (row == OPT4_ROW_LONG && ml <= MAX_ML4 && c->cell[kind][ROW4_EXT][ml] != 255)
         ;   /* the run's token is the match's too */
-    else if (c->cell[kind][l][first] != 255)
+    else if (find_split4(c, kind, l, ml, &b, &m))
         r += tok;
     else if (ml < MINMATCH)
         r = OPT4_NEVER;
@@ -2209,7 +2225,7 @@ void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
             nodes[i + 1].ml = 0;
             reps[i + 1] = r;
         }
-        int32_t row = ll <= MAX_LL4 ? ll : ll <= LIT_SPLIT4 ? ll - MAX_LL4 : OPT4_ROW_LONG;
+        int32_t row = ll <= LIT_SPLIT4 ? ll : OPT4_ROW_LONG;
         const int32_t *rowN = a->mtab + row * OPT4_COLS;
         const int32_t *rowR = rowN + OPT4_ROWS * OPT4_COLS;
         /* the previous distance */

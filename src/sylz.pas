@@ -748,29 +748,62 @@ begin
     and ((ml <= MAX_ML4) or (ml = TAB4_EXT_ML));
 end;
 
-{ The code of (ll literals, a match of ml) of kind k, or a literal-only
-  token and the match's }
-procedure PutPair4(const c: TCodes4; var p: PByte; k, ll, ml: SizeInt);
+{ How a sequence of kind k that is not one token is split into plain
+  tokens, when a split with a code exists: of ll literals (up to
+  LIT_SPLIT4) b stay with the match and the others go in a literal-only
+  token before it; of a match of ml (up to ML_SPLIT4) m bytes are in that
+  token and the rest in one at the previous offset. Tried first: MAX_LL4
+  literals on their own and the longest first part; then the other splits
+  of the literals; then the shorter first parts. False: no split has a
+  code (b and m are then the first tried). }
+function FindSplit4(const c: TCodes4; k, ll, ml: SizeInt; out b, m: SizeInt): Boolean;
 var
-  code: Byte;
+  bMax, mMin, i: SizeInt;
 begin
-  code := c[k, ll, ml];
-  if code = 255 then
+  b := ll;
+  bMax := ll;
+  if ll > MAX_LL4 then
   begin
-    p^ := c[1, ll, 0];
-    Inc(p);
-    code := c[k, 0, ml];
+    b := ll - MAX_LL4;
+    bMax := MAX_LL4;
   end;
-  p^ := code;
-  Inc(p);
+  m := ml;
+  mMin := ml;
+  if ml > MAX_ML4 then
+  begin
+    { no part under its kind's shortest match, none over MAX_ML4 }
+    m := MAX_ML4;
+    if ml - m < SYLZ_MINREP then
+      m := ml - SYLZ_MINREP;
+    mMin := ml - MAX_ML4;
+    if mMin < MINML4[k] then
+      mMin := MINML4[k];
+  end;
+  if c[k, b, m] <> 255 then
+    Exit(True);
+  for i := b + 1 to bMax do
+    if c[k, i, m] <> 255 then
+    begin
+      b := i;
+      Exit(True);
+    end;
+  for i := m - 1 downto mMin do
+    if c[k, b, i] <> 255 then
+    begin
+      m := i;
+      Exit(True);
+    end;
+  Result := False;
 end;
 
-{ What PutTokens4 looks up for a sequence of kind k: the cell (row: the
-  literals its match's token carries, ROW4_EXT for a run over LIT_SPLIT4;
-  col: the match length, COL4_EXT for one over ML_SPLIT4, or over MAX_ML4
-  after such a run); false when it only takes codes every table has. The
-  chunks' table updates are made from the counts of these. }
-function PairOf4(k, ll, ml: SizeInt; out row, col: SizeInt): Boolean; inline;
+{ What PutTokens4 looks up in table c for a sequence of kind k: the cell
+  (row: the literals its match's token carries, ROW4_EXT for a run over
+  LIT_SPLIT4; col: the match length, COL4_EXT for one over ML_SPLIT4, or
+  over MAX_ML4 after such a run); false when it only takes codes every
+  table has. The chunks' table updates are made from the counts of these;
+  a sequence that is split counts the cell its split takes, which keeps
+  that code in the table. }
+function PairOf4(const c: TCodes4; k, ll, ml: SizeInt; out row, col: SizeInt): Boolean; inline;
 begin
   Result := True;
   col := ml;
@@ -782,22 +815,18 @@ begin
       col := COL4_EXT;
     Exit;
   end;
-  if ll > MAX_LL4 then
-  begin
-    if (k = 0) and (ml = SYLZ_MINMATCH) then
-      Exit(False);
-    Dec(row, MAX_LL4);
-  end;
   if ml > ML_SPLIT4 then
   begin
+    if ll > MAX_LL4 then
+      Dec(row, MAX_LL4);
     col := COL4_EXT;
     Exit(row <> 0);
   end;
-  if ml > MAX_ML4 then
+  if (ll > MAX_LL4) or (ml > MAX_ML4) then
   begin
-    col := MAX_ML4;
-    if ml - col < SYLZ_MINREP then
-      col := ml - SYLZ_MINREP;
+    if (ll > MAX_LL4) and (k = 0) and (ml = SYLZ_MINMATCH) then
+      Exit(False);
+    FindSplit4(c, k, ll, ml, row, col);
   end;
 end;
 
@@ -805,7 +834,7 @@ end;
   returns where they end. }
 function PutTokens4(const c: TCodes4; p: PByte; k, ll, ml: SizeInt): PByte;
 var
-  part: SizeInt;
+  b, m: SizeInt;
 begin
   if (ll <= MAX_LL4) and (ml <= MAX_ML4) and (c[k, ll, ml] <> 255) then
   begin
@@ -839,24 +868,24 @@ begin
     PutExt(p, ll);
     ll := 0;
   end
-  else if ll > MAX_LL4 then
+  else if (ll > MAX_LL4) and (k = 0) and (ml = SYLZ_MINMATCH) then
   begin
-    if (k = 0) and (ml = SYLZ_MINMATCH) then
-    begin
-      { a 4-byte match at a new offset takes the run's escape, which every
-        table has, from MAX_LL4 literals on: split, it could cost more
-        bytes than it saves, and SylzBound would not hold }
-      p^ := c[0, ROW4_EXT, SYLZ_MINMATCH];
-      Inc(p);
-      PutExt(p, ll);
-      Exit(p);
-    end;
-    p^ := c[1, MAX_LL4, 0];
+    { a 4-byte match at a new offset takes the run's escape, which every
+      table has, from MAX_LL4 literals on: split, it could cost more
+      bytes than it saves, and SylzBound would not hold }
+    p^ := c[0, ROW4_EXT, SYLZ_MINMATCH];
     Inc(p);
-    Dec(ll, MAX_LL4);
+    PutExt(p, ll);
+    Exit(p);
   end;
   if ml > ML_SPLIT4 then
   begin
+    if ll > MAX_LL4 then
+    begin
+      p^ := c[1, MAX_LL4, 0];
+      Inc(p);
+      Dec(ll, MAX_LL4);
+    end;
     { the literals in the escape's token, or in one of their own before it }
     if (ll > 0) and (c[k, ll, COL4_EXT] = 255) then
     begin
@@ -867,32 +896,32 @@ begin
     p^ := c[k, ll, COL4_EXT];
     Inc(p);
     PutExt(p, ml - MINML4[k]);
-  end
-  else if ml > MAX_ML4 then
+    Exit(p);
+  end;
+  { plain tokens: the literals the match's token does not take, in one or
+    two of their own before it; what is left of a match over MAX_ML4, in a
+    token at the previous offset (this match's) after it }
+  if not FindSplit4(c, k, ll, ml, b, m) then
+    b := 0;
+  Dec(ll, b);
+  if ll > MAX_LL4 then
   begin
-    { MAX_ML4 bytes at a time, the rest at the previous offset (this
-      match's); no part shorter than SYLZ_MINREP }
-    part := MAX_ML4;
-    if ml - part < SYLZ_MINREP then
-      part := ml - SYLZ_MINREP;
-    PutPair4(c, p, k, ll, part);
-    Dec(ml, part);
-    while ml > 0 do
-    begin
-      part := ml;
-      if part > MAX_ML4 then
-      begin
-        part := MAX_ML4;
-        if ml - part < SYLZ_MINREP then
-          part := ml - SYLZ_MINREP;
-      end;
-      p^ := c[1, 0, part];
-      Inc(p);
-      Dec(ml, part);
-    end;
-  end
-  else
-    PutPair4(c, p, k, ll, ml);
+    p^ := c[1, MAX_LL4, 0];
+    Inc(p);
+    Dec(ll, MAX_LL4);
+  end;
+  if ll > 0 then
+  begin
+    p^ := c[1, ll, 0];
+    Inc(p);
+  end;
+  p^ := c[k, b, m];
+  Inc(p);
+  if ml > m then
+  begin
+    p^ := c[1, 0, ml - m];
+    Inc(p);
+  end;
   Result := p;
 end;
 
@@ -1107,7 +1136,7 @@ begin
     begin
       GetRec4(r, ll, ml, dist);
       k := Ord(dist = prev);
-      if PairOf4(k, ll, ml, row, col) then
+      if PairOf4(e.codes, k, ll, ml, row, col) then
         Inc(cnt[k, row, col]);
       prev := dist;
     end
@@ -1117,7 +1146,7 @@ begin
       if r > e.recs then
         prev := SizeInt(r[-1]) + 1;
       k := Ord(SizeInt(r[2]) + 1 = prev);
-      if PairOf4(k, r[0], r[1], row, col) then
+      if PairOf4(e.codes, k, r[0], r[1], row, col) then
         Inc(cnt[k, row, col]);
       Inc(r, 3 * sample);
     end;
@@ -4509,11 +4538,11 @@ end;
 { ── format v4's prices ── }
 
 const
-  { mtab4: [kind, row, match length]: rows 0..MAX_LL4 by the literals the
-    match's token carries, row OPT4_ROW_LONG after a run over LIT_SPLIT4
-    (an extension: no literals left for the token) }
-  OPT4_ROW_LONG = MAX_LL4 + 1;
-  OPT4_ROWS = MAX_LL4 + 2;
+  { mtab4: [kind, row, match length]: rows 0..LIT_SPLIT4 by the literals
+    before the match, row OPT4_ROW_LONG after a run over LIT_SPLIT4 (an
+    extension: no literals left for the match's token) }
+  OPT4_ROW_LONG = LIT_SPLIT4 + 1;
+  OPT4_ROWS = LIT_SPLIT4 + 2;
   OPT4_COLS = 2 * MAX_ML4 + 2;   { lengths 0 .. 2 * MAX_ML4 + 1 }
   OPT4_NEVER = High(Int32) div 4;
   { Off the price of a pair with no code of its own (two tokens), in
@@ -4545,17 +4574,15 @@ type
 { The row of mtab4 for a pending run of ll literals. }
 function Opt4Row(ll: SizeInt): SizeInt; inline;
 begin
-  if ll <= MAX_LL4 then
+  if ll <= LIT_SPLIT4 then
     Result := ll
-  else if ll <= LIT_SPLIT4 then
-    Result := ll - MAX_LL4
   else
     Result := OPT4_ROW_LONG;
 end;
 
 { What growing a literal run from ll to ll + 1 costs beyond the byte: the
   literal-only token of a run over MAX_LL4, then the extension that
-  replaces it past LIT_SPLIT4 (EmitSplit4). }
+  replaces it past LIT_SPLIT4 (PutTokens4). }
 function LitStep4(ll: SizeInt; const a: TOptDp4Args): Int32; inline;
 begin
   if ll < LIT_SPLIT4 then
@@ -4571,14 +4598,15 @@ begin
     Result := a.scale * (ExtBytes(ll + 1) - ExtBytes(ll));
 end;
 
-{ The match's share of a sequence as EmitSplit4 codes it: its tokens,
-  its offset bytes (kind 0), its extension; row as Opt4Row gives it. A
+{ The match's share of a sequence as PutTokens4 codes it: its tokens,
+  its offset bytes (kind 0), its extension; row as Opt4Row gives it (the
+  literal-only token of a run over MAX_LL4 is in LitStep4's price). A
   match under SYLZ_MINMATCH at the previous offset is only worth a token
   of its own: with none, never. }
 function MatchCost4(row, ml, kind: SizeInt; const a: TOptDp4Args): Int32;
 var
-  tok, first: Int32;
-  l: SizeInt;
+  tok: Int32;
+  l, b, m: SizeInt;
   c: ^TCodes4;
 begin
   c := a.codes;
@@ -4598,22 +4626,19 @@ begin
   if ml > ML_SPLIT4 then
   begin
     { the literals in the escape's token where it has that code }
+    if l > MAX_LL4 then
+      Dec(l, MAX_LL4);
     if (l > 0) and (c^[kind, l, COL4_EXT] = 255) then
       Inc(Result, tok);
     Inc(Result, tok + a.scale * Int32(ExtBytes(ml - MINML4[kind])) + a.esc);
     Exit;
   end;
-  first := ml;
+  { what is left of a match over MAX_ML4: a token at the previous offset }
   if ml > MAX_ML4 then
-  begin
-    first := MAX_ML4;
-    if ml - first < SYLZ_MINREP then
-      first := ml - SYLZ_MINREP;
-    Inc(Result, tok * Int32((ml - first + MAX_ML4 - 1) div MAX_ML4));
-  end;
+    Inc(Result, tok);
   if (row = OPT4_ROW_LONG) and (ml <= MAX_ML4) and (c^[kind, ROW4_EXT, ml] <> 255) then
     { the run's token is the match's too }
-  else if c^[kind, l, first] <> 255 then
+  else if FindSplit4(c^, kind, l, ml, b, m) then
     Inc(Result, tok)
   else if ml < SYLZ_MINMATCH then
     Result := OPT4_NEVER
