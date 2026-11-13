@@ -1527,6 +1527,7 @@ typedef struct {
     void (*search)(sylzc_hc *);
     intptr_t anchor;              /* out */
     sylzc_emit e;
+    uint32_t *cnt;                /* v4: TEmit's cell counts (TPairCounts4) */
     intptr_t accel;               /* v4: HC_ACCEL4 */
 } sylzc_hcparse;
 
@@ -1539,15 +1540,51 @@ static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intp
     return st->s->longest;
 }
 
-/* Emit in CompressHCCore: a match shorter than MINMATCH stays literals */
+/* PairOf4 in sylz.pas for a sequence that is not one token: the cell it
+   looks up first, counted. */
+static __attribute__((noinline)) void count_split4(const struct sylzc_codes4 *t,
+    uint32_t *cnt, int k, intptr_t ll, intptr_t ml)
+{
+    intptr_t row = ll, col = ml;
+    if (ll > LIT_SPLIT4) {
+        row = ROW4_EXT;
+        if (ml > MAX_ML4)
+            col = COL4_EXT;
+    } else if (ml > ML_SPLIT4) {
+        if (ll > MAX_LL4)
+            row -= MAX_LL4;
+        col = COL4_EXT;
+        if (row == 0)
+            return;
+    } else {
+        if (ll > MAX_LL4 && k == 0 && ml == MINMATCH)
+            return;
+        find_split4(t, k, ll, ml, &row, &col);
+    }
+    cnt[(k * (ROW4_EXT + 1) + row) * (COL4_EXT + 1) + col]++;
+}
+
+/* Emit in CompressHCCore: a match shorter than MINMATCH stays literals.
+   v4: the cell the sequence looks up is counted as it is recorded
+   (CountAll4's count without its pass over the records; after a flush:
+   it is the next chunk's, with the table that flush left) */
 static inline __attribute__((always_inline)) void hc_emit(sylzc_hcparse *st, intptr_t p,
     intptr_t len, intptr_t r, const int v4)
 {
     if (len < MINMATCH)
         return;
-    if (v4)
-        emit_sequence4(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
-    else
+    if (v4) {
+        sylzc_emit *e = &st->e;
+        intptr_t ll = p - st->anchor;
+        int k = p - r == e->rep;
+        if (e->rec >= e->recEnd)
+            e->flush(e);
+        if (__builtin_expect(ll <= MAX_LL4 && len <= MAX_ML4, 1))
+            st->cnt[(k * (ROW4_EXT + 1) + ll) * (COL4_EXT + 1) + len]++;
+        else
+            count_split4(e->codes, st->cnt, k, ll, len);
+        emit_sequence4(e, st->s->src + st->anchor, ll, p - r, len);
+    } else
         emit_sequence(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
     st->anchor = p + len;
 }

@@ -533,6 +533,8 @@ type
   TTable4 = array[0..255] of UInt32;
   { each code's cell, as an index into TCodes4 }
   TCells4 = array[0..255] of UInt16;
+  { what a chunk's sequences look up, by cell (PairOf4) }
+  TPairCounts4 = array[0..1, 0..ROWS4 - 1, 0..COLS4 - 1] of UInt32;
 
 type
   { The control stream is written straight into dst (after the header);
@@ -565,6 +567,10 @@ type
     prefix: SizeInt;
     direct: Boolean;
     head, body, tokEnd: PByte;
+    { v4: the compressor counts what each sequence looks up as it records
+      it (levels 4-8 in C), into cnt: FlushChunk4 then takes those }
+    counted: Boolean;
+    cnt: TPairCounts4;
     roomy: Boolean;   { dst holds SylzBound(n): no sequence can run out of room }
     failed: Boolean;  { a flush called from C found no room }
   end;
@@ -613,6 +619,7 @@ begin
   e.direct := False;
   e.head := nil;
   e.body := nil;
+  e.counted := False;
   e.tokEnd := nil;
   e.failed := False;
   e.srcEnd := srcEnd;
@@ -1083,7 +1090,6 @@ const
   COUNT4_MAX = $FFFFF;    { a sort key's count: 20 bits over 12 of cell or code }
 
 type
-  TPairCounts4 = array[0..1, 0..ROWS4 - 1, 0..COLS4 - 1] of UInt32;
   TUpdate4 = array[0..UPDATE4_MAX - 1] of Byte;
 
 { v[0..n) in descending order (Shell sort: a few hundred keys at most). }
@@ -1242,44 +1248,73 @@ type
     x2: UInt32;                { format v2's extension bytes (EXT2_NONE: no v2) }
   end;
 
+{ CountAll4's sequences that are not one token: the cell counted (into
+  cf), and in the result Extra4 (high 32 bits) and what format v2 adds
+  for it (low 32 bits: EXT2_NONE for a match it does not have). }
+function CountSplit4(const codes: TCodes4; cf: PUInt32; k, ll, ml: SizeInt): UInt64;
+var
+  row, col: SizeInt;
+begin
+  if PairOf4(codes, k, ll, ml, row, col) then
+    Inc(cf[(k * ROWS4 + row) * COLS4 + col]);
+  if ml < SYLZ_MINMATCH then
+    Result := EXT2_NONE
+  else
+    Result := UInt32(Ctrl2Ext(ll, ml));
+  Inc(Result, UInt64(Extra4(k, ll, ml)) shl 32);
+end;
+
 { The cells that the records r..rend look up, counted in cnt, and what
   the same sequences take in format v2 (3 bytes each and x2; a match
   under SYLZ_MINMATCH, which v2 does not have, adds EXT2_NONE) and in this
   one (a token each, Extra4, the offsets of the matches not at the
-  previous offset). Its own routine, so that the loop's variables can
-  live in registers. }
+  previous offset). Its own routine, with the records read in place and
+  nothing passed by reference inside the loop, so that its variables
+  live in registers (with GetRec4 and the counts by reference FPC kept
+  them in memory: 70 instructions a record at level 4, now about 20).
+  Once x2 reaches EXT2_NONE only that it did counts. }
 procedure CountAll4(r, rend: PUInt16; prev: SizeInt; const codes: TCodes4;
   var cnt: TPairCounts4; out sums: TSums4);
 var
-  ll, ml, dist, k, row, col, seqs, reps, x4: SizeInt;
+  ll, ml, dist, k, seqs, reps, x4: SizeInt;
   x2: UInt32;
+  cf: PUInt32;
+  e2: PUInt16;
+  d: UInt64;
 begin
   seqs := 0;
   reps := 0;
   x4 := 0;
   x2 := 0;
+  cf := @cnt[0, 0, 0];
+  e2 := @Ext2[0, 0];
   while r < rend do
   begin
-    GetRec4(r, ll, ml, dist);
+    ll := r[0];
+    ml := r[1];
+    dist := SizeInt(r[2]) + 1;
+    Inc(r, 3);
+    if ll = REC4_ESC then
+    begin
+      ll := PUInt32(r)^;
+      ml := PUInt32(r + 2)^;
+      Inc(r, 6);
+    end;
     k := Ord(dist = prev);
+    prev := dist;
     if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
     begin
-      Inc(cnt[k, ll, ml]);
-      Inc(x2, Ext2[ll, ml]);
+      Inc(cf[(k * ROWS4 + ll) * COLS4 + ml]);
+      Inc(x2, e2[ll * (MAX_ML4 + 1) + ml]);
     end
     else
     begin
-      if PairOf4(codes, k, ll, ml, row, col) then
-        Inc(cnt[k, row, col]);
-      Inc(x4, Extra4(k, ll, ml));
-      if ml < SYLZ_MINMATCH then
-        Inc(x2, EXT2_NONE)
-      else if x2 < EXT2_NONE then
-        Inc(x2, UInt32(Ctrl2Ext(ll, ml)));
+      d := CountSplit4(codes, cf, k, ll, ml);
+      Inc(x4, SizeInt(d shr 32));
+      Inc(x2, UInt32(d));
     end;
     Inc(seqs);
     Inc(reps, k);
-    prev := dist;
   end;
   sums.seqs := seqs;
   sums.reps := reps;
@@ -1394,7 +1429,9 @@ begin
   FillChar(cnt, SizeOf(cnt), 0);
   r := e.recs;
   prev := e.tokRep;
-  if open or (sample = 1) then
+  if e.counted and not e.whole then
+    Move(e.cnt, cnt, SizeOf(cnt))   { counted as recorded; no v2 layout to weigh }
+  else if open or (sample = 1) then
   begin
     CountAll4(r, rend, prev, e.codes, cnt, sums);
     if not open and (sums.x2 < EXT2_NONE) and (sums.seqs <= EXT2_SEQS) then
@@ -1410,6 +1447,8 @@ begin
         Inc(cnt[k, row, col]);
       Inc(r, 3 * sample);
     end;
+  if e.counted then
+    FillChar(e.cnt, SizeOf(e.cnt), 0);   { for the next chunk }
   nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, e.cells, repl, miss);
   if e.whole and (e.ctrl2 >= 0) then
   begin
@@ -4950,6 +4989,7 @@ type
     search: Pointer;           { HcSearchX64 or sylzc_hc_search }
     anchor: SizeInt;           { out }
     e: TEmitC;
+    cnt: PUInt32;              { v4: e.cnt, counted as the sequences are recorded }
     accel: SizeInt;            { v4: HC_ACCEL4 }
   end;
 
@@ -4995,6 +5035,9 @@ begin
     EmitToC(e, sc.e, src + n);
     if e.v4 then
     begin
+      e.counted := True;
+      FillChar(e.cnt, SizeOf(e.cnt), 0);
+      sc.cnt := @e.cnt[0, 0, 0];
       sc.accel := HC_ACCEL4;
       sylzc_compress_hc4(@sc);
     end
