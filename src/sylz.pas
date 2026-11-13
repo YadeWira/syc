@@ -306,7 +306,14 @@ const
                                         (OFFCOUNT_MAX bytes) after the tokens }
   OFFCOUNT_MAX = 5;
   HDR_V4       = UInt32($40000000);   { v4 layout: tokens, offsets, literals }
-  HDR_TOKMASK  = UInt32($3FFFFFFF);
+  HDR_TOKMASK  = UInt32($1FFFFFFF);
+  { v4, a block of one chunk under 2^HDR4_BITS token bytes: the header has
+    them in bits 0..13, the offset count in bits 14..27 and the chunk's
+    CHUNK4_UPDATE in bit 28, and neither a chunk header nor a count
+    follows }
+  HDR4_ONE     = UInt32($20000000);
+  HDR4_BITS    = 14;
+  HDR4_UPDATE  = UInt32($10000000);
   HDR_ENTROPY  = UInt32($80000000);   { v3: literals entropy-coded }
   HDR_CTRLMASK = UInt32($7FFFFFFF);
   LIT_CHUNK    = 65536;               { v3 literal chunk }
@@ -507,12 +514,26 @@ type
     cells: TCells4;
     codesGen: SizeInt;
     sample: SizeInt;  { chunk tables from one sequence in this many }
+    ctrl2: SizeInt;   { v4: the last chunk's sequences as format v2's control
+                        stream, in bytes; -1: not counted, or not possible }
+    whole: Boolean;   { v4: the chunk to write is the whole block }
+    lay2: Boolean;    { v4: the block goes out in format v2's layout }
     roomy: Boolean;   { dst holds SylzBound(n): no sequence can run out of room }
     failed: Boolean;  { a flush called from C found no room }
   end;
   PEmit = ^TEmit;
 
+const
+  { Ext2's "format v2 has no such match": more than the extension bytes
+    of a chunk that is counted as format v2 (EXT2_SEQS sequences at most),
+    and CHUNK4_SEQS times it is under 2^32 }
+  EXT2_NONE = 1 shl 14;
+  EXT2_SEQS = 1 shl 14;
+
 var
+  { the extension bytes format v2 takes for (literals, match), in the
+    lengths one v4 token holds }
+  Ext2: array[0..MAX_LL4, 0..MAX_ML4] of UInt16;
   { SYLZ_TOKENS4's codes and cells, and which of its codes are of cells
     every table has (they never change) }
   Codes4: TCodes4;
@@ -538,6 +559,9 @@ begin
   e.tokRep := 1;
   e.codesGen := 0;
   e.sample := 1;
+  e.ctrl2 := -1;
+  e.whole := False;
+  e.lay2 := False;
   e.failed := False;
   e.srcEnd := srcEnd;
   e.entropy := flags and SYLZ_ENTROPY <> 0;
@@ -590,6 +614,59 @@ begin
   end;
   p^ := Byte(v);
   Inc(p);
+end;
+
+{ The extension bytes of a sequence in format v2's control stream. }
+function Ctrl2Ext(ll, ml: SizeInt): SizeInt;
+var
+  m: SizeInt;
+begin
+  m := ml - SYLZ_MINMATCH;
+  if ll <= EXACT_LL then
+  begin
+    if m > EXACT_M then
+      Result := m div 255 + 1
+    else
+      Result := Ord(ExactCode[ll, m] = 255);
+  end
+  else if m <= EXACT_M then
+    Result := ll div 255 + 1
+  else
+    Result := ll div 255 + m div 255 + 2;
+end;
+
+{ A sequence as format v2 has it (EmitSequence), at p. }
+procedure PutSeq2(var p: PByte; ll, ml, dist: SizeInt);
+var
+  m, code: SizeInt;
+  q: PByte;
+begin
+  m := ml - SYLZ_MINMATCH;
+  p[1] := Byte(dist - 1);
+  p[2] := Byte((dist - 1) shr 8);
+  q := p + 3;
+  code := 255;
+  if (ll <= EXACT_LL) and (m <= EXACT_M) then
+    code := ExactCode[ll, m];
+  if code <> 255 then
+    p[0] := Byte(code)
+  else if ll <= EXACT_LL then
+  begin
+    p[0] := Byte(ESC_ML + ll);
+    PutExt(q, m);
+  end
+  else if m <= EXACT_M then
+  begin
+    p[0] := Byte(ESC_LL + m);
+    PutExt(q, ll);
+  end
+  else
+  begin
+    p[0] := ESC_BOTH;
+    PutExt(q, ll);
+    PutExt(q, m);
+  end;
+  p := q;
 end;
 
 { Whether the encoder falls back on the code of this cell (kind, row:
@@ -689,6 +766,12 @@ var
 begin
   if not BuildCodes4(SYLZ_TOKENS4, Codes4) then
     RunError(201);
+  for row := 0 to MAX_LL4 do
+    for col := 0 to MAX_ML4 do
+      if col < SYLZ_MINMATCH then
+        Ext2[row, col] := EXT2_NONE
+      else
+        Ext2[row, col] := UInt16(Ctrl2Ext(row, col));
   for code := 0 to 255 do
   begin
     CellOf4(SYLZ_TOKENS4[code], k, row, col);
@@ -925,6 +1008,25 @@ begin
   Result := p;
 end;
 
+{ The token bytes of a sequence that is not one token, apart from the one
+  token and the one more it takes when the cell PairOf4 gives has no
+  code: what no table changes. }
+function Extra4(k, ll, ml: SizeInt): SizeInt;
+begin
+  if ll > LIT_SPLIT4 then
+  begin
+    Result := ll div 255 + 1;
+    if ml > MAX_ML4 then
+      Inc(Result, (ml - MINML4[k]) div 255 + 1);
+  end
+  else if ml > ML_SPLIT4 then
+    Result := (ml - MINML4[k]) div 255 + 1 + Ord(ll > MAX_LL4)
+  else if (ll > MAX_LL4) and (k = 0) and (ml = SYLZ_MINMATCH) then
+    Result := 1
+  else
+    Result := Ord(ll > MAX_LL4) + Ord(ml > MAX_ML4);
+end;
+
 const
   COUNT4_MAX = $FFFFF;    { a sort key's count: 20 bits over 12 of cell or code }
 
@@ -965,9 +1067,10 @@ end;
   saves, and keeps it while the chunk uses it: the optimal parser chose it
   for the price of one token (SylzBound). Returns how many codes changed,
   listed in repl; ties go to the lower cell (kind, row, column) and the
-  lower code. }
+  lower code. miss: the lookups counted that find no code afterwards. }
 function UpdateTable4(const cnt: TPairCounts4; sample, maxRepl: SizeInt;
-  var t: TTable4; var c: TCodes4; var cells: TCells4; out repl: TUpdate4): SizeInt;
+  var t: TTable4; var c: TCodes4; var cells: TCells4; out repl: TUpdate4;
+  out miss: SizeInt): SizeInt;
 var
   add: array[0..NCELLS4 - 1] of UInt32;   { count shl 12 or (4095 - cell) }
   del: array[0..255] of UInt32;          { (COUNT4_MAX - count) shl 12 or (255 - code) }
@@ -982,6 +1085,7 @@ begin
   { what one more code must be asked for to pay for itself, at best }
   least := UInt32((UPDATE4_BYTES + sample + sample - 1) div sample);
   na := 0;
+  miss := 0;
   for cell := 0 to NCELLS4 - 1 do
   begin
     v := cf[cell];
@@ -992,6 +1096,7 @@ begin
     info := CellInfo4[cell];
     if info and CELL4_KEPT <> 0 then
       Continue;
+    Inc(miss, v);
     if info and CELL4_SHORT <> 0 then
       v := COUNT4_MAX
     else if v < least then
@@ -1054,6 +1159,7 @@ begin
     end;
     pc[cells[code]] := 255;
     cell := 4095 - SizeInt(add[i] and 4095);
+    Inc(miss, SizeInt(d) - SizeInt(cf[cell]));
     cells[code] := UInt16(cell);
     pc[cell] := Byte(code);
     t[code] := CellInfo4[cell] and CELL4_ENTRY;
@@ -1100,12 +1206,14 @@ var
   r, rend: PUInt16;
   head, p, limit, off, body: PByte;
   prev, k, row, col, ll, ml, dist, i, code, sample, nrepl, maxRepl: SizeInt;
-  w: UInt32;
+  seqs, reps, x4, miss: SizeInt;
+  w, x2: UInt32;
 {$ifdef SYLZ_C}
   pc: TPut4C;
 {$endif}
 begin
   Result := True;
+  e.ctrl2 := -1;
   if e.rec = e.recs then
     Exit;
   rend := e.rec;
@@ -1132,14 +1240,41 @@ begin
   r := e.recs;
   prev := e.tokRep;
   if sample = 1 then
+  begin
+    { and what format v2 would take for them: 3 bytes each and x2 (a
+      match under SYLZ_MINMATCH, which v2 does not have, adds EXT2_NONE);
+      for this format's bytes, the matches at the previous offset and
+      Extra4 }
+    seqs := 0;
+    reps := 0;
+    x4 := 0;
+    x2 := 0;
     while r < rend do
     begin
       GetRec4(r, ll, ml, dist);
       k := Ord(dist = prev);
-      if PairOf4(e.codes, k, ll, ml, row, col) then
-        Inc(cnt[k, row, col]);
+      if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
+      begin
+        Inc(cnt[k, ll, ml]);
+        Inc(x2, Ext2[ll, ml]);
+      end
+      else
+      begin
+        if PairOf4(e.codes, k, ll, ml, row, col) then
+          Inc(cnt[k, row, col]);
+        Inc(x4, Extra4(k, ll, ml));
+        if ml < SYLZ_MINMATCH then
+          Inc(x2, EXT2_NONE)
+        else if x2 < EXT2_NONE then
+          Inc(x2, UInt32(Ctrl2Ext(ll, ml)));
+      end;
+      Inc(seqs);
+      Inc(reps, k);
       prev := dist;
-    end
+    end;
+    if (x2 < EXT2_NONE) and (seqs <= EXT2_SEQS) then
+      e.ctrl2 := 3 * seqs + SizeInt(x2);
+  end
   else
     while r < rend do
     begin
@@ -1150,7 +1285,24 @@ begin
         Inc(cnt[k, row, col]);
       Inc(r, 3 * sample);
     end;
-  nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, e.cells, repl);
+  nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, e.cells, repl, miss);
+  if e.whole and (e.ctrl2 >= 0) then
+  begin
+    { The chunk is the whole block, and format v2's control stream for it
+      is e.ctrl2 bytes. This format's tokens and offsets: a token for each
+      sequence and one more where its cell has no code, Extra4, two offset
+      bytes for each match not at the previous offset, the update. Where
+      v2's is smaller the block goes out in v2's layout (EmitFinish) and
+      the tokens are not written. }
+    i := seqs + x4 + miss + 2 * (seqs - reps);
+    if nrepl > 0 then
+      Inc(i, 1 + UPDATE4_BYTES * nrepl);
+    if e.ctrl2 < i then
+    begin
+      e.lay2 := True;
+      Exit;
+    end;
+  end;
   { room: what is left of dst after the offsets and literals so far }
   limit := e.oend - (e.off - e.offs) - (e.lit - e.lits);
   head := e.ctrl;
@@ -1352,54 +1504,140 @@ begin
   Result := used;
 end;
 
+{ The block's last sequences leave it while a sequence costs as much as
+  its match saves: after a long run of literals its extension is paid for
+  that match alone, and without the sequence the run is part of the tail,
+  which costs nothing (one 4-byte match after a megabyte of literals:
+  4 KiB). lit and litLen: the tail, which takes their bytes. }
+procedure DropTail4(var e: TEmit; var lit: PByte; var litLen: SizeInt);
+var
+  r, last: PUInt16;
+  ll, ml, dist: SizeInt;
+begin
+  while e.rec > e.recs do
+  begin
+    last := e.rec - 3;
+    if (e.rec - e.recs >= 3 * REC4_LONG) and ((e.rec - 3 * REC4_LONG)^ = REC4_ESC) then
+    begin
+      { a long record may end here: only from the first one on can that
+        be told }
+      r := e.recs;
+      while r < e.rec do
+      begin
+        last := r;
+        GetRec4(r, ll, ml, dist);
+      end;
+    end;
+    r := last;
+    GetRec4(r, ll, ml, dist);
+    { at the least one token and the run's extension }
+    if (ll <= LIT_SPLIT4) or (ll div 255 + 2 < ml) then
+      Break;
+    e.rec := last;
+    Dec(e.lit, ll);
+    Dec(lit, ll + ml);
+    Inc(litLen, ll + ml);
+  end;
+end;
+
 function EmitFinish(var e: TEmit; lit: PByte; litLen: SizeInt): SizeInt;
 var
   ctrlLen, litTotal, v3, offLen: SizeInt;
+  hdr: UInt32;
+  one: Boolean;
+  r, rend: PUInt16;
+  p: PByte;
+  ll, ml, dist: SizeInt;
 begin
   if e.v4 then
   begin
     { the token chunks, the offsets behind their count (none of either
       without a token), then the literals: raw, or v3's chunks when
       smaller }
+    one := e.ctrl = e.dst + HEADER_SIZE;   { no chunk before this one }
+    DropTail4(e, lit, litLen);
+    rend := e.rec;
+    e.whole := one;
     if e.failed or not FlushChunk4(e) then
       Exit(-1);
-    ctrlLen := e.ctrl - (e.dst + HEADER_SIZE);
-    offLen := e.off - e.offs;
     litTotal := (e.lit - e.lits) + litLen;
-    v3 := 0;   { the count's bytes }
-    if ctrlLen > 0 then
-      repeat
-        Inc(v3);
-      until (offLen shr 1) shr (7 * v3) = 0;
-    if e.ctrl + v3 + offLen + litTotal > e.oend then
-      Exit(-1);
-    if ctrlLen > 0 then
+    p := e.dst + HEADER_SIZE;
+    if not e.lay2 then
     begin
-      v3 := offLen shr 1;
-      while v3 >= 128 do
+      ctrlLen := e.ctrl - p;
+      offLen := e.off - e.offs;
+      hdr := HDR_V4;
+      v3 := 0;   { the count's bytes }
+      if one and (ctrlLen > 0) and (p^ and CHUNK4_LONG = 0)
+         and (ctrlLen - 2 < 1 shl HDR4_BITS) then
       begin
-        e.ctrl^ := Byte(v3) or 128;
-        Inc(e.ctrl);
-        v3 := v3 shr 7;
+        { one small chunk: what its header and the count say, in the
+          block's header }
+        if p^ and CHUNK4_UPDATE <> 0 then
+          hdr := hdr or HDR4_UPDATE;
+        Move(p[2], p^, ctrlLen - 2);
+        Dec(ctrlLen, 2);
+        Dec(e.ctrl, 2);
+        hdr := hdr or HDR4_ONE or (UInt32(offLen shr 1) shl HDR4_BITS);
+      end
+      else if ctrlLen > 0 then
+        repeat
+          Inc(v3);
+        until (offLen shr 1) shr (7 * v3) = 0;
+      if ctrlLen > SizeInt(HDR_TOKMASK) then
+        Exit(-1);
+      hdr := hdr or UInt32(ctrlLen);
+      { what FlushChunk4 could only estimate }
+      e.lay2 := one and (e.ctrl2 >= 0) and (e.ctrl2 < ctrlLen + v3 + offLen);
+    end;
+    if e.lay2 then
+    begin
+      { The same sequences in format v2's layout, which is smaller here (a
+        small block with few matches at the previous offset pays for this
+        layout's missing codes and gets nothing back): every decoder takes
+        each block by its header. }
+      if p + e.ctrl2 + litTotal > e.oend then
+        Exit(-1);
+      r := e.recs;
+      while r < rend do
+      begin
+        GetRec4(r, ll, ml, dist);
+        PutSeq2(p, ll, ml, dist);
       end;
-      e.ctrl^ := Byte(v3);
-      Inc(e.ctrl);
+      e.ctrl := p;
+    end
+    else
+    begin
+      if e.ctrl + v3 + offLen + litTotal > e.oend then
+        Exit(-1);
+      if v3 > 0 then
+      begin
+        v3 := offLen shr 1;
+        while v3 >= 128 do
+        begin
+          e.ctrl^ := Byte(v3) or 128;
+          Inc(e.ctrl);
+          v3 := v3 shr 7;
+        end;
+        e.ctrl^ := Byte(v3);
+        Inc(e.ctrl);
+      end;
       Move(e.offs^, e.ctrl^, offLen);
       Inc(e.ctrl, offLen);
-    end;
-    Move(lit^, e.lit^, litLen);
-    if e.entropy and (litTotal > 0) then
-    begin
-      v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
-      if (v3 >= 0) and (v3 < litTotal) then
+      Move(lit^, e.lit^, litLen);
+      if e.entropy and (litTotal > 0) then
       begin
-        PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_V4 or HDR_ENTROPY;
-        Exit(e.ctrl - e.dst + v3);
+        v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+        if (v3 >= 0) and (v3 < litTotal) then
+        begin
+          PUInt32(e.dst)^ := hdr or HDR_ENTROPY;
+          Exit(e.ctrl - e.dst + v3);
+        end;
       end;
+      PUInt32(e.dst)^ := hdr;
+      Move(e.lits^, e.ctrl^, litTotal);
+      Exit(e.ctrl - e.dst + litTotal);
     end;
-    PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_V4;
-    Move(e.lits^, e.ctrl^, litTotal);
-    Exit(e.ctrl - e.dst + litTotal);
   end;
   ctrlLen := e.ctrl - (e.dst + HEADER_SIZE);
   litTotal := (e.lit - e.lits) + litLen;
@@ -6377,9 +6615,11 @@ begin
 end;
 
 { A format v4 block's streams into dst: the token chunks at sec, with
-  SYLZ_TOKENS4 as their updates leave it, then the tail literals. }
+  SYLZ_TOKENS4 as their updates leave it, then the tail literals. one < 0:
+  each chunk behind its header; else one chunk, sec to secEnd, and one is
+  what its header would say besides the length (CHUNK4_UPDATE). }
 function DecodeStreams4(sec, secEnd, offp, offend, lit, lend, dst: PByte;
-  dstLen: SizeInt): SizeInt;
+  dstLen: SizeInt; one: Int32): SizeInt;
 var
   st: TDecode4State;
   own: TTable4;
@@ -6398,18 +6638,23 @@ begin
   st.tokens := @SYLZ_TOKENS4[0];
   while sec < secEnd do
   begin
-    { the header: 2 bytes, or 4 }
-    if secEnd - sec < 2 then
-      Exit;
-    w := sec[0] or (UInt32(sec[1]) shl 8);
-    if w and CHUNK4_LONG <> 0 then
+    if one >= 0 then
+      w := UInt32(one)
+    else
     begin
-      if secEnd - sec < 4 then
+      { the header: 2 bytes, or 4 }
+      if secEnd - sec < 2 then
         Exit;
-      w := w or (UInt32(sec[2]) shl 16) or (UInt32(sec[3]) shl 24);
+      w := sec[0] or (UInt32(sec[1]) shl 8);
+      if w and CHUNK4_LONG <> 0 then
+      begin
+        if secEnd - sec < 4 then
+          Exit;
+        w := w or (UInt32(sec[2]) shl 16) or (UInt32(sec[3]) shl 24);
+        Inc(sec, 2);
+      end;
       Inc(sec, 2);
     end;
-    Inc(sec, 2);
     if w and CHUNK4_UPDATE <> 0 then
     begin
       { entries replaced, from this chunk on }
@@ -6432,10 +6677,15 @@ begin
         Dec(c);
       end;
     end;
-    if SizeInt(w shr 2) > secEnd - sec then
-      Exit;
     st.tok := sec;
-    st.tend := sec + (w shr 2);
+    if one >= 0 then
+      st.tend := secEnd
+    else
+    begin
+      if SizeInt(w shr 2) > secEnd - sec then
+        Exit;
+      st.tend := sec + (w shr 2);
+    end;
     if not DecodeChunk4(st) then
       Exit;
     sec := st.tend;
@@ -6463,6 +6713,7 @@ function SylzDecompressCtx(var dctx: TSylzDCtx; src: PByte; n: SizeInt; dst: PBy
   dstLen: SizeInt): SizeInt;
 var
   hdr, count, b: UInt32;
+  one: Int32;
   ctrlLen, offLen, litCount, pos, c, r: SizeInt;
   ctrl, cend, send, p: PByte;
 begin
@@ -6471,16 +6722,28 @@ begin
   hdr := PUInt32(src)^;
   send := src + n;
   offLen := -1;   { not v4 }
+  one := -1;
   if hdr and HDR_V4 <> 0 then
   begin
     { v4: tokens, offsets, literals (raw, or v3's chunks with bit 31: v5) }
     ctrlLen := hdr and HDR_TOKMASK;
+    if hdr and HDR4_ONE <> 0 then
+      ctrlLen := hdr and (1 shl HDR4_BITS - 1);
     if ctrlLen > n - HEADER_SIZE then
       Exit(-1);
     ctrl := src + HEADER_SIZE;
     cend := ctrl + ctrlLen;
     offLen := 0;
-    if ctrlLen > 0 then
+    if hdr and HDR4_ONE <> 0 then
+    begin
+      { one chunk; its header's flag and the offsets' count are in hdr }
+      one := Ord(hdr and HDR4_UPDATE <> 0) * CHUNK4_UPDATE;
+      count := (hdr shr HDR4_BITS) and (1 shl HDR4_BITS - 1);
+      if count > UInt32((send - cend) shr 1) then
+        Exit(-1);
+      offLen := 2 * SizeInt(count);
+    end
+    else if ctrlLen > 0 then
     begin
       { the offsets' count: up to OFFCOUNT_MAX bytes, 32 bits }
       count := 0;
@@ -6501,7 +6764,7 @@ begin
     end;
     Inc(cend, offLen);   { where the literal section starts }
     if hdr and HDR_ENTROPY = 0 then
-      Exit(DecodeStreams4(ctrl, ctrl + ctrlLen, cend - offLen, cend, cend, send, dst, dstLen));
+      Exit(DecodeStreams4(ctrl, ctrl + ctrlLen, cend - offLen, cend, cend, send, dst, dstLen, one));
   end
   else
   begin
@@ -6543,7 +6806,7 @@ begin
     Exit(-1);
   if offLen >= 0 then
     Result := DecodeStreams4(ctrl, ctrl + ctrlLen, cend - offLen, cend,
-      dctx.lits, dctx.lits + litCount, dst, dstLen)
+      dctx.lits, dctx.lits + litCount, dst, dstLen, one)
   else
     Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
 end;

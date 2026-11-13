@@ -4,12 +4,13 @@
 Usage: sylz4_table.py [--table FILE] BLOCK...
 
 Each BLOCK is one v4 block without entropy-coded literals (sylzbench -v4
-with SYLZ_DUMP=prefix). They are read with the table in src/sylz.pas (or
---table FILE, the same Pascal constants) and their updates of it, their
-split sequences joined back, and each sequence asked what PutTokens4
-looks up for it (PairOf4); the table is the fixed codes plus the cells
-asked for most often, each block weighing the same. Prints the table as
-it goes in src/sylz.pas.
+with SYLZ_DUMP=prefix; a block the encoder left in format v2's layout is
+skipped). They are read with the table in src/sylz.pas (or --table FILE,
+the same Pascal constants) and their updates of it, their split
+sequences joined back, and each sequence asked what PutTokens4 looks up
+for it first (PairOf4, before it tries other splits); the table is the
+fixed codes plus the cells asked for most often, each block weighing the
+same. Prints the table as it goes in src/sylz.pas.
 """
 import re
 import struct
@@ -52,28 +53,35 @@ def table_entry(v):
 
 
 def sequences(block, static):
-    """The block's sequences as (kind, literals, match), splits joined."""
+    """The block's sequences as (kind, literals, match), splits joined;
+    None for a block in format v2's layout."""
     hdr, = struct.unpack_from('<I', block, 0)
-    assert hdr & 0x40000000 and not hdr & 0x80000000
-    tok_end = 4 + (hdr & 0x3FFFFFFF)
+    assert not hdr & 0x80000000
+    if not hdr & 0x40000000:
+        return None
+    one = hdr & 0x20000000   # one chunk: no chunk header, its flag in bit 28
+    tok_end = 4 + (hdr & 0x3FFF if one else hdr & 0x1FFFFFFF)
     table = list(static)
     out = []
     c = 4
     pend = 0             # literals of literal-only tokens
     after_match = False  # the last token was a match
     while c < tok_end:
-        chdr = block[c] | block[c + 1] << 8
-        c += 2
-        if chdr & 2:
-            chdr |= block[c] << 16 | block[c + 1] << 24
+        if one:
+            chdr = (hdr >> 28) & 1
+        else:
+            chdr = block[c] | block[c + 1] << 8
             c += 2
+            if chdr & 2:
+                chdr |= block[c] << 16 | block[c + 1] << 24
+                c += 2
         if chdr & 1:
             count = block[c] + 1
             c += 1
             for _ in range(count):
                 table[block[c]] = table_entry(block[c + 1] | block[c + 2] << 8)
                 c += 3
-        cend = c + (chdr >> 2)
+        cend = tok_end if one else c + (chdr >> 2)
         while c < cend:
             e = table[block[c]]
             c += 1
@@ -109,7 +117,7 @@ def sequences(block, static):
 
 def cell_of(k, ll, ml):
     """PairOf4 in sylz.pas: the cell (kind, row, column) a sequence asks
-    for, or None when it only takes codes every table has."""
+    for first, or None when it only takes codes every table has."""
     if ll > LIT_SPLIT:
         return (k, ROW_EXT, COL_EXT if ml > MAX_ML else ml)
     if ll > MAX_LL:
@@ -148,6 +156,8 @@ def main():
     freq = {}
     for name in args:
         seqs = sequences(open(name, 'rb').read(), table)
+        if not seqs:
+            continue
         for k, ll, ml in seqs:
             p = cell_of(k, ll, ml)
             if p is not None and not fixed(*p):

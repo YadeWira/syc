@@ -292,13 +292,18 @@ def table_entry(v):
 def decode_block4(b, n):
     """A format v4 or v5 block of n decoded bytes."""
     hdr = u32(b, 0)
-    tok_len = hdr & 0x3FFFFFFF
+    one = hdr & 0x20000000   # one chunk, no chunk header, no count bytes
+    tok_len = hdr & 0x3FFF if one else hdr & 0x1FFFFFFF
     if tok_len > len(b) - 4:
         raise SylzError("token stream past the block")
     tok_end = 4 + tok_len
     i = tok_end
     off_count = 0
-    if tok_len:
+    if one:
+        off_count = (hdr >> 14) & 0x3FFF
+        if off_count > (len(b) - i) // 2:
+            raise SylzError("offsets past the block")
+    elif tok_len:
         # the offsets' count: 1 to 5 bytes, 7 bits each, low bits first
         shift = 0
         while True:
@@ -329,16 +334,20 @@ def decode_block4(b, n):
     c = 4
     table = list(TOKENS4)   # each block starts with the built-in table
     while c < tok_end:
-        # the chunk's header: 2 bytes, or 4 with bit 1 set
-        if tok_end - c < 2:
-            raise SylzError("truncated chunk header")
-        chdr = b[c] | b[c + 1] << 8
-        c += 2
-        if chdr & 2:
+        if one:
+            # the block's header has the chunk's update flag in bit 28
+            chdr = (hdr >> 28) & 1
+        else:
+            # the chunk's header: 2 bytes, or 4 with bit 1 set
             if tok_end - c < 2:
                 raise SylzError("truncated chunk header")
-            chdr |= b[c] << 16 | b[c + 1] << 24
+            chdr = b[c] | b[c + 1] << 8
             c += 2
+            if chdr & 2:
+                if tok_end - c < 2:
+                    raise SylzError("truncated chunk header")
+                chdr |= b[c] << 16 | b[c + 1] << 24
+                c += 2
         if chdr & 1:
             # entries replaced, from this chunk on
             if c >= tok_end:
@@ -350,7 +359,7 @@ def decode_block4(b, n):
             for k in range(count):
                 table[b[c]] = table_entry(b[c + 1] | b[c + 2] << 8)
                 c += 3
-        cend = c + (chdr >> 2)
+        cend = tok_end if one else c + (chdr >> 2)
         if cend > tok_end:
             raise SylzError("chunk past the token stream")
         while c < cend:
