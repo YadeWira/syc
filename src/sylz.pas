@@ -969,14 +969,55 @@ begin
   e.direct := False;
 end;
 
+const
+  { PairIndex4 and a match's sure gain are the same for every literal run
+    over PAIR4_LLCAP and every match over PAIR4_MLCAP }
+  PAIR4_LLCAP = LIT_SPLIT4 + 1;
+  PAIR4_MLCAP = ML_SPLIT4 + 1;
+
+var
+  { CountPairs4's tables, of capped lengths: PairIndex4 (a sequence that
+    looks nothing up counts in cell 0, no literals and no match, which no
+    table is built from), and the bytes a match is sure to save
+    (GAIN4_MATCH, GAIN4_COST) }
+  PairIdx4: array[0..PAIR4_LLCAP, 0..PAIR4_MLCAP] of UInt16;
+  PairGain4: array[0..PAIR4_MLCAP] of Byte;
+
+procedure BuildPairIdx4;
+var
+  ll, ml, i: SizeInt;
+begin
+  for ll := 0 to PAIR4_LLCAP do
+    for ml := 0 to PAIR4_MLCAP do
+    begin
+      i := PairIndex4(ll, ml);
+      if i < 0 then
+        i := 0;
+      PairIdx4[ll, ml] := UInt16(i);
+    end;
+  for ml := 0 to PAIR4_MLCAP do
+  begin
+    i := ml;
+    if i > GAIN4_MATCH then
+      i := GAIN4_MATCH;
+    if i > GAIN4_COST then
+      PairGain4[ml] := Byte(i - GAIN4_COST)
+    else
+      PairGain4[ml] := 0;
+  end;
+end;
+
 { Counts what the recorded sequences r .. rend look up (PairIndex4) into
   cnt; prev: the distance before them. Returns the bytes their matches
   are sure to save (GAIN4_MATCH, GAIN4_COST). (A routine of its own, with
   nothing passed by reference inside the loop: in FlushChunk4, through
-  GetRec4, FPC kept every local in memory, 27 cycles a record.) }
+  GetRec4, FPC kept every local in memory, 27 cycles a record. And by
+  tables: PairIndex4's tests depend on the data, and each one the
+  processor guessed wrong cost as much as the rest of the record, 25
+  cycles a record against 9.) }
 function CountPairs4(r, rend: PUInt16; prev: SizeInt; var cnt: TPairCounts4): SizeInt;
 var
-  ll, ml, dist, i: SizeInt;
+  ll, ml, dist: SizeInt;
   kinds: array[0..1] of PUInt32;
 begin
   Result := 0;
@@ -994,14 +1035,13 @@ begin
       ml := PUInt32(r + 2)^;
       Inc(r, 6);
     end;
-    i := PairIndex4(ll, ml);
-    if i >= 0 then
-      Inc(kinds[Ord(dist = prev)][i]);
+    if ll > PAIR4_LLCAP then
+      ll := PAIR4_LLCAP;
+    if ml > PAIR4_MLCAP then
+      ml := PAIR4_MLCAP;
+    Inc(kinds[Ord(dist = prev)][PairIdx4[ll, ml]]);
     prev := dist;
-    if ml > GAIN4_MATCH then
-      ml := GAIN4_MATCH;
-    if ml > GAIN4_COST then
-      Inc(Result, ml - GAIN4_COST);
+    Inc(Result, PairGain4[ml]);
   end;
 end;
 
@@ -6756,6 +6796,7 @@ end;
 
 initialization
   BuildExactCodes;
+  BuildPairIdx4;
   if not BuildCodes4(SYLZ_TOKENS4, Codes4) then
     RunError(201);
 end.
