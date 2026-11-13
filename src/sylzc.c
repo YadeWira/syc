@@ -365,6 +365,7 @@ typedef struct {
     const uint32_t *fast;
     const uint8_t *offs0;
     const void *shorts;
+    /* (format v5's literal fields follow; only sylz.pas reads them) */
 } sylzc_d4;
 
 /* A match of any length at a distance under 16, in 8-byte steps (ml may
@@ -421,89 +422,17 @@ DECODER_INLINE void copy_short32(uint8_t *op, uintptr_t off, uintptr_t ml)
     }
 }
 
-/* DecodeSeqs4 in sylz.pas: the chunk's sequences from st->tok on, exact
-   and fully checked; with toOffset, only until the block has read an
-   offset. 0, or -1 on corrupt input. */
-DECODER_INLINE intptr_t decode4_seqs(sylzc_d4 *st, int toOffset)
-{
-    const uint32_t *tokens = st->tokens;
-    const uint8_t *tok = st->tok, *tend = st->tend;
-    const uint8_t *offp = st->offp, *offend = st->offend;
-    const uint8_t *lit = st->lit, *lend = st->lend;
-    uint8_t *op = st->op, *oend = st->oend, *dst = st->dst;
-    uintptr_t rep = (uintptr_t)st->rep;
-
-    while (tok < tend && !(toOffset && offp != st->offs0)) {
-        uint32_t e = tokens[*tok++];
-        intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
-        if (e & TOK4_LLEXT) {
-            uint8_t b;
-            do {
-                if (tok >= tend)
-                    return -1;
-                b = *tok++;
-                ll += b;
-            } while (b == 255);
-        }
-        if (e & TOK4_MLEXT) {
-            uint8_t b;
-            do {
-                if (tok >= tend)
-                    return -1;
-                b = *tok++;
-                ml += b;
-            } while (b == 255);
-        }
-        if (e & 0xFF0000) {
-            if (offend - offp < 2)
-                return -1;
-            rep = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
-            offp += 2;
-        }
-        if (ll > lend - lit || ll > oend - op)
-            return -1;
-        /* in wide steps where there is room past the run or the match:
-           a block can open with megabytes of literals, or of one byte
-           repeated at the first distance, before it reads an offset */
-        if (ll <= lend - lit - 16 && ll <= oend - op - 16)
-            for (intptr_t i = 0; i < ll; i += 16)
-                copy16(op + i, lit + i);
-        else
-            for (intptr_t i = 0; i < ll; i++)
-                op[i] = lit[i];
-        op += ll;
-        lit += ll;
-        if ((intptr_t)rep > op - dst || ml > oend - op)
-            return -1;
-        const uint8_t *m = op - rep;
-        if (ml > oend - op - 16)
-            while (ml-- > 0)
-                *op++ = *m++;
-        else if (rep >= 16) {
-            for (intptr_t i = 0; i < ml; i += 16)
-                copy16(op + i, m + i);
-            op += ml;
-        } else
-            op = copy_short(op, rep, ml);
-    }
-    st->tok = tok;
-    st->offp = offp;
-    st->lit = lit;
-    st->op = op;
-    st->rep = (intptr_t)rep;
-    return 0;
-}
-
-/* One chunk of format v4's sequences (DecodeChunk4 in sylz.pas): 0, or
-   -1 on corrupt input.
+/* The fast loop of format v4's decoder (DecodeFast4Pas in sylz.pas): 0
+   when it stops, with everything at the token it stopped at, or -1 on
+   corrupt input. The block must have read an offset (DecodeChunk4 does
+   the sequences before that).
 
    The fast loop: a sequence with an exact code takes one token, at most
    2 offset bytes and 16 literals, and writes inside 64 bytes of output
    (16 literal bytes, then 32 match bytes after at most 16 literals), so
    k = min(tokens, offset bytes / 2, literals / 16, output / 64) of them
    need no bounds check: the inner loop counts k down. Once the block has
-   read an offset (decode4_seqs does the sequences before that), the
-   previous distance is the offset before the next one in the stream: a
+   read an offset, the previous distance is the offset before the next one in the stream: a
    token advances the stream by the bytes it takes and reads the two
    before it, with nothing to choose. One test sends a token off the
    straight path: a distance under 16, or, in the block's first
@@ -511,13 +440,11 @@ DECODER_INLINE intptr_t decode4_seqs(sylzc_d4 *st, int toOffset)
    can one reach before the output's start. The output is fetched 512
    bytes ahead: its lines are new to the cache, and the stores wait for
    them otherwise. An escape is checked on its own, then k is counted
-   again. What is left when k = 0 goes through the exact, fully checked
-   loop. */
+   again. The loop stops when k = 0 or an escape has no room for the
+   wide copies: the caller (DecodeChunk4) takes it from there, exactly,
+   and refills format v5's literals. */
 DECODER_INLINE intptr_t decode4_core(sylzc_d4 *st)
 {
-    if (st->offp == st->offs0 && decode4_seqs(st, 1) < 0)
-        return -1;
-
     const uint32_t *tokens = st->tokens;
     const uint8_t *tok = st->tok, *tend = st->tend;
     const uint8_t *offp = st->offp, *offend = st->offend;
@@ -590,7 +517,7 @@ escape:
             /* room for the wide copies: 16 literal bytes past the run, 128
                output bytes past the sequence */
             if (ll < 0 || ll > lend - lit - 16 || ll + ml > oend - op - 128)
-                break;   /* the checked loop does this sequence exactly */
+                break;   /* the caller does this sequence exactly */
             if (e & 0xFF0000) {
                 /* k > 0: the offset stream has these 2 bytes */
                 off = (uintptr_t)read16(offp) + 1;
@@ -645,7 +572,7 @@ escape:
     st->lit = lit;
     st->op = op;
     st->rep = (intptr_t)rep;
-    return decode4_seqs(st, 0);
+    return 0;
 }
 
 #if defined(__i386__) && !defined(SYLZC_NO_SSE2)

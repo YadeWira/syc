@@ -104,9 +104,9 @@ var
   alphabet: UInt32;
 begin
   if Length(samples) > 0 then
-    kind := RandBelow(6)
+    kind := RandBelow(7)
   else
-    kind := RandBelow(5);
+    kind := RandBelow(6);
   case kind of
     0: { random }
       for i := 0 to n - 1 do
@@ -142,6 +142,14 @@ begin
           buf[i] := buf[i - 1 - SizeInt(RandBelow(Min(i - 1, 70000)))]
         else
           buf[i] := Byte(Rand);
+    5: { skewed bytes with few matches, and a stretch of them repeated:
+         literal runs longer than a Huffman chunk, coded }
+      begin
+        for i := 0 to n - 1 do
+          buf[i] := Byte(Rand and Rand and Rand);
+        if n > 3000 then
+          Move(buf[0], buf[n div 2], 1 + RandBelow(1000));
+      end;
   else { slice of a real file }
     s := samples[RandBelow(Length(samples))];
     if Length(s) = 0 then
@@ -245,25 +253,40 @@ begin
   GuardedFree(input);
 end;
 
-{ One Huffman chunk decoded on its own: the chunk of m bytes must roundtrip;
-  declared sizes other than m (down to tiny ones, which the encoder never
-  codes) and corrupted copies must be rejected or decode within bounds. }
+{ HufDecodeChunk, or HufDecodeChunk8 (format v5's chunks) with eight. }
+function DecodeChunk(eight: Boolean; src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
+begin
+  if eight then
+    Result := HufDecodeChunk8(src, srcLen, dst, n)
+  else
+    Result := HufDecodeChunk(src, srcLen, dst, n);
+end;
+
+{ One Huffman chunk decoded on its own, four streams or eight: the chunk
+  of m bytes must roundtrip; declared sizes other than m (down to tiny
+  ones, which the encoder never codes) and corrupted copies must be
+  rejected or decode within bounds. }
 procedure HufCase;
 var
   m, n, csize, r, i: SizeInt;
   input, comp, bad, outp, old: TGuarded;
+  eight: Boolean;
 begin
   m := HUF_MIN_SYMBOLS + RandBelow(65536 - HUF_MIN_SYMBOLS + 1);
   input := GuardedAlloc(m);
   MakeInput(input.p, m);
   comp := GuardedAlloc(HufBound(m));
-  csize := HufEncodeChunk(input.p, m, comp.p, HufBound(m));
+  eight := RandBelow(2) = 0;
+  if eight then
+    csize := HufEncodeChunk8(input.p, m, comp.p, HufBound(m))
+  else
+    csize := HufEncodeChunk(input.p, m, comp.p, HufBound(m));
   if csize < 0 then
     Fail('HufEncodeChunk returned -1 with a HufBound buffer', m, -1);
   bad := GuardedAlloc(csize);
   Move(comp.p^, bad.p^, csize);
   outp := GuardedAlloc(m);
-  if (HufDecodeChunk(bad.p, csize, outp.p, m) <> csize)
+  if (DecodeChunk(eight, bad.p, csize, outp.p, m) <> csize)
      or (CompareByte(input.p^, outp.p^, m) <> 0) then
     Fail('Huffman chunk roundtrip mismatch', m, -1);
   GuardedFree(outp);
@@ -294,7 +317,7 @@ begin
     Move(comp.p^, bad.p^, csize);
     if RandBelow(2) = 0 then
       bad.p[RandBelow(csize)] := Byte(Rand);
-    r := HufDecodeChunk(bad.p, csize, outp.p, n);
+    r := DecodeChunk(eight, bad.p, csize, outp.p, n);
     if r > csize then
       Fail('Huffman chunk took more than its bytes', n, -1);
     GuardedFree(outp);

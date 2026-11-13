@@ -246,6 +246,68 @@ lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
 API and CLI).
 
+## Format v5: eight Huffman streams, its own levels (2026-11-13)
+
+Asked for: v5 better than v3 in ratio, compression and decompression
+speed at every -ec level. Measured on CPU 25 (shared machine): sizes,
+user cycles per MB (perf, the difference between runs of 0 and N
+compressions, 1 and 7 decodes; three rounds of the decodes, the best),
+v5 against v3 of the same build:
+
+- **Huffman decoding** (shared with v3, the same bytes; the previous
+  commit): each stream's buffer shifted by the code just read, the table
+  built by doubling, the encoder storing its accumulator every five
+  codes. v3 decodes in 7-13% fewer cycles than at 0.6.0, and compresses
+  in up to 35% fewer at -ec 0 (the encoder took 28 cycles a literal).
+- **Eight streams** (v5's chunk mode 3, symbol i in stream i mod 8):
+  four streams are bound by the chain from one symbol to the next (a
+  table load, a shift: 7 cycles), 1.75 cycles a literal at best. A C
+  prototype on silesia.tar's literals: 1.93 cycles a literal with four
+  streams, 1.39 with eight interleaved (output in consecutive bytes, a
+  sentinel bit instead of a bit count). In the decoder: -ec 0 1.486 ->
+  1.404, -ec 1 1.474 -> 1.353 M cycles per MB (silesia.tar). 8 more
+  header bytes a chunk: +0.005%.
+- **Levels.** v5 at level + 2, like v3, compressed 5-17% slower than v3
+  at most levels (v4's parsers are slower than v2's: the repeat checks,
+  the recorded sequences). v4's parse at a level is smaller than v2's
+  at the next one, so v5 parses one level lower (V5_LEVELS); with eight
+  streams even the fast parse (-ec 0) decodes faster than v3's -ec 0.
+  -ec 3 with level 4's 2 chain attempts came out 0.05% bigger than v3
+  on silesia.tar: 3 attempts. -ec 9: the first of CompressOptEC's two
+  parses only counts literals, and a shallow tree (btCut 2) counts
+  nearly the same ones: 69.22 MB against 68.98, 632 M cycles per MB
+  against 895 (v3: 839). -ec 10: level 9's parameters twice (level 10's
+  came out bigger in v5, 69.21 MB).
+
+v5 against v3 (same build), size / compression cycles / decode cycles:
+
+| -ec | silesia.tar | mixed.tar |
+|---|---|---|
+| 0 | -2.50 / -14.1 / -3.1% | -1.43 / -33.5 / -16.2% |
+| 1 | -2.02 / -14.2 / -6.8% | -1.74 / -16.9 / -17.3% |
+| 2 | -0.49 / -48.1 / -6.9% | -0.21 / -59.0 / -14.4% |
+| 3 | -1.51 / -7.7 / -8.7% | -1.19 / -3.0 / -16.0% |
+| 4 | -0.72 / -21.8 / -7.9% | -1.01 / -9.7 / -16.2% |
+| 5 | -1.29 / -19.2 / -8.5% | -1.17 / -8.7 / -16.2% |
+| 6 | -1.33 / -34.7 / -6.9% | -1.17 / -25.1 / -16.7% |
+| 7 | -0.84 / -67.0 / -5.7% | -1.09 / -51.0 / -15.3% |
+| 8 | -3.03 / -7.8 / -7.7% | -1.55 / -20.6 / -17.3% |
+| 9 | -2.83 / -24.6 / -9.7% | -1.70 / -15.1 / -16.2% |
+| 10 | -3.15 / -5.8 / -9.4% | -1.64 / -20.1 / -18.6% |
+
+Every cell is negative: v5 is smaller, and takes fewer cycles to
+compress and to decode, at every level of both. The thin ones: mixed
+-ec 3 compression (-3.0%: a review's nine interleaved rounds, the
+median; v5 took fewer cycles in eight of them, -2.5 to -3.9% by the
+best, wall clock -3 to -4%; a first run here gave -5.0%), silesia -ec 0
+decoding (-3.1%; wall clock 2239 against 2165 MB/s, the review's 2260
+against 2195), silesia -ec 3 and -ec 10 compression (-6 to -8%). On
+mixed.tar -ec 10 came out 0.02% bigger than -ec 9 (79.02 MB against
+79.00), in 28% more cycles. Against 0.6.0's v5, the remapped
+levels are up to 0.8 points bigger (silesia -ec 0 37.83% against
+37.22%; -ec 10 0.1 smaller) and compress in 1.2-3.2x fewer cycles at
+-ec 0..8.
+
 ## Commands for developing and reporting (2026-11-12)
 
 syc b (benchmark in memory), s (self-test), r (report), i on .sylz

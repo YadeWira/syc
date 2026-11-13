@@ -47,8 +47,9 @@
   Formats v4 and v5 (SYLZ_V4; provisional until frozen): three streams,
   tokens, offsets and literals, so that a token is one byte and a
   sequence takes two offset bytes only when it needs them; v5 is v4 with
-  the literals in v3's chunks. Bit 30 of the first u32 tells them from v2
-  and v3:
+  the literals in chunks like v3's, whose Huffman chunks have eight
+  streams (sylzhuf.pas, mode 3). Bit 30 of the first u32 tells them from
+  v2 and v3:
 
     block    := hdr:u32le  tokens[tokLen]  [offCount]  offsets[2 * offCount]
                 litsection
@@ -206,7 +207,8 @@ const
     literals that, Huffman-coded, they decode slower than level 2's parse
     and compress worse: silesia.tar 40.11% / 1655 MB/s, 39.21% / 1795,
     against 38.80% / 2209); 9 and 10 run the optimal parser with each
-    literal priced by its Huffman code (CompressOptEC). }
+    literal priced by its Huffman code (CompressOptEC). Format v5 (with
+    SYLZ_V4) parses its levels 0..8 one level lower (V5_LEVELS). }
   SYLZ_EC_SHIFT = 2;
   SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL;   { 9 and 10: entropy-aware prices }
   SYLZ_V4 = 2;        { format v4; with SYLZ_ENTROPY, v5 }
@@ -1512,8 +1514,10 @@ end;
 { The block's literals as format v3 chunks at p, in no more than cap
   bytes. Returns the section size, or -1 if it does not fit. (Until syc
   0.2.13 cap was the v2 layout's size, and a chunk needed room for its raw
-  form there: a block with one chunk never became v3.) }
-function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; cap: SizeInt): SizeInt;
+  form there: a block with one chunk never became v3.) Format v5's
+  chunks (eight: true) have eight streams. }
+function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; cap: SizeInt;
+  eight: Boolean): SizeInt;
 var
   pos, c, r, used: SizeInt;
 begin
@@ -1527,7 +1531,10 @@ begin
     c := count - pos;
     if c > LIT_CHUNK then
       c := LIT_CHUNK;
-    r := HufEncodeChunk(lits + pos, c, p + used, cap - used);
+    if eight then
+      r := HufEncodeChunk8(lits + pos, c, p + used, cap - used)
+    else
+      r := HufEncodeChunk(lits + pos, c, p + used, cap - used);
     if r < 0 then
       Exit(-1);
     Inc(used, r);
@@ -1659,7 +1666,7 @@ begin
       Move(lit^, e.lit^, litLen);
       if e.entropy and (litTotal > 0) then
       begin
-        v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+        v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, True);
         if (v3 >= 0) and (v3 < litTotal) then
         begin
           PUInt32(e.dst)^ := hdr or HDR_ENTROPY;
@@ -1680,7 +1687,7 @@ begin
     { all literals in the scratch stream (it holds n + slack bytes), then
       code them; only kept when smaller than the v2 layout }
     Move(lit^, e.lit^, litLen);
-    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, False);
     if (v3 >= 0) and (v3 < litTotal) then
     begin
       PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_ENTROPY;
@@ -4097,7 +4104,7 @@ const
   HCW_OPTIMAL_ML = 18;
 
 function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
-  level: Integer): SizeInt;
+  attempts: Integer): SizeInt;
 var
   iend: PByte;
   mfl, pos, anchor, ml, ref, ml0, ref0, start0, ml2, ref2, start2,
@@ -4121,7 +4128,7 @@ begin
     s.src := src;
     s.iend := iend;
     s.nextToInsert := 0;
-    s.attempts := HC_ATTEMPTS[level];
+    s.attempts := attempts;
     mfl := n - SEARCH_TAIL;
     pos := 0;
     ml := 0; ref := 0; ml0 := 0; ref0 := 0; start0 := 0;
@@ -4293,7 +4300,7 @@ procedure sylzc_compress_hc4(st: Pointer); cdecl; external name 'sylzc_compress_
 {$endif}
 
 function CompressHC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
-  cap: SizeInt; level: Integer): SizeInt;
+  cap: SizeInt; attempts: Integer): SizeInt;
 var
   e: TEmit;
   s: THcState;
@@ -4320,7 +4327,7 @@ begin
     s.src := src;
     s.iend := src + n;
     s.nextToInsert := 0;
-    s.attempts := HC_ATTEMPTS[level];
+    s.attempts := attempts;
     sc.s := @s;
     sc.search := @sylzc_hc_search;
 {$ifdef SYLZ_ASM_X64}
@@ -4336,7 +4343,7 @@ begin
     Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
   end;
 {$endif}
-  Result := CompressHCCore(src, n, e, s, level);
+  Result := CompressHCCore(src, n, e, s, attempts);
 end;
 
 { ── optimal parser ──────────────────────────────────────────────────────── }
@@ -5425,9 +5432,11 @@ end;
   33.98 -> 33.61% (-ec 9) / 33.60% (-ec 10), mixed 57.15 -> 56.94 /
   56.91%, at about half the speed (two parses) and ~5% slower decode (more
   literals). A third parse, priced from the second's literals, gained
-  0.02 points (33.58%). }
+  0.02 points (33.58%). The first parse runs with stats, the second with
+  p (format v3: the same; format v5's -ec 9: a first parse with a
+  shallow tree, V5_OPT_STATS). }
 function CompressOptEC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
-  cap: SizeInt; const p: TSylzOptParams): SizeInt;
+  cap: SizeInt; const stats, p: TSylzOptParams): SizeInt;
 var
   e: TEmit;
   b: TBtState;
@@ -5435,7 +5444,7 @@ var
   hist: PUInt32;
   prices: PInt32;
 
-  procedure ResetTree;
+  procedure ResetTree(const q: TSylzOptParams);
   begin
     FillChar(ctx.bt^, SizeOf(UInt32) shl BT_HASHLOG, 0);
     b.src := src;
@@ -5443,8 +5452,8 @@ var
     b.head := ctx.bt;
     b.son := ctx.bt + (1 shl BT_HASHLOG);
     b.nextToInsert := 0;
-    b.cut := p.btCut;
-    b.maxLen := p.btMaxLen;
+    b.cut := q.btCut;
+    b.maxLen := q.btMaxLen;
   end;
 
 begin
@@ -5457,13 +5466,13 @@ begin
   prices := GetMem(regions * 256 * SizeOf(Int32));
   try
     FillChar(hist^, regions * 256 * SizeOf(UInt32), 0);
-    ResetTree;
+    ResetTree(stats);
     { nothing is emitted in this pass, but the parse depends on the format }
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
     e.roomy := cap >= SylzBound(n);
-    CompressOptCore(src, n, e, b, ctx.opt, p, nil, hist);
+    CompressOptCore(src, n, e, b, ctx.opt, stats, nil, hist);
     LiteralPrices(hist, regions, prices);
-    ResetTree;
+    ResetTree(p);
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
     e.roomy := cap >= SylzBound(n);
     Result := CompressOptCore(src, n, e, b, ctx.opt, p, prices, nil);
@@ -5497,10 +5506,43 @@ begin
   Result := SylzCompressEx(ctx, src, n, dst, cap, level, 0);
 end;
 
+type
+  TV5Level = record
+    parse, attempts: Integer;
+  end;
+
+const
+  { Format v5's levels 0..8: the parse (format v4's level) and, at the
+    hash chain levels, the chain attempts; one level below v3's (v2's
+    level + SYLZ_EC_SHIFT). v4's parse at a level is smaller than v2's at
+    the next one, and with eight Huffman streams the literals decode fast
+    enough to take the fast parse at -ec 0 (v4's level 1: silesia.tar 1.36
+    M cycles per MB decoded, v3's -ec 0 1.50). -ec 3 takes 3 attempts,
+    where level 4 has 2: with 2 silesia.tar came out 0.05% bigger than
+    v3's -ec 3, with 3 1.5% smaller and still 5% fewer cycles. Against v3
+    at each of -ec 0..8 (2026-11-13, silesia.tar and mixed.tar): 0.2-3.0%
+    smaller, 3-65% fewer cycles to compress. As level + 2, like v3, v5
+    took 5-17% more than v3 at most of them. }
+  V5_LEVELS: array[0..8] of TV5Level = (
+    (parse: 1; attempts: 0), (parse: 2; attempts: 0), (parse: 3; attempts: 0),
+    (parse: 4; attempts: 3), (parse: 5; attempts: 4), (parse: 6; attempts: 8),
+    (parse: 7; attempts: 16), (parse: 8; attempts: 64), (parse: 9; attempts: 0));
+
+  { Format v5's -ec 9: the first parse of CompressOptEC only counts the
+    literals, and a shallow tree counts nearly the same ones: silesia.tar
+    69.22 MB against 68.98 with OPT_LEVEL9's, in 629 M cycles per MB
+    instead of 895 (v3's -ec 9: 71.23 MB, 823). -ec 10 is OPT_LEVEL9 in
+    both parses: level 10's deeper tree came out bigger in v5 (69.21 MB). }
+  V5_OPT_STATS: TSylzOptParams = (btCut: 2; btMaxLen: 256; sufficient: 16;
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+
 function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+var
+  attempts: Integer;
 begin
   ctx.flags := flags;
+  attempts := 0;   { HC_ATTEMPTS[level] }
   if cap < HEADER4_SIZE then
     Exit(-1);
   { v4's offsets: 2 bytes for each match at a new offset, of 4 bytes or more }
@@ -5526,12 +5568,25 @@ begin
         ctx.scratchSize := n + SCRATCH_SLACK;
         ctx.scratch := GetMem(ctx.scratchSize);
       end;
+      if flags and SYLZ_V4 <> 0 then
+      begin
+        if level = SYLZ_MAXLEVEL - 1 then
+          Exit(CompressOptEC(ctx, src, n, dst, cap, V5_OPT_STATS, OPT_LEVEL9))
+        else
+          Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9));
+      end;
       if level = SYLZ_MAXLEVEL - 1 then
-        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9))
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9))
       else
-        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10));
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10, OPT_LEVEL10));
     end;
-    Inc(level, SYLZ_EC_SHIFT);
+    if flags and SYLZ_V4 <> 0 then
+    begin
+      attempts := V5_LEVELS[level].attempts;
+      level := V5_LEVELS[level].parse;
+    end
+    else
+      Inc(level, SYLZ_EC_SHIFT);
   end;
   if level > SYLZ_MAXLEVEL then
     level := SYLZ_MAXLEVEL;
@@ -5550,7 +5605,11 @@ begin
   else if level = 10 then
     Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL10)
   else
-    Result := CompressHC(ctx, src, n, dst, cap, level);
+  begin
+    if attempts = 0 then
+      attempts := HC_ATTEMPTS[level];
+    Result := CompressHC(ctx, src, n, dst, cap, attempts);
+  end;
 end;
 
 function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
@@ -5677,8 +5736,47 @@ type
     fast: PUInt32;                           { 96: in, the same as a TFast4 }
     offs0: PByte;                            { 104: in, where the block's offsets start }
     short: Pointer;                          { 112: in, Short4 }
+    { format v5 (the fast loops do not read these): the literal chunks not
+      decoded yet, the literals in them, and the buffer lit .. lend is in }
+    litSrc, litSrcEnd: PByte;
+    litLeft: SizeInt;
+    litBuf: PByte;
   end;
   PDecode4State = ^TDecode4State;
+
+const
+  { Format v5's literal chunks are decoded one at a time, when the
+    sequences get to them, into a buffer of one chunk that stays in the
+    cache; the whole literal stream decoded first went out to memory and
+    came back (silesia.tar, -ec 0: 35 MB of it). The buffer starts with
+    room for the literals of the chunk before that are not used yet:
+    under LITBUF_KEEP, where the fast loops stop. }
+  LITBUF_KEEP = 16;
+  LITBUF_SIZE = LITBUF_KEEP + LIT_CHUNK + 16;
+
+{ Format v5: the next literal chunk, after the literals decoded and not
+  used yet. False on corrupt input, or with no chunk left. }
+function RefillLits4(var st: TDecode4State): Boolean;
+var
+  keep, c, r: SizeInt;
+begin
+  Result := False;
+  keep := st.lend - st.lit;
+  if (st.litLeft <= 0) or (keep > LITBUF_KEEP) then
+    Exit;
+  c := st.litLeft;
+  if c > LIT_CHUNK then
+    c := LIT_CHUNK;
+  Move(st.lit^, (st.litBuf + LITBUF_KEEP - keep)^, keep);
+  r := HufDecodeChunk8(st.litSrc, st.litSrcEnd - st.litSrc, st.litBuf + LITBUF_KEEP, c);
+  if r < 0 then
+    Exit;
+  Inc(st.litSrc, r);
+  Dec(st.litLeft, c);
+  st.lit := st.litBuf + LITBUF_KEEP - keep;
+  st.lend := st.litBuf + LITBUF_KEEP + c;
+  Result := True;
+end;
 
 var
   Fast4: TFast4;     { SYLZ_TOKENS4's }
@@ -6750,15 +6848,18 @@ begin
   until n <= 0;
 end;
 
-{ The rest of a chunk's sequences, exact and fully checked: tokens (with
-  their extensions) up to st.tend, 2-byte offsets from st.offp for those
-  that take one; with toOffset, only until the block has read an offset.
-  False on corrupt input. }
+{ A chunk's sequences from st.tok on, exact and fully checked: tokens
+  (with their extensions), 2-byte offsets from st.offp for those that
+  take one. It goes on to st.tend, or stops after a sequence whose
+  literals went on into the next literal chunk (format v5: the fast loop
+  has literals again), and with toOffset as soon as the block has read
+  an offset (the fast loops want one). False on corrupt input. }
 function DecodeSeqs4(var st: TDecode4State; toOffset: Boolean): Boolean;
 var
   tok, offp, lit, op, m: PByte;
   e: UInt32;
-  ll, ml, rep: SizeInt;
+  ll, ml, rep, c: SizeInt;
+  refilled: Boolean;
 begin
   Result := False;
   tok := st.tok;
@@ -6766,7 +6867,8 @@ begin
   lit := st.lit;
   op := st.op;
   rep := st.rep;
-  while (tok < st.tend) and not (toOffset and (offp <> st.offs0)) do
+  refilled := False;
+  while (tok < st.tend) and not refilled and not (toOffset and (offp <> st.offs0)) do
   begin
     e := st.tokens[tok^];
     Inc(tok);
@@ -6783,8 +6885,21 @@ begin
       rep := SizeInt(offp[0] or (UInt32(offp[1]) shl 8)) + 1;
       Inc(offp, 2);
     end;
-    if (ll > st.lend - lit) or (ll > st.oend - op) then
+    if ll > st.oend - op then
       Exit;
+    while ll > st.lend - lit do
+    begin
+      { what is decoded of the run, then the next literal chunk }
+      c := st.lend - lit;
+      Move(lit^, op^, c);
+      Inc(op, c);
+      Dec(ll, c);
+      st.lit := st.lend;
+      if not RefillLits4(st) then
+        Exit;
+      lit := st.lit;
+      refilled := True;
+    end;
     Move(lit^, op^, ll);
     Inc(op, ll);
     Inc(lit, ll);
@@ -7001,57 +7116,67 @@ function sylzc_decode4(st: PDecode4State): SizeInt; cdecl; external name 'sylzc_
 { One chunk of sequences: st.tok .. st.tend with the table st.tokens. }
 function DecodeChunk4(var st: TDecode4State): Boolean;
 begin
-{$ifdef SYLZ_ASM_X64}
-  if SylzUseAsm and not SylzPreferC then
+  Result := False;
+  while st.tok < st.tend do
   begin
-    { the fast loop stops at an escape it has no room for, or at the
-      chunk's last sequences: DecodeEscape4, then DecodeSeqs4, exactly }
-    repeat
-      DecodeFast4X64(@st);
-      if st.status < 0 then
-        Exit(False);
-    until not DecodeEscape4(st);
-    Exit(DecodeSeqs4(st, False));
-  end;
+    { the fast loops want the block to have read an offset: the previous
+      distance is then the offset before the next one in the stream }
+    if st.offp = st.offs0 then
+    begin
+      if not DecodeSeqs4(st, True) then
+        Exit;
+      Continue;
+    end;
+    { the fast loop stops at an escape it has no room for, when the
+      literals decoded so far run short (format v5), and near the ends of
+      the streams }
+{$ifdef SYLZ_ASM_X64}
+    if SylzUseAsm and not SylzPreferC then
+      DecodeFast4X64(@st)
+    else
 {$endif}
 {$ifdef SYLZ_C}
-  if SylzUseAsm then
-    Exit(sylzc_decode4(@st) = 0);
+    if SylzUseAsm then
+      st.status := sylzc_decode4(@st)
+    else
 {$endif}
-  { DecodeFast4Pas wants the block to have read an offset }
-  if (st.offp = st.offs0) and not DecodeSeqs4(st, True) then
-    Exit(False);
-  repeat
-    DecodeFast4Pas(st);
+      DecodeFast4Pas(st);
     if st.status < 0 then
-      Exit(False);
-  until not DecodeEscape4(st);
-  Result := DecodeSeqs4(st, False);
+      Exit;
+    if st.tok >= st.tend then
+      Break;
+    if DecodeEscape4(st) then
+      Continue;
+    if (st.litLeft > 0) and (st.lend - st.lit < LITBUF_KEEP) then
+    begin
+      if not RefillLits4(st) then
+        Exit;
+      Continue;
+    end;
+    { exactly: to the chunk's end, or past a literal run that goes on in
+      the next literal chunk }
+    if not DecodeSeqs4(st, False) then
+      Exit;
+  end;
+  Result := True;
 end;
 
-{ A format v4 block's streams into dst: the token chunks at sec, with
-  SYLZ_TOKENS4 as their updates leave it, then the tail literals. one < 0:
-  each chunk behind its header; else one chunk, sec to secEnd, and one is
-  what its header would say besides the length (CHUNK4_UPDATE). }
-function DecodeStreams4(sec, secEnd, offp, offend, lit, lend, dst: PByte;
-  dstLen: SizeInt; one: Int32): SizeInt;
+{ A format v4 block's sequences into st.op .. st.oend: the token chunks
+  sec .. secEnd, with SYLZ_TOKENS4 as their updates leave it, then the
+  tail literals. The caller sets the offsets, the literals and the output
+  in st. one < 0: each chunk behind its header; else one chunk, sec to
+  secEnd, and one is what its header would say besides the length
+  (CHUNK4_UPDATE). }
+function DecodeStreams4(var st: TDecode4State; sec, secEnd: PByte; one: Int32): Boolean;
 var
-  st: TDecode4State;
   own: TTable4;
   ownFast: TFast4;
   w: UInt32;
   c: SizeInt;
 begin
-  Result := -1;
-  st.offp := offp;
-  st.lit := lit;
-  st.op := dst;
-  st.offend := offend;
-  st.lend := lend;
-  st.oend := dst + dstLen;
-  st.dst := dst;
+  Result := False;
   st.rep := 1;
-  st.offs0 := offp;
+  st.offs0 := st.offp;
   st.short := @Short4;
   st.tokens := @SYLZ_TOKENS4[0];
   st.fast := @Fast4[0];
@@ -7112,11 +7237,24 @@ begin
       Exit;
     sec := st.tend;
   end;
-  { every offset used; the rest of the literals is the block's tail }
-  if (st.offp <> offend) or (lend - st.lit <> st.oend - st.op) then
+  { every offset used; the rest of the literals, decoded or still in
+    their chunks, is the block's tail }
+  if st.offp <> st.offend then
     Exit;
-  Move(st.lit^, st.op^, lend - st.lit);
-  Result := dstLen;
+  repeat
+    c := st.lend - st.lit;
+    if c > st.oend - st.op then
+      Exit;
+    Move(st.lit^, st.op^, c);
+    Inc(st.op, c);
+    st.lit := st.lend;
+    if st.litLeft = 0 then
+      Break;
+    if not RefillLits4(st) then
+      Exit;
+  until False;
+  { the output filled, and the literal chunks took the rest of the block }
+  Result := (st.op = st.oend) and (st.litSrc = st.litSrcEnd);
 end;
 
 procedure SylzDCtxInit(out dctx: TSylzDCtx);
@@ -7138,12 +7276,12 @@ var
   one: Int32;
   ctrlLen, offLen, litCount, pos, c, r: SizeInt;
   ctrl, cend, send, p: PByte;
+  st: TDecode4State;
 begin
   if n < HEADER_SIZE then
     Exit(-1);
   hdr := PUInt32(src)^;
   send := src + n;
-  offLen := -1;   { not v4 }
   one := -1;
   if hdr and HDR_V4 <> 0 then
   begin
@@ -7185,25 +7323,60 @@ begin
       offLen := 2 * SizeInt(count);
     end;
     Inc(cend, offLen);   { where the literal section starts }
+    st.offp := cend - offLen;
+    st.offend := cend;
+    st.op := dst;
+    st.oend := dst + dstLen;
+    st.dst := dst;
     if hdr and HDR_ENTROPY = 0 then
-      Exit(DecodeStreams4(ctrl, ctrl + ctrlLen, cend - offLen, cend, cend, send, dst, dstLen, one));
-  end
-  else
-  begin
-    ctrlLen := hdr and HDR_CTRLMASK;
-    if ctrlLen > n - HEADER_SIZE then
-      Exit(-1);
-    ctrl := src + HEADER_SIZE;
-    cend := ctrl + ctrlLen;
-    if hdr and HDR_ENTROPY = 0 then
-      Exit(DecodeStreams(ctrl, cend, cend, send, dst, dstLen));
+    begin
+      st.lit := cend;
+      st.lend := send;
+      st.litSrc := nil;
+      st.litSrcEnd := nil;
+      st.litLeft := 0;
+      st.litBuf := nil;
+    end
+    else
+    begin
+      { v5: the literal chunks are decoded as the sequences get to them }
+      if send - cend < 4 then
+        Exit(-1);
+      litCount := PUInt32(cend)^;
+      { (a u32 of 2^31 or more is negative in a 32-bit SizeInt) }
+      if (litCount > dstLen) or (litCount <= 0) then
+        Exit(-1);
+      if dctx.litsSize < LITBUF_SIZE then
+      begin
+        FreeMem(dctx.lits);
+        dctx.lits := GetMem(LITBUF_SIZE);
+        dctx.litsSize := LITBUF_SIZE;
+      end;
+      st.litBuf := dctx.lits;
+      st.lit := dctx.lits;
+      st.lend := dctx.lits;
+      st.litSrc := cend + 4;
+      st.litSrcEnd := send;
+      st.litLeft := litCount;
+    end;
+    if DecodeStreams4(st, ctrl, ctrl + ctrlLen, one) then
+      Exit(dstLen);
+    Exit(-1);
   end;
+  ctrlLen := hdr and HDR_CTRLMASK;
+  if ctrlLen > n - HEADER_SIZE then
+    Exit(-1);
+  ctrl := src + HEADER_SIZE;
+  cend := ctrl + ctrlLen;
+  if hdr and HDR_ENTROPY = 0 then
+    Exit(DecodeStreams(ctrl, cend, cend, send, dst, dstLen));
 
-  { v3 / v5: decode the literal chunks first, then the sequences over them }
+  { v3: decode the literal chunks first, then the sequences over them }
   if send - cend < 4 then
     Exit(-1);
   litCount := PUInt32(cend)^;
-  if (litCount > dstLen) or (litCount = 0) then
+  { (a u32 of 2^31 or more is negative in a 32-bit SizeInt) }
+  if (litCount > dstLen) or (litCount <= 0) then
     Exit(-1);
   if dctx.litsSize < litCount then
   begin
@@ -7226,11 +7399,7 @@ begin
   end;
   if p <> send then   { the chunks must take the rest of the block exactly }
     Exit(-1);
-  if offLen >= 0 then
-    Result := DecodeStreams4(ctrl, ctrl + ctrlLen, cend - offLen, cend,
-      dctx.lits, dctx.lits + litCount, dst, dstLen, one)
-  else
-    Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
+  Result := DecodeStreams(ctrl, cend, dctx.lits, dctx.lits + litCount, dst, dstLen);
 end;
 
 function SylzBlockFormat(src: PByte; n: SizeInt): Integer;
