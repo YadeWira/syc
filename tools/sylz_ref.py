@@ -228,8 +228,9 @@ def decode_huffman_run(reader, decode_map, count):
     return out
 
 
-def decode_chunk(b, i, c):
-    """The chunk at b[i:] holding c literals: (literals, next i)."""
+def decode_chunk(b, i, c, v5):
+    """The chunk at b[i:] holding c literals: (literals, next i). Format
+    v3 has modes 0, 1 and 2, format v5 modes 0 and 3."""
     if i >= len(b):
         raise SylzError("truncated")
     mode = b[i]
@@ -237,11 +238,11 @@ def decode_chunk(b, i, c):
         if len(b) - (i + 1) < c:
             raise SylzError("truncated raw chunk")
         return bytes(b[i + 1:i + 1 + c]), i + 1 + c
-    if mode not in (1, 2):
+    if mode not in ((3,) if v5 else (1, 2)):
         raise SylzError("unknown chunk mode %d" % mode)
     if c < MIN_HUFF_SYMBOLS:
         raise SylzError("Huffman chunk under 256 symbols")
-    nsizes = 4 if mode == 2 else 3
+    nsizes = {1: 3, 2: 4, 3: 8}[mode]
     head = 1 + 128 + 2 * nsizes
     if len(b) - i < head:
         raise SylzError("truncated chunk header")
@@ -255,6 +256,17 @@ def decode_chunk(b, i, c):
     decode_map = {cl: sym for sym, cl in codes.items()}
     sizes = [u16(b, i + 129 + 2 * k) for k in range(nsizes)]
     p = i + head
+    if mode == 3:
+        # eight streams, symbols dealt out in turn: symbol j in stream j % 8
+        out = bytearray(c)
+        for k in range(8):
+            end = p + sizes[k]
+            if end > len(b):
+                raise SylzError("stream past the block")
+            r = BitReader(b, p, end)
+            out[k::8] = decode_huffman_run(r, decode_map, len(range(k, c, 8)))
+            p = end
+        return bytes(out), p
     q = (c + 3) // 4
     runs = [q, q, q, c - 3 * q]
     out = bytearray()
@@ -300,7 +312,7 @@ def decode_block4(b, n):
     offs = b[tok_end:tok_end + off_len]
     i = tok_end + off_len
     if hdr >> 31:
-        lits, i = decode_literal_section(b, i, n)
+        lits, i = decode_literal_section(b, i, n, True)
         if i != len(b):
             raise SylzError("the chunks do not take the rest of the block")
     else:
@@ -364,8 +376,8 @@ def decode_block4(b, n):
     return bytes(out)
 
 
-def decode_literal_section(b, i, n):
-    """v3's and v5's coded literals at b[i:]: (literals, next i)."""
+def decode_literal_section(b, i, n, v5):
+    """v3's or v5's coded literals at b[i:]: (literals, next i)."""
     lit_count = u32(b, i)
     if lit_count == 0 or lit_count > n:
         raise SylzError("literal count out of range")
@@ -373,7 +385,7 @@ def decode_literal_section(b, i, n):
     lits = bytearray()
     while len(lits) < lit_count:
         c = min(LIT_CHUNK, lit_count - len(lits))
-        chunk, i = decode_chunk(b, i, c)
+        chunk, i = decode_chunk(b, i, c, v5)
         lits += chunk
     return bytes(lits), i
 
@@ -390,7 +402,7 @@ def decode_block(b, n):
     i = 4 + ctrl_len
     if not hdr >> 31:
         return decode_sequences(ctrl, b[i:], n)   # format v2
-    lits, i = decode_literal_section(b, i, n)
+    lits, i = decode_literal_section(b, i, n, False)
     if i != len(b):
         raise SylzError("the chunks do not take the rest of the block")
     return decode_sequences(ctrl, lits, n)

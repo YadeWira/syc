@@ -47,8 +47,9 @@
   Formats v4 and v5 (SYLZ_V4; provisional until frozen): three streams,
   tokens, offsets and literals, so that a token is one byte and a
   sequence takes two offset bytes only when it needs them; v5 is v4 with
-  the literals in v3's chunks. Bit 30 of the first u32 tells them from v2
-  and v3:
+  the literals in chunks like v3's, whose Huffman chunks have eight
+  streams (sylzhuf.pas, mode 3). Bit 30 of the first u32 tells them from
+  v2 and v3:
 
     block    := hdr:u32le  offLen:u32le  tokens[tokLen]  offsets[offLen]
                 litsection
@@ -1136,8 +1137,10 @@ end;
 { The block's literals as format v3 chunks at p, in no more than cap
   bytes. Returns the section size, or -1 if it does not fit. (Until syc
   0.2.13 cap was the v2 layout's size, and a chunk needed room for its raw
-  form there: a block with one chunk never became v3.) }
-function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; cap: SizeInt): SizeInt;
+  form there: a block with one chunk never became v3.) Format v5's
+  chunks (eight: true) have eight streams. }
+function EncodeLiteralChunks(lits: PByte; count: SizeInt; p: PByte; cap: SizeInt;
+  eight: Boolean): SizeInt;
 var
   pos, c, r, used: SizeInt;
 begin
@@ -1151,7 +1154,10 @@ begin
     c := count - pos;
     if c > LIT_CHUNK then
       c := LIT_CHUNK;
-    r := HufEncodeChunk(lits + pos, c, p + used, cap - used);
+    if eight then
+      r := HufEncodeChunk8(lits + pos, c, p + used, cap - used)
+    else
+      r := HufEncodeChunk(lits + pos, c, p + used, cap - used);
     if r < 0 then
       Exit(-1);
     Inc(used, r);
@@ -1181,7 +1187,7 @@ begin
     Move(lit^, e.lit^, litLen);
     if e.entropy and (litTotal > 0) then
     begin
-      v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+      v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, True);
       if (v3 >= 0) and (v3 < litTotal) then
       begin
         PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_V4 or HDR_ENTROPY;
@@ -1201,7 +1207,7 @@ begin
     { all literals in the scratch stream (it holds n + slack bytes), then
       code them; only kept when smaller than the v2 layout }
     Move(lit^, e.lit^, litLen);
-    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl);
+    v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, False);
     if (v3 >= 0) and (v3 < litTotal) then
     begin
       PUInt32(e.dst)^ := UInt32(ctrlLen) or HDR_ENTROPY;
@@ -5133,7 +5139,7 @@ begin
   if c > LIT_CHUNK then
     c := LIT_CHUNK;
   Move(st.lit^, (st.litBuf + LITBUF_KEEP - keep)^, keep);
-  r := HufDecodeChunk(st.litSrc, st.litSrcEnd - st.litSrc, st.litBuf + LITBUF_KEEP, c);
+  r := HufDecodeChunk8(st.litSrc, st.litSrcEnd - st.litSrc, st.litBuf + LITBUF_KEEP, c);
   if r < 0 then
     Exit;
   Inc(st.litSrc, r);

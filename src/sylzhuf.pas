@@ -10,6 +10,9 @@
                stream1 stream2 stream3 stream4   (written by syc 0.2.4 to
                0.2.13, still read; stream 4 ends where its last code does)
 
+    mode 3  := lengths[128]  size1:u16le .. size8:u16le
+               stream1 .. stream8   (format v5)
+
   Mode 2 gives every stream's size, so the next chunk's place is known
   without decoding this one (chunks can be decoded in parallel).
 
@@ -22,6 +25,15 @@
   in deflate, so the decoder reads 8 bytes little-endian with no byte
   swap). Four independent streams let the decoder interleave four
   dependency chains.
+
+  Mode 3 (format v5's chunks, HufEncodeChunk8 / HufDecodeChunk8) has
+  eight streams, and deals the symbols out to them in turn: symbol i is
+  in stream i mod 8. Eight chains instead of four: a symbol's chain
+  (table load, shift) is about 7 cycles, so four streams cannot go
+  below 1.75 cycles a symbol; eight took 1.39 in a prototype against
+  1.93 for four (silesia.tar's literals), and the v5 decoder 6-8% fewer
+  cycles per byte (-ec 0 and 1). The symbols of a round of all eight streams go
+  to consecutive bytes, so the decoder has a single output pointer.
 
   The decoder never reads or writes out of bounds, whatever the input:
   it rejects length sets that are not a complete prefix code, and checks
@@ -40,6 +52,7 @@ const
   HUF_TABLESIZE = 1 shl HUF_MAXBITS;
   HUF_HEADER    = 128 + 6;   { mode 1: lengths + three stream sizes }
   HUF_HEADER2   = 128 + 8;   { mode 2: lengths + four stream sizes }
+  HUF_HEADER3   = 128 + 16;  { mode 3: lengths + eight stream sizes }
   HUF_MIN_GAIN_PCT = 4;
   { smallest chunk that may be Huffman-coded (mode 1); smaller ones are
     raw. The decoder rejects mode 1 below it: with fewer symbols the
@@ -54,10 +67,16 @@ function HufBound(n: SizeInt): SizeInt;
   n <= 65536 * 4 keeps every stream under the u16 size limit. }
 function HufEncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
 
-{ Decodes one chunk of exactly n bytes from src[0..srcLen) into dst.
-  Returns the number of src bytes the chunk took, or -1 if it is
-  corrupt. }
+{ HufEncodeChunk with eight interleaved streams: mode 3 (or raw). }
+function HufEncodeChunk8(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+
+{ Decodes one chunk (modes 0, 1, 2) of exactly n bytes from
+  src[0..srcLen) into dst. Returns the number of src bytes the chunk
+  took, or -1 if it is corrupt. }
 function HufDecodeChunk(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
+
+{ HufDecodeChunk for modes 0 and 3 (format v5's chunks). }
+function HufDecodeChunk8(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
 
 { The code lengths (0 = absent, else 1..HUF_MAXBITS) HufEncodeChunk would
   give symbols with these frequencies. }
@@ -254,13 +273,14 @@ const
   ENC_GROUP = 5;
   ENC_SLACK = 8;   { a run's last write may go this far past its end }
 
-{ The codes of src[0..n) at p, LSB first, the last byte padded with zero
-  bits; tab[symbol] = its code (first bit lowest) shl 4 or its length.
-  Returns where the run ends; writes up to ENC_SLACK - 1 bytes past it.
-  (The accumulator is stored whole every ENC_GROUP symbols and the pointer
-  moved by the whole bytes in it: one byte at a time, with a bounds check
-  each, took 28 cycles a literal; this takes 3.) }
-function EncodeRun(src: PByte; n: SizeInt; tab: PUInt32; p: PByte): PByte;
+{ The codes of n symbols at p, LSB first, the last byte padded with zero
+  bits: src[0], src[step], src[2 * step] ...; tab[symbol] = its code
+  (first bit lowest) shl 4 or its length. Returns where the run ends;
+  writes up to ENC_SLACK - 1 bytes past it. (The accumulator is stored
+  whole every ENC_GROUP symbols and the pointer moved by the whole bytes
+  in it: one byte at a time, with a bounds check each, took 28 cycles a
+  literal; this takes 3.) }
+function EncodeRun(src: PByte; n, step: SizeInt; tab: PUInt32; p: PByte): PByte;
 var
   acc: UInt64;
   bits: SizeUInt;
@@ -272,47 +292,51 @@ begin
   i := 0;
   while i + ENC_GROUP <= n do
   begin
-    e := tab[src[i]];
+    e := tab[src^];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
-    e := tab[src[i + 1]];
+    e := tab[src[step]];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
-    e := tab[src[i + 2]];
+    e := tab[src[2 * step]];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
-    e := tab[src[i + 3]];
+    e := tab[src[3 * step]];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
-    e := tab[src[i + 4]];
+    e := tab[src[4 * step]];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
     PUInt64(p)^ := acc;
     Inc(p, bits shr 3);
     acc := acc shr (bits and 56);
     bits := bits and 7;
+    Inc(src, ENC_GROUP * step);
     Inc(i, ENC_GROUP);
   end;
   { fewer than ENC_GROUP left: they fit too }
   while i < n do
   begin
-    e := tab[src[i]];
+    e := tab[src^];
     acc := acc or (UInt64(e shr 4) shl bits);
     Inc(bits, e and 15);
+    Inc(src, step);
     Inc(i);
   end;
   PUInt64(p)^ := acc;
   Result := p + (bits + 7) shr 3;
 end;
 
-function HufEncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+{ HufEncodeChunk (streams = 4: mode 2) and HufEncodeChunk8 (8: mode 3). }
+function EncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
+  streams: Integer): SizeInt;
 var
   hist: array[0..3, 0..255] of UInt32;
   freq: array[0..255] of UInt32;
   len: array[0..255] of Byte;
   code: array[0..255] of UInt32;
   tab: array[0..255] of UInt32;
-  i, s, q, a, b: SizeInt;
+  i, s, q, a, b, header: SizeInt;
   bits: Int64;
   p, start, stop: PByte;
   size: SizeInt;
@@ -342,6 +366,10 @@ begin
     for i := 0 to 255 do
       freq[i] := hist[0, i] + hist[1, i] + hist[2, i] + hist[3, i];
     BuildLengths(freq, len, HUF_MAXBITS);
+    if streams = 8 then
+      header := HUF_HEADER3
+    else
+      header := HUF_HEADER2;
     { a single symbol has no complete code: such a chunk stays raw }
     if CanonicalCodes(len, code) then
     begin
@@ -357,24 +385,31 @@ begin
         nearly random data it saves little and costs a table decode per
         byte (mixed corpus: 4% gives +12% decode speed for 0.1 point of
         ratio; 8% gives +25% for 0.5). The streams take at most bits div
-        8 + 4 bytes, so they end inside the chunk's raw size, and
+        8 + streams bytes, so they end inside the chunk's raw size, and
         EncodeRun's writes inside cap when that leaves ENC_SLACK. }
-      if (HUF_HEADER2 + bits div 8 + 4 + n * HUF_MIN_GAIN_PCT div 100 < n)
-         and (1 + HUF_HEADER2 + bits div 8 + 4 + ENC_SLACK <= cap) then
+      if (header + bits div 8 + streams + n * HUF_MIN_GAIN_PCT div 100 < n)
+         and (1 + header + bits div 8 + streams + ENC_SLACK <= cap) then
       begin
         p := dst + 1;
         for i := 0 to 127 do
           p[i] := len[2 * i] or (len[2 * i + 1] shl 4);
-        start := p + HUF_HEADER2;
+        start := p + header;
         q := (n + 3) div 4;
         fits := True;
-        for s := 0 to 3 do
+        for s := 0 to streams - 1 do
         begin
-          a := s * q;
-          b := a + q;
-          if b > n then
-            b := n;
-          stop := EncodeRun(src + a, b - a, @tab[0], start);
+          if streams = 8 then
+            { symbols s, s + 8, s + 16 ... }
+            stop := EncodeRun(src + s, (n - s + 7) div 8, 8, @tab[0], start)
+          else
+          begin
+            { a run of q symbols }
+            a := s * q;
+            b := a + q;
+            if b > n then
+              b := n;
+            stop := EncodeRun(src + a, b - a, 1, @tab[0], start);
+          end;
           size := stop - start;
           if size > $FFFF then
             fits := False;   { the size field is 16 bits }
@@ -384,7 +419,10 @@ begin
         end;
         if fits and (start - dst < 1 + n) then
         begin
-          dst[0] := 2;
+          if streams = 8 then
+            dst[0] := 3
+          else
+            dst[0] := 2;
           Exit(start - dst);
         end;
       end;
@@ -394,6 +432,16 @@ begin
   if n > 0 then
     Move(src^, dst[1], n);
   Result := 1 + n;
+end;
+
+function HufEncodeChunk(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+begin
+  Result := EncodeChunk(src, n, dst, cap, 4);
+end;
+
+function HufEncodeChunk8(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt): SizeInt;
+begin
+  Result := EncodeChunk(src, n, dst, cap, 8);
 end;
 
 procedure HufLengths(freq: PUInt32; len: PByte);
@@ -1071,6 +1119,524 @@ asm
 end;
 
 { BMI2 (cpuid leaf 7, ebx bit 8) }
+type
+  { In/out state of the mode 3 bulk decoder; fixed field order. }
+  THufBulk8 = record
+    pos: array[0..7] of UInt64;   {  0: in/out, each stream's next bit, as its address times 8 }
+    table: Pointer;               { 64: in }
+    out0: PByte;                  { 72: in/out, the next output byte }
+    outEnd: PByte;                { 80: in, out0 after the last round to run }
+  end;
+  PHufBulk8 = ^THufBulk8;
+
+{ The bulk loop of HufDecodeChunk8: rounds of five symbols from each of
+  the eight streams (40 output bytes: symbol j of stream k at out0 + 8j +
+  k), until out0 reaches outEnd (at least one round). A refill reads the
+  8 bytes at the stream's byte; the caller counts the rounds the input
+  allows (a round takes at most 55 bits of a stream).
+
+  A stream's buffer is loaded at its bit position, shifted so that its
+  next bit is bit 0, and bit 63 set: the code bits are below that mark,
+  57 of them or more, enough for five codes of HUF_MAXBITS. A symbol:
+  the table entry at the low HUF_MAXBITS bits (length in the low byte,
+  symbol in the high one), the buffer shifted right by the length. The
+  mark moves down with the bits taken, so at the refill its leading
+  zeros are the bits the round took: no count to keep in a register.
+
+  Registers: r8-r15 the buffers, rdi the table, rsi the output (no REX
+  prefix: the symbol is stored from ah), rbp outEnd (never addresses
+  memory: FPC reads [rbp + n] as a frame access), edx the symbols left
+  in the round; rax, rcx scratch. The bit positions live on the stack.
+  HufBulk8Bmi2 uses bzhi, shrx and lzcnt (written as bytes, FPC 3.2's
+  assembler lacks them; every CPU with BMI2 has lzcnt), HufBulk8X64 and,
+  shr cl and bsr. }
+procedure HufBulk8Bmi2(st: PHufBulk8); assembler; nostackframe;
+asm
+  push rbx
+  push r12
+  push rbp
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  sub rsp, 72
+  mov [rsp + 64], rax             { state }
+  mov rcx, [rax + 0]
+  mov [rsp + 0], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r8, [rdx]
+  db $C4, $42, $F3, $F7, $C0   { shrx r8, r8, rcx }
+  bts r8, 63
+  mov rcx, [rax + 8]
+  mov [rsp + 8], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r9, [rdx]
+  db $C4, $42, $F3, $F7, $C9   { shrx r9, r9, rcx }
+  bts r9, 63
+  mov rcx, [rax + 16]
+  mov [rsp + 16], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r10, [rdx]
+  db $C4, $42, $F3, $F7, $D2   { shrx r10, r10, rcx }
+  bts r10, 63
+  mov rcx, [rax + 24]
+  mov [rsp + 24], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r11, [rdx]
+  db $C4, $42, $F3, $F7, $DB   { shrx r11, r11, rcx }
+  bts r11, 63
+  mov rcx, [rax + 32]
+  mov [rsp + 32], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r12, [rdx]
+  db $C4, $42, $F3, $F7, $E4   { shrx r12, r12, rcx }
+  bts r12, 63
+  mov rcx, [rax + 40]
+  mov [rsp + 40], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r13, [rdx]
+  db $C4, $42, $F3, $F7, $ED   { shrx r13, r13, rcx }
+  bts r13, 63
+  mov rcx, [rax + 48]
+  mov [rsp + 48], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r14, [rdx]
+  db $C4, $42, $F3, $F7, $F6   { shrx r14, r14, rcx }
+  bts r14, 63
+  mov rcx, [rax + 56]
+  mov [rsp + 56], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r15, [rdx]
+  db $C4, $42, $F3, $F7, $FF   { shrx r15, r15, rcx }
+  bts r15, 63
+  mov rdi, [rax + 64]             { table }
+  mov rsi, [rax + 72]             { out0 }
+  mov rbp, [rax + 80]             { outEnd }
+  mov ebx, HUF_MAXBITS
+@round:
+  mov edx, 5
+@sym:
+  db $C4, $C2, $60, $F5, $C0   { bzhi eax, r8d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $C0   { shrx r8, r8, rax }
+  mov byte ptr [rsi + 0], ah
+  db $C4, $C2, $60, $F5, $C1   { bzhi eax, r9d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $C9   { shrx r9, r9, rax }
+  mov byte ptr [rsi + 1], ah
+  db $C4, $C2, $60, $F5, $C2   { bzhi eax, r10d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $D2   { shrx r10, r10, rax }
+  mov byte ptr [rsi + 2], ah
+  db $C4, $C2, $60, $F5, $C3   { bzhi eax, r11d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $DB   { shrx r11, r11, rax }
+  mov byte ptr [rsi + 3], ah
+  db $C4, $C2, $60, $F5, $C4   { bzhi eax, r12d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $E4   { shrx r12, r12, rax }
+  mov byte ptr [rsi + 4], ah
+  db $C4, $C2, $60, $F5, $C5   { bzhi eax, r13d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $ED   { shrx r13, r13, rax }
+  mov byte ptr [rsi + 5], ah
+  db $C4, $C2, $60, $F5, $C6   { bzhi eax, r14d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $F6   { shrx r14, r14, rax }
+  mov byte ptr [rsi + 6], ah
+  db $C4, $C2, $60, $F5, $C7   { bzhi eax, r15d, ebx }
+  movzx eax, word ptr [rdi + rax * 2]
+  db $C4, $42, $FB, $F7, $FF   { shrx r15, r15, rax }
+  mov byte ptr [rsi + 7], ah
+  add rsi, 8
+  dec edx
+  jnz @sym
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $C8   { lzcnt rcx, r8 }
+  add rcx, [rsp + 0]
+  mov [rsp + 0], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r8, [rax]
+  db $C4, $42, $F3, $F7, $C0   { shrx r8, r8, rcx }
+  bts r8, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $C9   { lzcnt rcx, r9 }
+  add rcx, [rsp + 8]
+  mov [rsp + 8], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r9, [rax]
+  db $C4, $42, $F3, $F7, $C9   { shrx r9, r9, rcx }
+  bts r9, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CA   { lzcnt rcx, r10 }
+  add rcx, [rsp + 16]
+  mov [rsp + 16], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r10, [rax]
+  db $C4, $42, $F3, $F7, $D2   { shrx r10, r10, rcx }
+  bts r10, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CB   { lzcnt rcx, r11 }
+  add rcx, [rsp + 24]
+  mov [rsp + 24], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r11, [rax]
+  db $C4, $42, $F3, $F7, $DB   { shrx r11, r11, rcx }
+  bts r11, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CC   { lzcnt rcx, r12 }
+  add rcx, [rsp + 32]
+  mov [rsp + 32], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r12, [rax]
+  db $C4, $42, $F3, $F7, $E4   { shrx r12, r12, rcx }
+  bts r12, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CD   { lzcnt rcx, r13 }
+  add rcx, [rsp + 40]
+  mov [rsp + 40], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r13, [rax]
+  db $C4, $42, $F3, $F7, $ED   { shrx r13, r13, rcx }
+  bts r13, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CE   { lzcnt rcx, r14 }
+  add rcx, [rsp + 48]
+  mov [rsp + 48], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r14, [rax]
+  db $C4, $42, $F3, $F7, $F6   { shrx r14, r14, rcx }
+  bts r14, 63
+  xor ecx, ecx
+  db $F3, $49, $0F, $BD, $CF   { lzcnt rcx, r15 }
+  add rcx, [rsp + 56]
+  mov [rsp + 56], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r15, [rax]
+  db $C4, $42, $F3, $F7, $FF   { shrx r15, r15, rcx }
+  bts r15, 63
+  cmp rsi, rbp
+  jb @round
+  mov rax, [rsp + 64]
+  mov [rax + 72], rsi
+  mov rcx, [rsp + 0]
+  mov [rax + 0], rcx
+  mov rcx, [rsp + 8]
+  mov [rax + 8], rcx
+  mov rcx, [rsp + 16]
+  mov [rax + 16], rcx
+  mov rcx, [rsp + 24]
+  mov [rax + 24], rcx
+  mov rcx, [rsp + 32]
+  mov [rax + 32], rcx
+  mov rcx, [rsp + 40]
+  mov [rax + 40], rcx
+  mov rcx, [rsp + 48]
+  mov [rax + 48], rcx
+  mov rcx, [rsp + 56]
+  mov [rax + 56], rcx
+  add rsp, 72
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop rbp
+  pop r12
+  pop rbx
+end;
+
+procedure HufBulk8X64(st: PHufBulk8); assembler; nostackframe;
+asm
+  push rbx
+  push r12
+  push rbp
+  push r13
+  push r14
+  push r15
+{$ifdef WIN64}
+  push rsi
+  push rdi
+  mov rax, rcx
+{$else}
+  mov rax, rdi
+{$endif}
+  sub rsp, 72
+  mov [rsp + 64], rax             { state }
+  mov rcx, [rax + 0]
+  mov [rsp + 0], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r8, [rdx]
+  shr r8, cl
+  bts r8, 63
+  mov rcx, [rax + 8]
+  mov [rsp + 8], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r9, [rdx]
+  shr r9, cl
+  bts r9, 63
+  mov rcx, [rax + 16]
+  mov [rsp + 16], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r10, [rdx]
+  shr r10, cl
+  bts r10, 63
+  mov rcx, [rax + 24]
+  mov [rsp + 24], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r11, [rdx]
+  shr r11, cl
+  bts r11, 63
+  mov rcx, [rax + 32]
+  mov [rsp + 32], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r12, [rdx]
+  shr r12, cl
+  bts r12, 63
+  mov rcx, [rax + 40]
+  mov [rsp + 40], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r13, [rdx]
+  shr r13, cl
+  bts r13, 63
+  mov rcx, [rax + 48]
+  mov [rsp + 48], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r14, [rdx]
+  shr r14, cl
+  bts r14, 63
+  mov rcx, [rax + 56]
+  mov [rsp + 56], rcx
+  mov rdx, rcx
+  shr rdx, 3
+  and ecx, 7
+  mov r15, [rdx]
+  shr r15, cl
+  bts r15, 63
+  mov rdi, [rax + 64]             { table }
+  mov rsi, [rax + 72]             { out0 }
+  mov rbp, [rax + 80]             { outEnd }
+@round:
+  mov edx, 5
+@sym:
+  mov eax, r8d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r8, cl
+  mov byte ptr [rsi + 0], ah
+  mov eax, r9d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r9, cl
+  mov byte ptr [rsi + 1], ah
+  mov eax, r10d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r10, cl
+  mov byte ptr [rsi + 2], ah
+  mov eax, r11d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r11, cl
+  mov byte ptr [rsi + 3], ah
+  mov eax, r12d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r12, cl
+  mov byte ptr [rsi + 4], ah
+  mov eax, r13d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r13, cl
+  mov byte ptr [rsi + 5], ah
+  mov eax, r14d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r14, cl
+  mov byte ptr [rsi + 6], ah
+  mov eax, r15d
+  and eax, HUF_TABLESIZE - 1
+  movzx eax, word ptr [rdi + rax * 2]
+  mov ecx, eax
+  shr r15, cl
+  mov byte ptr [rsi + 7], ah
+  add rsi, 8
+  dec edx
+  jnz @sym
+  bsr rcx, r8
+  xor ecx, 63
+  add rcx, [rsp + 0]
+  mov [rsp + 0], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r8, [rax]
+  shr r8, cl
+  bts r8, 63
+  bsr rcx, r9
+  xor ecx, 63
+  add rcx, [rsp + 8]
+  mov [rsp + 8], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r9, [rax]
+  shr r9, cl
+  bts r9, 63
+  bsr rcx, r10
+  xor ecx, 63
+  add rcx, [rsp + 16]
+  mov [rsp + 16], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r10, [rax]
+  shr r10, cl
+  bts r10, 63
+  bsr rcx, r11
+  xor ecx, 63
+  add rcx, [rsp + 24]
+  mov [rsp + 24], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r11, [rax]
+  shr r11, cl
+  bts r11, 63
+  bsr rcx, r12
+  xor ecx, 63
+  add rcx, [rsp + 32]
+  mov [rsp + 32], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r12, [rax]
+  shr r12, cl
+  bts r12, 63
+  bsr rcx, r13
+  xor ecx, 63
+  add rcx, [rsp + 40]
+  mov [rsp + 40], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r13, [rax]
+  shr r13, cl
+  bts r13, 63
+  bsr rcx, r14
+  xor ecx, 63
+  add rcx, [rsp + 48]
+  mov [rsp + 48], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r14, [rax]
+  shr r14, cl
+  bts r14, 63
+  bsr rcx, r15
+  xor ecx, 63
+  add rcx, [rsp + 56]
+  mov [rsp + 56], rcx
+  mov rax, rcx
+  shr rax, 3
+  and ecx, 7
+  mov r15, [rax]
+  shr r15, cl
+  bts r15, 63
+  cmp rsi, rbp
+  jb @round
+  mov rax, [rsp + 64]
+  mov [rax + 72], rsi
+  mov rcx, [rsp + 0]
+  mov [rax + 0], rcx
+  mov rcx, [rsp + 8]
+  mov [rax + 8], rcx
+  mov rcx, [rsp + 16]
+  mov [rax + 16], rcx
+  mov rcx, [rsp + 24]
+  mov [rax + 24], rcx
+  mov rcx, [rsp + 32]
+  mov [rax + 32], rcx
+  mov rcx, [rsp + 40]
+  mov [rax + 40], rcx
+  mov rcx, [rsp + 48]
+  mov [rax + 48], rcx
+  mov rcx, [rsp + 56]
+  mov [rax + 56], rcx
+  add rsp, 72
+{$ifdef WIN64}
+  pop rdi
+  pop rsi
+{$endif}
+  pop r15
+  pop r14
+  pop r13
+  pop rbp
+  pop r12
+  pop rbx
+end;
+
 function CpuHasBmi2: Boolean; assembler; nostackframe;
 asm
   push rbx
@@ -1253,6 +1819,146 @@ begin
     Result := chunkEnd - src
   else
     Result := r[3].p - src - r[3].count div 8;
+end;
+
+{ Mode 3's symbols first, first + 8 .. below n, from a stream at bit pos
+  of src, one at a time; no byte read at or past srcLen. Returns the
+  bit position after them. }
+function DecodeTail8(src: PByte; srcLen: SizeInt; const t: THufTable;
+  pos: SizeInt; dst: PByte; first, n: SizeInt): SizeInt;
+var
+  j, k: SizeInt;
+  w, v: UInt32;
+begin
+  j := first;
+  while j < n do
+  begin
+    { a code starts at bit pos and 7 + HUF_MAXBITS bits fit in 3 bytes }
+    k := pos shr 3;
+    w := 0;
+    if k < srcLen then
+      w := src[k];
+    if k + 1 < srcLen then
+      w := w or (UInt32(src[k + 1]) shl 8);
+    if k + 2 < srcLen then
+      w := w or (UInt32(src[k + 2]) shl 16);
+    v := t[(w shr (pos and 7)) and (HUF_TABLESIZE - 1)];
+    dst[j] := Byte(v shr 8);
+    Inc(pos, v and 255);
+    Inc(j, 8);
+  end;
+  Result := pos;
+end;
+
+function HufDecodeChunk8(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): SizeInt;
+const
+  ROUND_BITS = 5 * HUF_MAXBITS;   { the most a bulk round takes of a stream }
+var
+  t: THufTable;
+  pos, lim: array[0..7] of SizeInt;   { the streams' bits, from src }
+  k, j, total, rounds, used, c: SizeInt;
+  b: UInt64;
+  v: UInt32;
+  o: PByte;
+{$ifdef HUF_ASM_X64}
+  bulk: THufBulk8;
+{$endif}
+begin
+  Result := -1;
+  if srcLen < 1 then
+    Exit;
+  if src[0] = 0 then
+  begin
+    if srcLen - 1 < n then
+      Exit;
+    Move(src[1], dst^, n);
+    Exit(1 + n);
+  end;
+  if (src[0] <> 3) or (n < HUF_MIN_SYMBOLS) or (srcLen < 1 + HUF_HEADER3) then
+    Exit;
+  if not BuildTable(src + 1, t) then
+    Exit;
+  total := 1 + HUF_HEADER3;
+  for k := 0 to 7 do
+  begin
+    pos[k] := total * 8;
+    Inc(total, src[129 + 2 * k] or (SizeInt(src[130 + 2 * k]) shl 8));
+    lim[k] := total * 8;
+  end;
+  if total > srcLen then
+    Exit;
+  { nothing past the chunk's 8 bytes of slack is read: the bit
+    positions stay small (32-bit targets) }
+  if srcLen > total + 8 then
+    srcLen := total + 8;
+  { bulk: rounds of five symbols from each stream, while every stream
+    has five left (stream 7 has the fewest, n div 8) and its refills read
+    inside src[0 .. srcLen): reading past a stream's end into the next
+    one only matters to codes that end past it, which the end check
+    below rejects }
+  rounds := n div 8 div 5;
+  o := dst;
+{$ifdef HUF_ASM_X64}
+  if HufUseAsm then
+  begin
+    for k := 0 to 7 do
+      bulk.pos[k] := UInt64(SizeUInt(src)) * 8 + UInt64(pos[k]);
+    bulk.table := @t[0];
+    bulk.out0 := dst;
+    while rounds > 0 do
+    begin
+      { refills at the start and after each round, each round at most
+        ROUND_BITS further: the last 8-byte read must end by srcLen }
+      used := rounds;
+      for k := 0 to 7 do
+      begin
+        c := ((srcLen - 8) * 8 - pos[k]) div ROUND_BITS;
+        if c < used then
+          used := c;
+      end;
+      if used <= 0 then
+        Break;
+      bulk.outEnd := bulk.out0 + 40 * used;
+      if HufUseBmi2 then
+        HufBulk8Bmi2(@bulk)
+      else
+        HufBulk8X64(@bulk);
+      for k := 0 to 7 do
+        pos[k] := SizeInt(bulk.pos[k] - UInt64(SizeUInt(src)) * 8);
+      Dec(rounds, used);
+    end;
+    o := bulk.out0;
+  end
+  else
+{$endif}
+  while rounds > 0 do
+  begin
+    for k := 0 to 7 do
+      if pos[k] shr 3 + 8 > srcLen then
+        rounds := 0;
+    if rounds = 0 then
+      Break;
+    for k := 0 to 7 do
+    begin
+      b := PUInt64(src + pos[k] shr 3)^ shr (pos[k] and 7);
+      c := 0;
+      for j := 0 to 4 do
+      begin
+        v := t[b and (HUF_TABLESIZE - 1)];
+        o[8 * j + k] := Byte(v shr 8);
+        b := b shr (v and 255);
+        Inc(c, v and 255);
+      end;
+      Inc(pos[k], c);
+    end;
+    Inc(o, 40);
+    Dec(rounds);
+  end;
+  { the rest one at a time; each stream must end inside its bytes }
+  for k := 0 to 7 do
+    if DecodeTail8(src, srcLen, t, pos[k], dst, o - dst + k, n) > lim[k] then
+      Exit;
+  Result := total;
 end;
 
 {$ifdef HUF_ASM_X64}
