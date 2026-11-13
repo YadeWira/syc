@@ -2297,88 +2297,93 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
     return r;
 }
 
-/* OptDp4Pas in sylz.pas, same nodes */
+/* OptDp4Pas in sylz.pas, same nodes. Each match is relaxed in two
+   parts: every length up to subLen (a counted loop over the row: no
+   bounds or table tests), then its full length. */
+static inline void relax4(sylzc_node *nd, int32_t tc, int32_t ml, int32_t dist)
+{
+    if (tc < nd->cost) {
+        nd->cost = tc;
+        nd->ll = 0;
+        nd->ml = ml;
+        nd->dist = dist;
+    }
+}
+
 void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
                    const int32_t *off, const int32_t *cnt, const sylzc_dp4args *a)
 {
     const uint8_t *wsrc = a->wsrc;
-    const int32_t minRep = a->minRep;
+    const int32_t minRep = a->minRep, subLen = a->subLen;
+    /* repDom[row]: in that row a match at the previous distance never
+       costs more than another of the same length, even with the short
+       offset penalty against none (past the table too: one extension
+       byte more at most, against two offset bytes). There, once the
+       previous distance has priced the lengths up to some top, no
+       candidate can do better at those: they are not tried (same parse,
+       2% fewer instructions at level 9). */
+    uint8_t repDom[OPT4_ROWS];
+    for (int32_t row = 0; row < OPT4_ROWS; row++) {
+        const int32_t *rn = a->mtab + row * OPT4_COLS, *rr = rn + OPT4_ROWS * OPT4_COLS;
+        int dom = minRep <= MINMATCH;
+        for (int32_t ml = MINMATCH; ml < OPT4_COLS; ml++)
+            dom &= rr[ml] + a->shortOff <= rn[ml];
+        repDom[row] = (uint8_t)dom;
+    }
     for (int32_t i = 0; i < w; i++) {
         int32_t k = cnt[i];
         if (k < 0)
             continue;
-        int32_t cost = nodes[i].cost;
-        int32_t ll = nodes[i].ll;
-        int32_t r = nodes[i].dist;
+        sylzc_node *nd = nodes + i;
+        int32_t cost = nd->cost;
+        int32_t ll = nd->ll;
+        int32_t r = nd->dist;
         int32_t tc = cost + a->litPrice[wsrc[i]] + lit_step4(ll, a);
-        if (tc < nodes[i + 1].cost) {
-            nodes[i + 1].cost = tc;
-            nodes[i + 1].ll = ll + 1;
-            nodes[i + 1].ml = 0;
-            nodes[i + 1].dist = r;
+        if (tc < nd[1].cost) {
+            nd[1].cost = tc;
+            nd[1].ll = ll + 1;
+            nd[1].ml = 0;
+            nd[1].dist = r;
         }
         int32_t row = ll <= MAX_LL4 ? ll : ll <= LIT_SPLIT4 ? ll - MAX_LL4 : OPT4_ROW_LONG;
         const int32_t *rowN = a->mtab + row * OPT4_COLS;
         const int32_t *rowR = rowN + OPT4_ROWS * OPT4_COLS;
+        int32_t prevLen = MINMATCH - 1;
         /* the previous distance: its first bytes, then the count */
         if (r <= a->before + i
             && (minRep >= 4 ? read32(wsrc + i) == read32(wsrc + i - r)
                             : read16(wsrc + i) == read16(wsrc + i - r))) {
             int32_t rl = (int32_t)count_match_inl(wsrc + i, wsrc + i - r, wsrc + w);
-            if (rl >= minRep) {
-                int32_t base = cost + (r < 16 ? a->shortOff : 0);
-                int32_t ml = minRep - 1;
-                while (ml < rl) {
-                    if (ml < a->subLen)
-                        ml++;
-                    else
-                        ml = rl;
-                    int32_t j = i + ml;
-                    if (ml < OPT4_COLS)
-                        tc = base + rowR[ml];
-                    else
-                        tc = base + match_cost4(row, ml, 1, a);
-                    if (tc < nodes[j].cost) {
-                        nodes[j].cost = tc;
-                        nodes[j].ll = 0;
-                        nodes[j].ml = ml;
-                        nodes[j].dist = r;
-                    }
-                }
-            }
+            int32_t base = cost + (r < 16 ? a->shortOff : 0);
+            int32_t top = rl < subLen ? rl : subLen;
+            for (int32_t ml = minRep; ml <= top; ml++)
+                relax4(nd + ml, base + rowR[ml], ml, r);
+            if (rl > top && rl >= minRep)
+                relax4(nd + rl, base + (rl < OPT4_COLS ? rowR[rl] : match_cost4(row, rl, 1, a)), rl, r);
+            if (repDom[row] && top > prevLen)
+                prevLen = top;
         }
         if (k == 0)
             continue;
         const int32_t *cp = cands + 2 * off[i];
-        int32_t prevLen = MINMATCH - 1;
+        const int32_t room = w - i;
         for (int32_t c = 0; c < k; c++) {
             int32_t len = cp[2 * c], dist = cp[2 * c + 1];
             if (dist == r) {
-                prevLen = len;   /* priced above, at least as long */
+                if (len > prevLen)
+                    prevLen = len;   /* priced above, at least as long */
                 continue;
             }
             int32_t base = cost + (dist < 16 ? a->shortOff : 0);
-            int32_t ml = prevLen;
-            while (ml < len) {
-                if (ml < a->subLen)
-                    ml++;
-                else
-                    ml = len;
-                int32_t j = i + ml;
-                if (j > w)
-                    break;
-                if (ml < OPT4_COLS)
-                    tc = base + rowN[ml];
-                else
-                    tc = base + match_cost4(row, ml, 0, a);
-                if (tc < nodes[j].cost) {
-                    nodes[j].cost = tc;
-                    nodes[j].ll = 0;
-                    nodes[j].ml = ml;
-                    nodes[j].dist = dist;
-                }
-            }
-            prevLen = len;
+            int32_t top = len < subLen ? len : subLen;
+            if (top > room)
+                top = room;
+            for (int32_t ml = prevLen + 1; ml <= top; ml++)
+                relax4(nd + ml, base + rowN[ml], ml, dist);
+            if (len > subLen && len > prevLen && len <= room)
+                relax4(nd + len, base + (len < OPT4_COLS ? rowN[len] : match_cost4(row, len, 0, a)), len, dist);
+            if (len > prevLen)
+                prevLen = len;
         }
     }
 }

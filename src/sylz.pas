@@ -3891,7 +3891,9 @@ type
     pSeq, pEsc, pShort: Single; { decode-time penalties, in bytes: per
                                   sequence, per escape token, per offset < 16 }
     subLen: Integer;            { every match length up to this is tried; past
-                                  it, only each candidate's full length }
+                                  it, only each candidate's full length (format
+                                  v4: under OPT4_COLS, sylzc_opt_dp4 prices
+                                  them from the table without a test) }
     skipLen: Integer;           { after a match this long, the positions it
                                   covers start no transitions of their own }
     minRep: Integer;            { format v4: the shortest match tried at the
