@@ -25,7 +25,7 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.6.x, pre-release.** Every release stays a pre-release until
+**Status: v0.7.x, pre-release.** Every release stays a pre-release until
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
