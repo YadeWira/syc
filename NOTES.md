@@ -267,6 +267,34 @@ files and on pieces of them (4 KiB, 64 KiB, 1 MiB; 8 of each file):
   or 1.0 byte at level 9 (no faster decoding, +0.05 points); repeats
   from 3 or 4 bytes (same); more literal stepping at level 4 (mixed
   decodes 2% faster, +1 point).
+- **Levels 0-1 compression (2026-11-13).** The second pass is gone
+  there: a chunk's first 8192 sequences (FAST_PREFIX4) are recorded and
+  its table made from them, the rest go into the open chunk as tokens as
+  they are found. The search goes on at a match's end (the previous
+  offset tried one byte past every match: 0.3 points). Assembler: the
+  table holds the low halves of addresses, one byte a probe for the
+  first 64 with the hash shift a constant, the match's first bytes
+  compared at the hit.
+  C: one loop per level, the dense probes in a loop of their own, the
+  distance without a branch. CountPairs4 by tables (9 cycles a record,
+  not 25). CPU 17, interleaved, cycles per compression (perf stat, the
+  minimum of 3), v2 / v4 before / v4 now:
+  silesia.tar assembler level 0 1441 / 1689 / 1287 M, level 1 1505 /
+  1776 / 1377 M; C level 0 1589 / 1825 / 1559 M, level 1 1671 / 1910 /
+  1667 M. mixed.tar assembler level 0 702 / 820 / 596 M, level 1 733 /
+  855 / 639 M; C 825 / 932 / 793 M, 881 / 994 / 857 M. Wall clock,
+  silesia.tar assembler: level 0 470 / 403 / 542 MB/s, level 1 445 /
+  378 / 505. Ratio 44.93 -> 44.75% (level 0), 43.12 -> 42.89% (level
+  1); v2 46.51 / 44.55. Decoding these blocks, cycles per MB, v2 / v4:
+  silesia.tar assembler level 0 1.00-1.07 / 0.94, level 1 1.04-1.07 /
+  0.93-0.98; C 1.17-1.19 / 1.01-1.02, 1.11-1.15 / 1.00-1.03; mixed.tar
+  assembler 0.97 / 0.93, 0.94 / 0.93-0.94.
+  Tried and dropped: a prefix of 2048 / 4096 / 16384 sequences
+  (silesia.tar level 1 +0.29 / +0.16 / -0.05% size; 4096 2% fewer
+  cycles), chunks of 262144 or 524288 token bytes (+0.05 / +0.18% on
+  silesia.tar level 1, samba +0.3%; 262144 1-2% fewer cycles). The move
+  of the offsets and literals behind the tokens at the end (EmitFinish)
+  is 3.5% of level 1; only another stream order would save it.
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
