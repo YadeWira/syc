@@ -1908,14 +1908,20 @@ const
   caller fills it with src's): the distances are the same, and a probe
   needs neither the position nor a check against the start of the input
   (a candidate is an earlier address, or src itself).
-  The first 64 probes after a match step one byte (@dense: 17
+  The first 64 probes after a match step one byte (@dense: 15
   instructions each); the ones after them (@probe) step further and
-  further.
+  further. @dense and the hashing before it come once per level, with the
+  shift a constant: a shift by cl is three operations, and the time goes
+  in waiting for the table's entry and the candidate's bytes behind a
+  branch nothing predicts, so what shortens that wait pays: the constant
+  shift 3% of the whole, the match's first 8 bytes compared through the
+  probe's own address (@hit, @repHit) 1%.
   Registers: r8 ip, r9 anchor, r10 offset write pointer, r11 table, r13
   minus the previous distance, r14 record or token write pointer, r15
   literal write pointer, rdi hash of the next probe, cl the hash shift;
   rbx the dense probes' end, or the next probe (fwd) with rbp the probe
-  count; rax candidate, r12 match end; the rest scratch. }
+  count; rax candidate; r12 the hash multiplier while probing, the match's
+  end from a hit on; the rest scratch. }
 procedure CompressFast4X64(st: PFast4EncState); assembler; nostackframe;
 asm
   push rbx
@@ -1931,12 +1937,17 @@ asm
 {$else}
   mov rax, rdi
 {$endif}
-  push rax                        { [rsp+72]: state }
   mov rdx, [rax + 8]
-  sub rdx, 8
+  sub rdx, 16
+  push rdx                        { [rsp+88]: iend - 16 }
+  push qword ptr [rax]            { [rsp+80]: src }
+  push rax                        { [rsp+72]: state }
+  add rdx, 8
   push rdx                        { [rsp+64]: iend - 8 }
-  push qword ptr [rax]            { [rsp+56]: src }
-  push qword ptr [rax + 112]      { [rsp+48]: the chunk's codes }
+  mov rdx, [rax + 112]
+  push rdx                        { [rsp+56]: the chunk's codes: a new offset's, }
+  add rdx, CODES4_KIND
+  push rdx                        { [rsp+48]: the previous offset's }
   push qword ptr [rax + 104]      { [rsp+40]: tokens (1) or records (0) }
   push qword ptr [rax + 8]        { [rsp+32]: iend }
   mov rcx, FAST_MULT16
@@ -1958,36 +1969,23 @@ asm
   mov rax, [rax + 88]             { back after a turn: the match it stopped at }
   jmp @emit
 @fresh:
+  mov r12, [rsp + 24]
   mov rbp, [r8]
   mov rdi, rbp
-  imul rdi, [rsp + 24]
-  shr rdi, cl                     { hash(ip) }
-
-  cmp cl, 64 - FAST_LOG1
-  jne @search0
-
-@search:
-  { rdi = hash(ip), rbp = the bytes at ip }
-  mov r12, [rsp + 24]
-  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]   { one byte at a time up to here }
-  cmp rbx, [rsp]
-  ja @searchEnd
-@dense:
-  movzx eax, word ptr [r11 + rdi * 2]   { low 16 bits of the candidate's address }
-  mov [r11 + rdi * 2], r8w
-  mov rdx, [r8 + 1]
-  mov rdi, rdx
   imul rdi, r12
-  shr rdi, 64 - FAST_LOG1         { hash(ip + 1) }
-  cmp edx, [r8 + r13 + 1]         { the previous distance, one byte on }
-  je @repHit
-  sub ax, r8w                     { 65536 - distance (0: 65536) }
-  cmp ebp, [r8 + rax - 65536]
-  je @hit
-  mov rbp, rdx
-  add r8, 1
+  shr rdi, cl                     { hash(ip) }
+  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]
+  cmp rbx, [rsp]
+  jbe @searchGo
+@searchEnd:
+  mov rbx, [rsp]                  { the last probes of the input }
   cmp r8, rbx
-  jb @dense
+  jae @last
+@searchGo:
+  cmp cl, 64 - FAST_LOG1
+  je @dense
+  jmp @dense0
+
 @denseEnd:
   cmp r8, [rsp]
   jae @last
@@ -2012,55 +2010,49 @@ asm
   cmp edx, [r8]
   jne @probe
 @hit:
+  { the match's end -> r12, its first 8 bytes read through the candidate
+    as the probe left it (a probe is at least 12 bytes from the end) }
+  mov rdx, [r8 + rax - 65536 + SYLZ_MINMATCH]
+  mov rsi, [r8 + SYLZ_MINMATCH]
+  lea r12, [r8 + SYLZ_MINMATCH]
   add rax, r8
   sub rax, 65536                  { ref = ip - distance }
-
-@back:
-  { extend the match backwards over the pending literals }
-  cmp r8, r9
-  jbe @emit
-  cmp rax, [rsp + 56]
-  jbe @emit
-  movzx edx, byte ptr [r8 - 1]
-  cmp dl, [rax - 1]
-  jne @emit
-  sub r8, 1
-  sub rax, 1
-  jmp @back
-
-@emit:
-  cmp r14, [rsp + 16]
-  jae @full                       { no room: the caller turns the chunk, then back here }
-  { match end -> r12 }
-  lea r12, [r8 + SYLZ_MINMATCH]
-  lea rdx, [rax + SYLZ_MINMATCH]
-@cm8:
-  cmp r12, [rsp + 64]
-  ja @cmTail
-  mov rsi, [r12]
-  xor rsi, [rdx]
-  jz @cmMore
+  xor rsi, rdx
+  jz @cmFar
   bsf rsi, rsi
   shr esi, 3
   add r12, rsi
 @cmDone:
+  cmp r14, [rsp + 16]
+  jae @full                       { no room: the caller turns the chunk, then back here }
+
+@back:
+  { extend the match backwards over the pending literals }
+  cmp r8, r9
+  jbe @backDone
+  cmp rax, [rsp + 80]
+  jbe @backDone
+  movzx edx, byte ptr [r8 - 1]
+  cmp dl, [rax - 1]
+  jne @backDone
+  sub r8, 1
+  sub rax, 1
+  jmp @back
+@backDone:
   mov rbx, r8
   sub rbx, r9                     { rbx = literals }
   mov rsi, rax
   sub rsi, r8                     { rsi = minus the distance }
+  sub r8, r12
+  neg r8                          { r8 = match length (ip comes back from r12) }
   cmp qword ptr [rsp + 40], 0
   je @record
-  { the tokens, as EmitDirect4 writes them. r8 = match length (ip comes
-    back from r12), rdx = 1 at a new distance, rdi = the exact codes of
-    the match's kind }
-  sub r8, r12
-  neg r8
+  { the tokens, as EmitDirect4 writes them. rdx = 1 at a new distance, rdi
+    = the exact codes of the match's kind }
   xor edx, edx
-  mov rdi, [rsp + 48]
-  lea rax, [rdi + CODES4_KIND]
   cmp rsi, r13
   setne dl
-  cmove rdi, rax
+  mov rdi, [rsp + 48 + rdx * 8]
   mov r13, rsi                    { the previous distance from here on }
   not rsi
   mov [r10], si                   { distance - 1: written either way, kept at a new distance }
@@ -2078,67 +2070,75 @@ asm
   add r14, 1
 
 @lits:
-  { literals to the scratch stream: 16 bytes at once (it has room for
-    them) when the read stays inside the input, the rest of a longer run
-    after them; at the end of the input, byte by byte }
-  lea rdx, [r9 + rbx + 16]
-  cmp rdx, [rsp + 32]
+  { up to 16 literals to the scratch stream: 16 bytes at once (it has
+    room for them) when the read stays inside the input }
+  cmp r9, [rsp + 88]
   ja @litBytes
   movdqu xmm0, [r9]
   movdqu [r15], xmm0
-  cmp rbx, 16
-  ja @litMore
 @litDone:
   add r15, rbx
   mov r8, r12                     { ip = match end }
   mov r9, r12                     { anchor = ip }
-  cmp r8, [rsp]
-  ja @last
+  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]   { one byte at a time up to here }
+  cmp rbx, [rsp]
+  ja @nearEnd
+  mov r12, [rsp + 24]
   cmp cl, 64 - FAST_LOG1
   jne @next0
   { table[hash(ip - 2)] = ip - 2 }
   mov rdx, [r8 - 2]
-  imul rdx, [rsp + 24]
+  imul rdx, r12
   shr rdx, 64 - FAST_LOG1
   lea eax, [r8 - 2]
   mov [r11 + rdx * 2], ax
   { the search goes on at the match's end }
   mov rbp, [r8]
   mov rdi, rbp
-  imul rdi, [rsp + 24]
+  imul rdi, r12
   shr rdi, 64 - FAST_LOG1
-  jmp @search
+@dense:
+  { rdi = hash(ip), rbp = the bytes at ip }
+  movzx eax, word ptr [r11 + rdi * 2]   { low 16 bits of the candidate's address }
+  mov [r11 + rdi * 2], r8w
+  mov rdx, [r8 + 1]
+  mov rdi, rdx
+  imul rdi, r12
+  shr rdi, 64 - FAST_LOG1         { hash(ip + 1) }
+  cmp edx, [r8 + r13 + 1]         { the previous distance, one byte on }
+  je @repHit
+  sub ax, r8w                     { 65536 - distance (0: 65536) }
+  cmp ebp, [r8 + rax - 65536]
+  je @hit
+  mov rbp, rdx
+  add r8, 1
+  cmp r8, rbx
+  jb @dense
+  jmp @denseEnd
 
 @repHit:
   add r8, 1
+  lea r12, [r8 + SYLZ_MINMATCH]
+  mov rsi, [r8 + SYLZ_MINMATCH]
+  xor rsi, [r8 + r13 + SYLZ_MINMATCH]
   lea rax, [r8 + r13]             { ref = ip - previous distance }
-  jmp @back
+  jz @cmFar
+  bsf rsi, rsi
+  shr esi, 3
+  add r12, rsi
+  jmp @cmDone
 
-@searchEnd:
-  mov rbx, [rsp]                  { the last probes of the input }
-  cmp r8, rbx
-  jae @denseEnd
-  cmp cl, 64 - FAST_LOG1
-  je @dense
-  jmp @dense0
-
-  { the same for level 0's table: a shift by a constant is one operation,
-    by cl three }
+  { the same for level 0's table }
 @next0:
   mov rdx, [r8 - 2]
-  imul rdx, [rsp + 24]
+  imul rdx, r12
   shr rdx, 64 - FAST_LOG0
   lea eax, [r8 - 2]
   mov [r11 + rdx * 2], ax
   mov rbp, [r8]
   mov rdi, rbp
-  imul rdi, [rsp + 24]
+  imul rdi, r12
   shr rdi, 64 - FAST_LOG0
-@search0:
-  mov r12, [rsp + 24]
-  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]
-  cmp rbx, [rsp]
-  ja @searchEnd
 @dense0:
   movzx eax, word ptr [r11 + rdi * 2]
   mov [r11 + rdi * 2], r8w
@@ -2157,6 +2157,40 @@ asm
   jb @dense0
   jmp @denseEnd
 
+@nearEnd:
+  { a match that ends within 64 bytes of the last probe, or past it }
+  cmp r8, [rsp]
+  ja @last
+  mov r12, [rsp + 24]
+  mov rdx, [r8 - 2]
+  imul rdx, r12
+  shr rdx, cl
+  lea eax, [r8 - 2]
+  mov [r11 + rdx * 2], ax
+  mov rbp, [r8]
+  mov rdi, rbp
+  imul rdi, r12
+  shr rdi, cl
+  jmp @searchEnd
+
+@emit:
+  { a match at r8, from rax (after a turn): its end -> r12 }
+  lea r12, [r8 + SYLZ_MINMATCH]
+  lea rdx, [rax + SYLZ_MINMATCH]
+  jmp @cm8
+@cmFar:
+  add r12, 8
+  lea rdx, [rax + SYLZ_MINMATCH + 8]
+@cm8:
+  cmp r12, [rsp + 64]
+  ja @cmTail
+  mov rsi, [r12]
+  xor rsi, [rdx]
+  jz @cmMore
+  bsf rsi, rsi
+  shr esi, 3
+  add r12, rsi
+  jmp @cmDone
 @cmMore:
   add r12, 8
   add rdx, 8
@@ -2171,10 +2205,17 @@ asm
   add rdx, 1
   jmp @cmTail
 
-@litMore:
-  lea rsi, [r9 + 16]
-  lea rdi, [r15 + 16]
-  lea rdx, [rbx - 16]
+@litsAny:
+  { a run of any length: the rest of a long one in 16-byte steps, when
+    their reads stay inside the input; at its end, byte by byte }
+  cmp rbx, 16
+  jbe @lits
+  lea rdx, [r9 + rbx + 16]
+  cmp rdx, [rsp + 32]
+  ja @litBytes
+  mov rsi, r9
+  mov rdi, r15
+  mov rdx, rbx
 @lit16:
   movdqu xmm0, [rsi]
   movdqu [rdi], xmm0
@@ -2198,30 +2239,28 @@ asm
 @record:
   { the record, as EmitSequence4 writes it: literals, match length,
     distance - 1 }
-  mov rbp, r12
-  sub rbp, r8
   mov r13, rsi
   not rsi
   mov [r14 + 4], si
   cmp rbx, REC4_ESC
   jae @recLong
-  cmp rbp, $FFFF
+  cmp r8, $FFFF
   ja @recLong
   mov [r14], bx
-  mov [r14 + 2], bp
+  mov [r14 + 2], r8w
   add r14, 6
-  jmp @lits
+  jmp @litsAny
 @recLong:
   mov word ptr [r14], REC4_ESC    { the lengths as two u32 after it }
   mov word ptr [r14 + 2], 0
   mov [r14 + 6], ebx
-  mov [r14 + 10], ebp
+  mov [r14 + 10], r8d
   add r14, 18
-  jmp @lits
+  jmp @litsAny
 
 @dNoCode:
   { a literal-only token, then the match's }
-  mov rdx, [rsp + 48]
+  mov rdx, [rsp + 56]
   imul eax, ebx, CODES4_ROW
   movzx eax, byte ptr [rdx + rax + CODES4_KIND]
   mov [r14], al
@@ -2237,7 +2276,7 @@ asm
   mov esi, edx
   xor esi, 1
   mov rbp, rbx
-  mov rax, [rsp + 48]
+  mov rax, [rsp + 56]
   cmp r8, MAX_ML4
   ja @dRun
   imul edx, esi, CODES4_ROW
@@ -2265,7 +2304,7 @@ asm
 @dRunMatchEnd:
   mov [r14], bpl
   add r14, 1
-  jmp @lits
+  jmp @litsAny
 @dRun:
   cmp rbx, LIT_SPLIT4
   jbe @dRunSplit
@@ -2321,11 +2360,11 @@ asm
   mov [r14], sil
   add r14, 1
   test rdx, rdx
-  jz @lits
+  jz @litsAny
   movzx esi, byte ptr [rax + rdx + CODES4_KIND]
   mov [r14], sil
   add r14, 1
-  jmp @lits
+  jmp @litsAny
 @dMatchExt:
   { what is left of the literals, then the match with its extension }
   test rbp, rbp
@@ -2349,7 +2388,7 @@ asm
 @dMatchEnd:
   mov [r14], dl
   add r14, 1
-  jmp @lits
+  jmp @litsAny
 
 @full:
   mov rdx, [rsp + 72]
@@ -2363,6 +2402,7 @@ asm
 @out:
   add rsp, 72
   pop rax                         { state }
+  add rsp, 16
   neg r13
   mov [rax + 80], r13
   mov [rax + 120], r10
