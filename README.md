@@ -158,10 +158,14 @@ each corpus, one core (CPU 17 of the Xeon E5-2697A v4, shared machine),
 user-space cycles per input byte from `perf stat` (the difference
 between 3 and 1 compressions, 2 and 1 at levels 7-10; 11 and 1 decodes;
 the least of 2 interleaved rounds, 1 at levels 9-10), 2026-11-13:
+**fewer cycles is faster**; on this CPU (2.6 GHz) MB/s is about 2600
+divided by the cycles per byte (6.37 cycles/byte: ~410 MB/s; 0.768:
+~3390 MB/s). Cycles, not seconds, because the machine is shared: its
+MB/s move by ±10% with the load, its cycle counts hardly.
 
 **silesia.tar, v4 against v2**
 
-| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+| level | ratio v2 | ratio v4 | compress v2, cycles/byte | compress v4, cycles/byte | change | decompress v2, cycles/byte | decompress v4, cycles/byte | change |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 46.51% | **44.67%** | 6.37 | 5.83 | -8.5% | 1.030 | 0.768 | -25.5% |
 | 1 | 44.55% | **42.82%** | 6.86 | 6.29 | -8.4% | 1.036 | 0.776 | -25.1% |
@@ -177,7 +181,7 @@ the least of 2 interleaved rounds, 1 at levels 9-10), 2026-11-13:
 
 **silesia.tar, v5 against v3**
 
-| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+| level | ratio v3 | ratio v5 | compress v3, cycles/byte | compress v5, cycles/byte | change | decompress v3, cycles/byte | decompress v5, cycles/byte | change |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 38.80% | **37.22%** | 13.13 | 12.30 | -6.4% | 1.455 | 1.162 | -20.1% |
 | 1 | 37.99% | **36.52%** | 18.38 | 16.35 | -11.0% | 1.422 | 1.171 | -17.7% |
@@ -193,7 +197,7 @@ the least of 2 interleaved rounds, 1 at levels 9-10), 2026-11-13:
 
 **mixed.tar, v4 against v2**
 
-| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+| level | ratio v2 | ratio v4 | compress v2, cycles/byte | compress v4, cycles/byte | change | decompress v2, cycles/byte | decompress v4, cycles/byte | change |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 66.31% | **64.83%** | 4.70 | 4.24 | -9.8% | 0.990 | 0.856 | -13.5% |
 | 1 | 65.59% | **64.23%** | 5.00 | 4.55 | -9.0% | 0.965 | 0.838 | -13.1% |
@@ -209,7 +213,7 @@ the least of 2 interleaved rounds, 1 at levels 9-10), 2026-11-13:
 
 **mixed.tar, v5 against v3**
 
-| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+| level | ratio v3 | ratio v5 | compress v3, cycles/byte | compress v5, cycles/byte | change | decompress v3, cycles/byte | decompress v5, cycles/byte | change |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 59.78% | **58.48%** | 14.26 | 13.25 | -7.1% | 1.932 | 1.506 | -22.1% |
 | 1 | 59.46% | **58.27%** | 19.29 | 16.51 | -14.4% | 1.888 | 1.497 | -20.7% |
