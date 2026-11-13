@@ -1039,27 +1039,64 @@ done:
     st->e = e;
 }
 
-/* CompressFastCore4 in sylz.pas, same output byte for byte. */
-void sylzc_compress_fast4(sylzc_fast *st)
+/* HashFast with the shift by 16 folded into the multiplier (the same
+   product modulo 2^64) */
+#define FAST_MULT16 (889523592379ull << 16)
+/* FAST_LOG0, FAST_LOG1 in sylz.pas */
+#define FAST_LOG0 13
+#define FAST_LOG1 15
+
+/* CompressFastCore4 in sylz.pas, same output byte for byte. Inlined once
+   per level, with the hash shift a constant (a shift by a variable takes
+   three operations on x86 without BMI2), and with the probes that step
+   one byte (the first 64 after a match, the only ones that try the
+   previous offset) in a loop of their own. The distance is fast_dist's
+   without its branch (a remainder of 0 is 65536 as the mask wraps), and
+   no candidate is checked against the start of the input: an entry is an
+   earlier position, or 0 (src) in the table cleared for this input, so
+   below position 65536 the distance to it is exact and never reaches
+   past src. */
+static inline __attribute__((always_inline)) void compress_fast4(sylzc_fast *st,
+    int hashLog)
 {
     const uint8_t *src = st->src;
     intptr_t n = st->n;
     uint16_t *table = st->table;
-    int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
     uint16_t *rec = e.rec;
     uint8_t *wlit = e.lit, *tok = e.ctrl, *off = e.off;
     intptr_t anchor = 0, ip, fwd, ref = 0, d, len, probes, mflimit, rep = 1;
     uint32_t h, fwdH;
+    int i;
 
     if (n < 12 + 1)
         goto done;
     mflimit = n - 12;
     ip = 1;
-    fwdH = hash_fast(src + ip, hashLog);
+    fwdH = (uint32_t)((read64(src + ip) * FAST_MULT16) >> (64 - hashLog));
     for (;;) {
         fwd = ip;
-        probes = 1 << SKIP_STRENGTH;
+        /* step one byte: the previous offset, one byte on, then the
+           table's candidate */
+        for (i = 0; i < (1 << SKIP_STRENGTH); i++) {
+            h = fwdH;
+            ip = fwd++;
+            if (fwd > mflimit)
+                goto done;
+            d = ((ip - table[h] - 1) & 0xFFFF) + 1;
+            fwdH = (uint32_t)((read64(src + fwd) * FAST_MULT16) >> (64 - hashLog));
+            table[h] = (uint16_t)ip;
+            if (read32(src + fwd - rep) == read32(src + fwd)) {
+                ip = fwd;
+                ref = ip - rep;
+                goto found;
+            }
+            ref = ip - d;
+            if (read32(src + ref) == read32(src + ip))
+                goto found;
+        }
+        /* then further and further */
+        probes = 2 << SKIP_STRENGTH;
         for (;;) {
             h = fwdH;
             ip = fwd;
@@ -1067,21 +1104,14 @@ void sylzc_compress_fast4(sylzc_fast *st)
             probes++;
             if (fwd > mflimit)
                 goto done;
-            d = fast_dist(ip, table[h]);
-            fwdH = hash_fast(src + fwd, hashLog);
+            d = ((ip - table[h] - 1) & 0xFFFF) + 1;
+            fwdH = (uint32_t)((read64(src + fwd) * FAST_MULT16) >> (64 - hashLog));
             table[h] = (uint16_t)ip;
-            /* the previous offset, one byte on, while the probes step
-               one byte */
-            if (probes <= (2 << SKIP_STRENGTH)
-                && read32(src + ip + 1 - rep) == read32(src + ip + 1)) {
-                ip++;
-                ref = ip - rep;
-                break;
-            }
             ref = ip - d;
-            if (d <= ip && read32(src + ref) == read32(src + ip))
+            if (read32(src + ref) == read32(src + ip))
                 break;
         }
+    found:
         while (ip > anchor && ref > 0 && src[ip - 1] == src[ref - 1]) {
             ip--;
             ref--;
@@ -1095,8 +1125,8 @@ void sylzc_compress_fast4(sylzc_fast *st)
         if (ip > mflimit)
             goto done;
         /* the search goes on at the match's end */
-        table[hash_fast(src + ip - 2, hashLog)] = (uint16_t)(ip - 2);
-        fwdH = hash_fast(src + ip, hashLog);
+        table[(uint32_t)((read64(src + ip - 2) * FAST_MULT16) >> (64 - hashLog))] = (uint16_t)(ip - 2);
+        fwdH = (uint32_t)((read64(src + ip) * FAST_MULT16) >> (64 - hashLog));
     }
 done:
     e.rec = rec;
@@ -1106,6 +1136,16 @@ done:
     e.rep = rep;
     st->anchor = anchor;
     st->e = e;
+}
+
+void sylzc_compress_fast4(sylzc_fast *st)
+{
+    if (st->hashLog == FAST_LOG0)
+        compress_fast4(st, FAST_LOG0);
+    else if (st->hashLog == FAST_LOG1)
+        compress_fast4(st, FAST_LOG1);
+    else
+        compress_fast4(st, (int)st->hashLog);
 }
 
 /* ── levels 2-3 ───────────────────────────────────────────────────────── */
