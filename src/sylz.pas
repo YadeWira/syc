@@ -78,7 +78,15 @@
   the entries it lists, for that chunk and the ones after it. A block
   that a v4 or v5 encoder writes may also be a v2 or v3 block, where
   that layout is smaller (a small block with few matches at the previous
-  offset): decoders take each block by its header.
+  offset): decoders take each block by its header. A block with no
+  tokens is its header and the literals: syc writes one where the block
+  would come out bigger than its input.
+
+  syc's encoder (not the format): levels 0-3 record a chunk's first
+  FAST_PREFIX4 sequences, make the update from them, and write the rest
+  of the chunk's tokens as the sequences are found (an open chunk, up to
+  CHUNK4_TOKENS token bytes); levels 4-10 record CHUNK4_SEQS sequences
+  and make each chunk's update from all of them.
 
   A match at the previous sequence's offset costs a token and no offset
   bytes: in structured data a fifth to a half of the matches are such.
@@ -208,7 +216,7 @@ const
     and compress worse: silesia.tar 40.11% / 1655 MB/s, 39.21% / 1795,
     against 38.80% / 2209); 9 and 10 run the optimal parser with each
     literal priced by its Huffman code (CompressOptEC). Format v5 (with
-    SYLZ_V4) parses its levels 0..8 one level lower (V5_LEVELS). }
+    SYLZ_V4) takes V5_LEVELS, the same parses with v4's parsers. }
   SYLZ_EC_SHIFT = 2;
   SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL;   { 9 and 10: entropy-aware prices }
   SYLZ_V4 = 2;        { format v4; with SYLZ_ENTROPY, v5 }
@@ -348,7 +356,7 @@ const
   HC_REP_GAIN  = 2;
   { format v4, levels 4..8: a literal run is searched every
     1 + run shr HC_ACCEL4 bytes (see CompressHCCore) }
-  HC_ACCEL4 = 6;
+  HC_ACCEL4 = 7;
   { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }
   MID_MAXLOG   = 16;
@@ -3633,9 +3641,11 @@ type
 { CompressMidCore for format v4 in x86_64 assembler, the same output byte
   for byte (tests check it); only used when dst holds SylzBound(n).
   Against CompressMidX64: the previous distance tried one byte on at each
-  position; tokens from SYLZ_TOKENS4 and offsets written apart
-  (EmitDirect4); and a shorter probe, 24 instructions where that one
-  takes 36:
+  position (with CompressMidCore's longer match one byte before a short
+  repeat); each sequence recorded (EmitSequence4) or, in an open chunk,
+  its tokens and offset written apart with the chunk's table
+  (EmitDirect4; PutTokens4 called for what is not one token or a pair);
+  and a shorter probe, 24 instructions where that one takes 36:
   - the tables hold the low 16 bits of ip, not of the position, so the
     caller fills them with those of src (what a position of 0 is) and no
     position is kept; the 16-bit difference with ip is 65536 - distance,
@@ -4762,7 +4772,9 @@ begin
             a fraction of the time (mixed corpus, level 4: -40% cycles
             for +0.2 points; silesia.tar -5% for +0.03), and a match
             found after a step is extended back over what was stepped
-            over. }
+            over. HC_ACCEL4 = 7, not 6: with 6, x-ray came out 130-190
+            bytes bigger than v2's at levels 6-8 (mixed corpus 6-12% more
+            cycles with 7, still 40-45% under v2's). }
           run := pos - anchor;
           if (e.rep <= pos) and (Read32(src + pos + 1 - e.rep) = Read32(src + pos + 1)) then
           begin
@@ -6186,20 +6198,18 @@ type
 
 const
   { Format v5's levels 0..8: the parse (format v4's level) and, at the
-    hash chain levels, the chain attempts; one level below v3's (v2's
-    level + SYLZ_EC_SHIFT). v4's parse at a level is smaller than v2's at
-    the next one, and with eight Huffman streams the literals decode fast
-    enough to take the fast parse at -ec 0 (v4's level 1: silesia.tar 1.36
-    M cycles per MB decoded, v3's -ec 0 1.50). -ec 3 takes 3 attempts,
-    where level 4 has 2: with 2 silesia.tar came out 0.05% bigger than
-    v3's -ec 3, with 3 1.5% smaller and still 5% fewer cycles. Against v3
-    at each of -ec 0..8 (2026-11-13, silesia.tar and mixed.tar): 0.2-3.0%
-    smaller, 3-65% fewer cycles to compress. As level + 2, like v3, v5
-    took 5-17% more than v3 at most of them. }
+    hash chain levels, the chain attempts (0: HC_ATTEMPTS). Since the
+    branches were integrated (2026-11-13) these are v3's (v2's level +
+    SYLZ_EC_SHIFT): one level lower, as the v4-v5-entropy branch had it
+    on master's parsers, left whole Silesia files up to 6% bigger than
+    v3's at -ec 0..7 (text at the hash chain levels, binary data at the
+    fast parse of -ec 0), and v4's faster parsers keep v5 ahead of v3 at
+    v3's levels: silesia.tar -3.5 to -12% cycles to compress at -ec 0..6,
+    the mixed corpus -16 to -43%. }
   V5_LEVELS: array[0..8] of TV5Level = (
-    (parse: 1; attempts: 0), (parse: 2; attempts: 0), (parse: 3; attempts: 0),
-    (parse: 4; attempts: 3), (parse: 5; attempts: 4), (parse: 6; attempts: 8),
-    (parse: 7; attempts: 16), (parse: 8; attempts: 64), (parse: 9; attempts: 0));
+    (parse: 2; attempts: 0), (parse: 3; attempts: 0), (parse: 4; attempts: 0),
+    (parse: 5; attempts: 0), (parse: 6; attempts: 0), (parse: 7; attempts: 0),
+    (parse: 8; attempts: 0), (parse: 9; attempts: 0), (parse: 10; attempts: 0));
 
   { Format v5's -ec 9: the first parse of CompressOptEC only counts the
     literals, and a shallow tree counts nearly the same ones: silesia.tar

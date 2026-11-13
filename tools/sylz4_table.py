@@ -5,12 +5,13 @@ Usage: sylz4_table.py [--table FILE] BLOCK...
 
 Each BLOCK is one v4 block without entropy-coded literals (sylzbench -v4
 with SYLZ_DUMP=prefix; a block the encoder left in format v2's layout is
-skipped). They are read with the table in src/sylz.pas (or --table FILE,
-the same Pascal constants) and their updates of it, their split
-sequences joined back, and each sequence asked what PutTokens4 looks up
-for it first (PairOf4, before it tries other splits); the table is the
-fixed codes plus the cells asked for most often, each block weighing the
-same. Prints the table as it goes in src/sylz.pas.
+skipped, and a block with no tokens adds nothing). They are read with
+the table in src/sylz.pas (or --table FILE, the same Pascal constants)
+and their updates of it, their split sequences joined back, and each
+sequence asked what PutTokens4 looks up for it first (PairOf4, before it
+tries other splits); the table is the fixed codes plus the cells asked
+for most often, each block weighing the same. Prints the table as it
+goes in src/sylz.pas.
 """
 import re
 import struct
