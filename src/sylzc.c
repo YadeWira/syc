@@ -1086,24 +1086,16 @@ void sylzc_compress_fast4(sylzc_fast *st)
             ip--;
             ref--;
         }
-        for (;;) {
-            len = MINMATCH + count_match_inl(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
-            emit_open4(&e, &rec, &tok, &off, &wlit, src + anchor, ip - anchor, ip - ref,
-                       len, rep);
-            rep = ip - ref;
-            ip += len;
-            anchor = ip;
-            if (ip > mflimit)
-                goto done;
-            table[hash_fast(src + ip - 2, hashLog)] = (uint16_t)(ip - 2);
-            h = hash_fast(src + ip, hashLog);
-            d = fast_dist(ip, table[h]);
-            table[h] = (uint16_t)ip;
-            ref = ip - d;
-            if (d > ip || read32(src + ref) != read32(src + ip))
-                break;
-        }
-        ip++;
+        len = MINMATCH + count_match_inl(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
+        emit_open4(&e, &rec, &tok, &off, &wlit, src + anchor, ip - anchor, ip - ref,
+                   len, rep);
+        rep = ip - ref;
+        ip += len;
+        anchor = ip;
+        if (ip > mflimit)
+            goto done;
+        /* the search goes on at the match's end */
+        table[hash_fast(src + ip - 2, hashLog)] = (uint16_t)(ip - 2);
         fwdH = hash_fast(src + ip, hashLog);
     }
 done:

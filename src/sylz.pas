@@ -372,12 +372,16 @@ begin
 end;
 
 { hash table size of each fast level }
+const
+  FAST_LOG0 = 13;
+  FAST_LOG1 = 15;
+
 function FastHashLog(level: Integer): Integer;
 begin
   if level = 0 then
-    Result := 13
+    Result := FAST_LOG0
   else
-    Result := 15;   { level 1 }
+    Result := FAST_LOG1;
 end;
 
 { Length of the common prefix of a and b, not reading at or past limit
@@ -1515,25 +1519,16 @@ begin
         Dec(ref);
       end;
 
-      repeat
-        len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, iend);
-        if not EmitSequence4(e, anchor, ip - anchor, ip - ref, len) then
-          Exit(-1);
-        rep := ip - ref;
-        Inc(ip, len);
-        anchor := ip;
-        if ip > mflimit then
-          Break;
-        table[HashFast(ip - 2, hashLog)] := UInt16(ip - 2 - src);
-        h := HashFast(ip, hashLog);
-        d := FastDist(ip - src, table[h]);
-        table[h] := UInt16(ip - src);
-        ref := ip - d;
-      until (d > ip - src) or (Read32(ref) <> Read32(ip));
+      len := SYLZ_MINMATCH + CountMatch(ip + SYLZ_MINMATCH, ref + SYLZ_MINMATCH, iend);
+      if not EmitSequence4(e, anchor, ip - anchor, ip - ref, len) then
+        Exit(-1);
+      rep := ip - ref;
+      Inc(ip, len);
+      anchor := ip;
       if ip > mflimit then
         Break;
-
-      Inc(ip);
+      { the search goes on at the match's end }
+      table[HashFast(ip - 2, hashLog)] := UInt16(ip - 2 - src);
       fwdH := HashFast(ip, hashLog);
     end;
   end;
@@ -1928,21 +1923,22 @@ asm
   imul rdi, [rsp + 24]
   shr rdi, cl                     { hash(ip) }
 
+  cmp cl, 64 - FAST_LOG1
+  jne @search0
+
 @search:
   { rdi = hash(ip), rbp = the bytes at ip }
   mov r12, [rsp + 24]
-  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]
+  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]   { one byte at a time up to here }
   cmp rbx, [rsp]
-  cmova rbx, [rsp]                { one byte at a time up to here }
-  cmp r8, rbx
-  jae @denseEnd
+  ja @searchEnd
 @dense:
   movzx eax, word ptr [r11 + rdi * 2]   { low 16 bits of the candidate's address }
   mov [r11 + rdi * 2], r8w
   mov rdx, [r8 + 1]
   mov rdi, rdx
   imul rdi, r12
-  shr rdi, cl                     { hash(ip + 1) }
+  shr rdi, 64 - FAST_LOG1         { hash(ip + 1) }
   cmp edx, [r8 + r13 + 1]         { the previous distance, one byte on }
   je @repHit
   sub ax, r8w                     { 65536 - distance (0: 65536) }
@@ -2058,37 +2054,68 @@ asm
   mov r9, r12                     { anchor = ip }
   cmp r8, [rsp]
   ja @last
+  cmp cl, 64 - FAST_LOG1
+  jne @next0
   { table[hash(ip - 2)] = ip - 2 }
   mov rdx, [r8 - 2]
   imul rdx, [rsp + 24]
-  shr rdx, cl
+  shr rdx, 64 - FAST_LOG1
   lea eax, [r8 - 2]
   mov [r11 + rdx * 2], ax
-  { a match right here needs no literals }
-  mov rdx, [r8]
-  imul rdx, [rsp + 24]
-  shr rdx, cl
-  movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], r8w
-  sub ax, r8w
-  mov edx, [r8 + rax - 65536]
-  cmp edx, [r8]
-  je @chain
-  add r8, 1
+  { the search goes on at the match's end }
   mov rbp, [r8]
   mov rdi, rbp
   imul rdi, [rsp + 24]
-  shr rdi, cl
+  shr rdi, 64 - FAST_LOG1
   jmp @search
 
-@chain:
-  add rax, r8
-  sub rax, 65536
-  jmp @emit
 @repHit:
   add r8, 1
   lea rax, [r8 + r13]             { ref = ip - previous distance }
   jmp @back
+
+@searchEnd:
+  mov rbx, [rsp]                  { the last probes of the input }
+  cmp r8, rbx
+  jae @denseEnd
+  cmp cl, 64 - FAST_LOG1
+  je @dense
+  jmp @dense0
+
+  { the same for level 0's table: a shift by a constant is one operation,
+    by cl three }
+@next0:
+  mov rdx, [r8 - 2]
+  imul rdx, [rsp + 24]
+  shr rdx, 64 - FAST_LOG0
+  lea eax, [r8 - 2]
+  mov [r11 + rdx * 2], ax
+  mov rbp, [r8]
+  mov rdi, rbp
+  imul rdi, [rsp + 24]
+  shr rdi, 64 - FAST_LOG0
+@search0:
+  mov r12, [rsp + 24]
+  lea rbx, [r8 + (1 shl SKIP_STRENGTH)]
+  cmp rbx, [rsp]
+  ja @searchEnd
+@dense0:
+  movzx eax, word ptr [r11 + rdi * 2]
+  mov [r11 + rdi * 2], r8w
+  mov rdx, [r8 + 1]
+  mov rdi, rdx
+  imul rdi, r12
+  shr rdi, 64 - FAST_LOG0
+  cmp edx, [r8 + r13 + 1]
+  je @repHit
+  sub ax, r8w
+  cmp ebp, [r8 + rax - 65536]
+  je @hit
+  mov rbp, rdx
+  add r8, 1
+  cmp r8, rbx
+  jb @dense0
+  jmp @denseEnd
 
 @cmMore:
   add r12, 8
