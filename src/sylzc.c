@@ -674,7 +674,7 @@ typedef struct {
     void (*flush)(void *);        /* v4: called with this struct when rec == recEnd,
                                      or (direct) when ctrl has reached tokEnd */
     void *owner;                  /* v4: sylz.pas's TEmit */
-    /* v4, levels 0-1: a chunk is open and the sequences go into it as
+    /* v4, levels 0-3: a chunk is open and the sequences go into it as
        tokens at ctrl (up to tokEnd), by its codes; their offsets at off */
     intptr_t direct;
     uint8_t *tokEnd, *off;
@@ -1260,8 +1260,8 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
     uint16_t *tl = st->tl, *ts = st->ts;
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
-    uint16_t *rec = e.rec;   /* v4: emit_fast4's pointers */
-    uint8_t *wlit = e.lit;
+    uint16_t *rec = e.rec;   /* v4: emit_open4's pointers */
+    uint8_t *tok = e.ctrl, *woff = e.off, *wlit = e.lit;
     intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit, rep = 1;
 
     if (n < 12 + 1)
@@ -1295,7 +1295,8 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
         else {
             dist = mid_cand(ts, mid_hash_short(src + pos, hashLog), src, pos);
-            if (dist == 0) {
+            /* v4: with no literals pending the short table's match must be 5 bytes */
+            if (dist == 0 || (v4 && pos == anchor && src[pos + 4] != src[pos + 4 - dist])) {
                 pos += 1 + ((pos - anchor) >> st->skip);
                 continue;
             }
@@ -1336,8 +1337,13 @@ found:
             pos--;
             len++;
         }
+        /* v4: after more than MAX_LL4 literals 4 bytes at a new offset are not taken */
+        if (v4 && len == MINMATCH && dist != rep && pos - anchor > MAX_LL4) {
+            pos += 1 + ((pos - anchor) >> st->skip);
+            continue;
+        }
         if (v4)
-            emit_fast4(&e, &rec, &wlit, src + anchor, pos - anchor, dist, len);
+            emit_open4(&e, &rec, &tok, &woff, &wlit, src + anchor, pos - anchor, dist, len, rep);
         else
             emit_sequence(&e, src + anchor, pos - anchor, dist, len);
         rep = dist;
@@ -1354,6 +1360,8 @@ found:
 done:
     if (v4) {
         e.rec = rec;
+        e.ctrl = tok;
+        e.off = woff;
         e.lit = wlit;
         e.rep = rep;
     }

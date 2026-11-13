@@ -353,6 +353,7 @@ const
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }
   MID_MAXLOG   = 16;
   MID_SKIP     = 9;     { probe step 1 + (literals so far) shr MID_SKIP }
+  MID_STEP1    = 1 shl MID_SKIP;   { so one byte below this many literals }
   MID_LAZY_ENOUGH = 32; { level 3 stops looking one byte later at this length }
   MID_NEXT_BELOW = 8;   { level 2 looks one byte later below this length }
   SCRATCH_SLACK = 16;
@@ -2782,7 +2783,7 @@ type
     flush: Pointer;            { v4: called with this record when rec = recEnd,
                                  or (direct) when ctrl has reached tokEnd }
     owner: Pointer;            { v4: the TEmit }
-    { v4, levels 0-1: TEmit's open chunk (ctrl: its token write pointer) }
+    { v4, levels 0-3: TEmit's open chunk (ctrl: its token write pointer) }
     direct: SizeInt;
     tokEnd, off: PByte;
     codes: Pointer;            { TCodes4 }
@@ -3078,6 +3079,12 @@ begin
       else
       begin
         dist := MidCand(ts, MidHashShort(src + pos, hashLog), src, pos);
+        { format v4: right after a match (no literals pending) 4 bytes at
+          a new offset save one byte and cost the decoder a sequence; the
+          short table's candidate must match 5 there }
+        if (dist > 0) and e.v4 and (pos = anchor)
+           and (src[pos + 4] <> src[pos + 4 - dist]) then
+          dist := 0;
         if dist = 0 then
         begin
           Inc(pos, 1 + (pos - anchor) shr MID_SKIP);
@@ -3130,6 +3137,14 @@ begin
       begin
         Dec(pos);
         Inc(len);
+      end;
+      { format v4: after more than MAX_LL4 literals 4 bytes at a new offset
+        save no byte (the run takes a token of its own, or an extension)
+        and cost the decoder a sequence, often an escape: not taken }
+      if e.v4 and (len = SYLZ_MINMATCH) and (dist <> rep) and (pos - anchor > MAX_LL4) then
+      begin
+        Inc(pos, 1 + (pos - anchor) shr MID_SKIP);
+        Continue;
       end;
       if not EmitSequence(e, src + anchor, pos - anchor, dist, len) then
         Exit(-1);
@@ -3588,28 +3603,62 @@ end;
 
 type
   { In/out state of format v4's assembler compressor of levels 2-3; fixed
-    field order. With more = 1 it stopped, the records full, at a match
-    (ip, mlen, dist): the caller flushes them and calls again. }
+    field order. With more = 1 it stopped at a sequence it leaves to
+    PutTokens4 (over MAX_LL4 literals, or a match over ML_SPLIT4): ip -
+    anchor literals, a match of mlen, k; its offset is written. The caller
+    writes the tokens at tok and calls again. }
   TMid4EncState = record
     src, iend, mflimit: PByte;   {   0,   8,  16: in }
     tl, ts: PUInt16;             {  24,  32: in, long and short tables }
-    rec: PUInt16;                {  40: in/out, where the next record goes }
+    tok: PByte;                  {  40: in/out, token write pointer }
     lit: PByte;                  {  48: in/out }
     anchor: PByte;               {  56: in/out (first: src) }
-    recEnd: PUInt16;             {  64: in }
+    off: PByte;                  {  64: in/out, offset write pointer }
     hashShift: Int64;            {  72: in, 64 - table log }
     lazy: Int64;                 {  80: in, 1 = level 3 }
     ip: PByte;                   {  88: in/out (first: src) }
     rep: SizeInt;                {  96: in/out, the previous distance (first: 1) }
-    mlen, dist: SizeInt;         { 104, 112: out, with more }
+    mlen, k: SizeInt;            { 104, 112: out, with more }
     more: SizeInt;               { 120: in/out (first: 0) }
+    codes: Pointer;              { 128: in, the table's TCodes4 }
+    tokEnd: PByte;               { 136: in, the open chunk's end (nil: records) }
+    dist: SizeInt;               { 144: out, with more = 2 }
   end;
   PMid4EncState = ^TMid4EncState;
 
-{ CompressMidCore for format v4 in x86_64 assembler: CompressMidX64 with
-  the previous distance tried one byte on at each position, and each
-  sequence recorded (EmitSequence4) instead of written as a token. The
-  same output byte for byte (tests check it). }
+{ CompressMidCore for format v4 in x86_64 assembler, the same output byte
+  for byte (tests check it); only used when dst holds SylzBound(n).
+  Against CompressMidX64: the previous distance tried one byte on at each
+  position; tokens from SYLZ_TOKENS4 and offsets written apart
+  (EmitDirect4); and a shorter probe, 24 instructions where that one
+  takes 36:
+  - the tables hold the low 16 bits of ip, not of the position, so the
+    caller fills them with those of src (what a position of 0 is) and no
+    position is kept; the 16-bit difference with ip is 65536 - distance,
+    and the candidate sits at ip + that - 65536;
+  - the 8 bytes at ip stay in a register for both hashes and compares;
+  - the step is one byte up to MID_STEP1 literals, so the loop compares ip
+    with where that ends (or mflimit, if that comes first) and only works
+    the step out past it;
+  - the first probe after a match, the one whose short candidate must
+    match 5 bytes, has its own copy of the probe.
+  Position 0 is not looked up (it has no candidate), so every table entry
+  is a position before the one probed, or src, and no candidate can lie
+  before src: the distance needs no check, and neither does the previous
+  distance, never over the position of the match that set it. A match is
+  looked for before mflimit, 12 bytes from the end, so the first 8 bytes
+  compared after its 4 are inside the input.
+  Registers: r8 ip, r9 anchor, r10 src, r11 long table, r12 short table,
+  r13 iend, r14 token and r15 literal write pointers, rbx minus the
+  previous distance and rbp the 8 bytes at ip while probing, then rdi
+  distance and rbp match length, cl the long hash's shift (the short
+  hash's 32-bit shift is the same cl mod 32); rax, rbx, rdx, rsi scratch.
+  Stack: [rsp] mflimit, [rsp+8] long hash multiplier, [rsp+16] offset
+  write pointer, [rsp+24] state, [rsp+32] lazy, [rsp+40] a candidate
+  distance, [rsp+48] the previous distance, [rsp+56] the codes, [rsp+64]
+  where the one-byte step ends, [rsp+72] iend - 16, [rsp+80] the open
+  chunk's end (0 while recording: every sequence goes back to the caller,
+  with more = 2), [rsp+88] scratch. }
 procedure CompressMid4X64(st: PMid4EncState); assembler; nostackframe;
 asm
   push rbx
@@ -3625,21 +3674,27 @@ asm
 {$else}
   mov rax, rdi
 {$endif}
-  sub rsp, 64
+  sub rsp, 96
   mov [rsp + 24], rax             { state }
+  mov rdx, [rax + 136]
+  mov [rsp + 80], rdx             { the open chunk's end, or 0: records }
   mov rdx, [rax + 16]
   mov [rsp], rdx                  { mflimit }
   mov rdx, 889523592379
   mov [rsp + 8], rdx              { long hash multiplier }
   mov rdx, [rax + 64]
-  mov [rsp + 16], rdx             { where the records end }
+  mov [rsp + 16], rdx             { offset write pointer }
   mov rdx, [rax + 80]
   mov [rsp + 32], rdx             { lazy }
   mov rdx, [rax + 96]
   mov [rsp + 48], rdx             { the previous distance }
+  mov rdx, [rax + 128]
+  mov [rsp + 56], rdx             { codes }
   mov rcx, [rax + 72]             { cl = hash shift, for the whole routine }
   mov r10, [rax]
   mov r13, [rax + 8]
+  lea rdx, [r13 - 16]
+  mov [rsp + 72], rdx             { iend - 16 }
   mov r11, [rax + 24]
   mov r12, [rax + 32]
   mov r14, [rax + 40]
@@ -3647,61 +3702,152 @@ asm
   mov r9, [rax + 56]              { anchor }
   mov r8, [rax + 88]              { ip }
   cmp qword ptr [rax + 120], 0
-  je @loop
-  mov rbp, [rax + 104]            { back after a flush: the match it stopped at }
-  mov rdi, [rax + 112]
-  jmp @emit
+  je @first
+  cmp qword ptr [rax + 120], 2
+  je @resumed
+  mov rbp, [rax + 104]            { back with a sequence's tokens written }
+  lea rax, [r8 + rbp]
+  mov rbx, r8
+  sub rbx, r9
+  jmp @litLong
+
+@resumed:
+  { back with the sequence (ip, mlen) recorded or written, its literals
+    copied: the tables, then on }
+  mov rbp, [rax + 104]
+  lea rax, [r8 + rbp]
+  xor ebx, ebx
+  jmp @litDone
+
+@first:
+  { position 0: only the previous distance (1), one byte on }
+  lea rax, [r8 + MID_STEP1]
+  cmp rax, [rsp]
+  cmova rax, [rsp]
+  mov [rsp + 64], rax
+  mov rbx, -1
+  mov rbp, [r8]
+  cmp ebp, [r8 + 1]
+  je @repHit
+  jmp @miss
 
 @loop:
+  { the first probe after a match: no literals pending }
+  mov rbx, [rsp + 48]
+  neg rbx                         { minus the previous distance, while probing }
+  lea rax, [r8 + MID_STEP1]
+  cmp rax, [rsp]
+  cmova rax, [rsp]
+  mov [rsp + 64], rax             { the step is one byte up to here }
   cmp r8, [rsp]
   jae @last
-  mov rsi, r8
-  sub rsi, r10                    { pos }
-  { the previous distance, one byte on (CompressMidCore) }
-  mov rdi, [rsp + 48]
-  lea rax, [r8 + 1]
-  sub rax, rdi
-  cmp rax, r10
-  jb @noRep                       { it reaches before the start of the input }
-  mov edx, [rax]
+  mov rbp, [r8]
+  mov edx, [r8 + rbx + 1]
   cmp edx, [r8 + 1]
-  jne @noRep
+  je @repHit
+  mov rdx, rbp
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], r8w
+  sub ax, r8w
+  cmp ebp, [r8 + rax - 65536]
+  je @longHit
+  imul edx, ebp, -1640531535
+  shr edx, cl
+  movzx eax, word ptr [r12 + rdx * 2]
+  mov [r12 + rdx * 2], r8w
+  sub ax, r8w
+  { here the short table's match must be 5 bytes }
+  mov rdx, [r8 + rax - 65536]
+  xor rdx, rbp
+  shl rdx, 24
+  jz @shortHit
+@miss:
+  add r8, 1
+  cmp r8, [rsp + 64]
+  jae @far
+@probe:
+  mov rbp, [r8]
+  { the previous distance, one byte on: taken as it is }
+  mov edx, [r8 + rbx + 1]
+  cmp edx, [r8 + 1]
+  je @repHit
+  { long table }
+  mov rdx, rbp
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], r8w
+  sub ax, r8w                     { 65536 - distance }
+  cmp ebp, [r8 + rax - 65536]
+  je @longHit
+  { short table }
+  imul edx, ebp, -1640531535
+  shr edx, cl
+  movzx eax, word ptr [r12 + rdx * 2]
+  mov [r12 + rdx * 2], r8w
+  sub ax, r8w
+  cmp ebp, [r8 + rax - 65536]
+  jne @miss
+@shortHit:
+  mov edi, 65536
+  sub rdi, rax                    { the distance }
+  jmp @found
+
+@far:
+  { MID_STEP1 literals or more pending: the step grows with them; or
+    mflimit }
+  lea rdx, [r8 - 1]
+  sub rdx, r9
+  shr rdx, MID_SKIP
+  add r8, rdx
+  cmp r8, [rsp]
+  jb @probe
+  jmp @last
+
+@repHit:
+  { the previous distance one byte on (rbp = the 8 bytes at ip); when its
+    match is shorter than MID_NEXT_BELOW, the long table's candidate at ip
+    instead if it reaches 2 bytes further (CompressMidCore) }
+  mov rdx, rbp
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], r8w        { ip into both tables }
+  sub ax, r8w                     { the long candidate: 65536 - distance }
+  mov [rsp + 88], rax
+  imul edx, ebp, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], r8w
+  mov rdi, [rsp + 48]
   lea rbx, [r8 + 1]
   mov [rsp + 40], rdi
   call @count                     { rdx = match end at rbx, distance [rsp + 40] }
   mov rbp, rdx
-  sub rbp, rbx                    { its length }
-  mov rsi, r8
-  sub rsi, r10                    { pos again (@count takes rsi) }
-  mov rdx, [r8]
-  shl rdx, 16
-  imul rdx, [rsp + 8]
-  shr rdx, cl
+  sub rbp, rbx
   cmp rbp, MID_NEXT_BELOW
-  jae @repLong
-  { a short one: the long table's candidate at pos instead, if it
-    reaches further }
-  movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], si
-  mov edx, [r8]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  mov [r12 + rdx * 2], si
-  mov edx, esi
-  sub edx, eax
-  and edx, $FFFF
-  mov eax, 65536
-  test edx, edx
-  cmovz edx, eax
-  cmp rdx, rsi
-  ja @repTake
-  mov rax, r8
-  sub rax, rdx
-  mov eax, [rax]
-  cmp eax, [r8]
+  jae @repTake
+  mov rax, [rsp + 88]
+  test eax, eax
+  jnz @repCand
+  { an entry equal to ip's low 16 bits: a distance of 65536, before src
+    under that position }
+  mov rdx, r8
+  sub rdx, r10
+  cmp rdx, 65536
+  jb @repTake
+@repCand:
+  mov edx, [r8 + rax - 65536]
+  cmp edx, [r8]
   jne @repTake
-  mov rbx, r8
+  mov edx, 65536
+  sub rdx, rax
   mov [rsp + 40], rdx
+  mov rbx, r8
   call @count
   sub rdx, r8
   lea rax, [rbp + 1]
@@ -3710,74 +3856,27 @@ asm
   mov rbp, rdx
   mov rdi, [rsp + 40]
   jmp @back
-@repLong:
-  mov [r11 + rdx * 2], si         { pos into both tables }
-  mov edx, [r8]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  mov [r12 + rdx * 2], si
 @repTake:
-  add r8, 1                       { the previous distance, one byte on }
+  add r8, 1
+  mov rdi, [rsp + 48]
   jmp @back
-@noRep:
-  { long table }
-  mov rdx, [r8]
-  shl rdx, 16
-  imul rdx, [rsp + 8]
-  shr rdx, cl
-  movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], si
-  mov edi, esi
-  sub edi, eax
-  and edi, $FFFF
-  mov eax, 65536
-  test edi, edi
-  cmovz edi, eax                  { distance, 0 meaning 65536 }
-  cmp rdi, rsi
-  ja @short
-  mov rax, r8
-  sub rax, rdi
-  mov edx, [rax]
-  cmp edx, [r8]
-  jne @short
-  { long hit: ip goes into the short table too }
-  mov edx, [r8]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  mov [r12 + rdx * 2], si
-  jmp @found
-@short:
-  mov edx, [r8]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  movzx eax, word ptr [r12 + rdx * 2]
-  mov [r12 + rdx * 2], si
-  mov edi, esi
-  sub edi, eax
-  and edi, $FFFF
-  mov eax, 65536
-  test edi, edi
-  cmovz edi, eax
-  cmp rdi, rsi
-  ja @miss
-  mov rax, r8
-  sub rax, rdi
-  mov edx, [rax]
-  cmp edx, [r8]
-  je @found
-@miss:
-  mov rdx, r8
-  sub rdx, r9
-  shr rdx, MID_SKIP
-  lea r8, [r8 + rdx + 1]
-  jmp @loop
 
+@longHit:
+  mov edi, 65536
+  sub rdi, rax
+  { ip goes into the short table too }
+  imul edx, ebp, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], r8w
 @found:
   { rbp = match length at ip, distance rdi }
-  lea rdx, [r8 + SYLZ_MINMATCH]
   mov rsi, r8
   sub rsi, rdi
-  add rsi, SYLZ_MINMATCH
+  mov rax, [r8 + SYLZ_MINMATCH]
+  xor rax, [rsi + SYLZ_MINMATCH]
+  jnz @cm1First                   { most matches end in these 8 bytes }
+  lea rdx, [r8 + SYLZ_MINMATCH + 8]
+  add rsi, SYLZ_MINMATCH + 8
 @cm1:
   lea rax, [rdx + 8]
   cmp rax, r13
@@ -3802,10 +3901,15 @@ asm
   add rdx, 1
   add rsi, 1
   jmp @cm1Tail
+@cm1First:
+  bsf rax, rax
+  shr eax, 3
+  lea rbp, [rax + SYLZ_MINMATCH]
+  jmp @counted
 @cm1Done:
   mov rbp, rdx
   sub rbp, r8
-
+@counted:
   cmp qword ptr [rsp + 32], 0
   jne @lazy
   { level 2: a short match, and a long one a byte later? }
@@ -3814,27 +3918,18 @@ asm
   lea rbx, [r8 + 1]
   cmp rbx, [rsp]
   jae @back
-  mov rsi, rbx
-  sub rsi, r10                    { pos + 1 }
   mov rdx, [rbx]
   shl rdx, 16
   imul rdx, [rsp + 8]
   shr rdx, cl
   movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], si
-  mov edx, esi
-  sub edx, eax
-  and edx, $FFFF
-  mov eax, 65536
-  test edx, edx
-  cmovz edx, eax
-  cmp rdx, rsi
-  ja @back
-  mov rax, rbx
-  sub rax, rdx
-  mov esi, [rax]
+  mov [r11 + rdx * 2], bx
+  sub ax, bx
+  mov esi, [rbx + rax - 65536]
   cmp esi, [rbx]
   jne @back
+  mov edx, 65536
+  sub rdx, rax
   mov [rsp + 40], rdx
   call @count                     { rdx = match end at rbx, distance [rsp + 40] }
   sub rdx, rbx
@@ -3852,51 +3947,32 @@ asm
   lea rbx, [r8 + 1]
   cmp rbx, [rsp]
   jae @back
-  mov rsi, rbx
-  sub rsi, r10
-  mov rdx, [rbx]
+  mov rsi, [rbx]                  { the 8 bytes there }
+  mov rdx, rsi
   shl rdx, 16
   imul rdx, [rsp + 8]
   shr rdx, cl
   movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], si
-  mov edx, esi
-  sub edx, eax
-  and edx, $FFFF
-  mov eax, 65536
-  test edx, edx
-  cmovz edx, eax
-  cmp rdx, rsi
-  ja @lzNoLong
-  mov rax, rbx
-  sub rax, rdx
-  mov eax, [rax]
-  cmp eax, [rbx]
+  mov [r11 + rdx * 2], bx
+  sub ax, bx
+  mov edx, 65536
+  sub rdx, rax                    { the long candidate's distance }
+  cmp esi, [rbx + rax - 65536]
   je @lzLong
-@lzNoLong:
   xor edx, edx
 @lzLong:
-  mov [rsp + 40], rdx             { long candidate's distance, or 0 }
-  mov edx, [rbx]
-  imul edx, edx, -1640531535
+  mov [rsp + 40], rdx             { or 0 }
+  imul edx, esi, -1640531535
   shr edx, cl
   movzx eax, word ptr [r12 + rdx * 2]
-  mov [r12 + rdx * 2], si
+  mov [r12 + rdx * 2], bx
   cmp qword ptr [rsp + 40], 0
   jne @lzHave
-  mov edx, esi
-  sub edx, eax
-  and edx, $FFFF
-  mov eax, 65536
-  test edx, edx
-  cmovz edx, eax
-  cmp rdx, rsi
-  ja @back
-  mov rax, rbx
-  sub rax, rdx
-  mov eax, [rax]
-  cmp eax, [rbx]
+  sub ax, bx
+  cmp esi, [rbx + rax - 65536]
   jne @back
+  mov edx, 65536
+  sub rdx, rax
   mov [rsp + 40], rdx
 @lzHave:
   call @count
@@ -3909,12 +3985,16 @@ asm
   jmp @lazy
 
 @count:
-  { rdx = end of the match at rbx with distance [rsp + 48] (one return
-    address pushed): prefix length from 4 on, reads before iend }
-  lea rdx, [rbx + SYLZ_MINMATCH]
+  { rdx = end of the match at rbx (before mflimit) with distance [rsp +
+    48] (one return address pushed): prefix length from 4 on, reads
+    before iend }
   mov rsi, rbx
   sub rsi, [rsp + 48]
-  add rsi, SYLZ_MINMATCH
+  mov rax, [rbx + SYLZ_MINMATCH]
+  xor rax, [rsi + SYLZ_MINMATCH]
+  jnz @cm2First
+  lea rdx, [rbx + SYLZ_MINMATCH + 8]
+  add rsi, SYLZ_MINMATCH + 8
 @cm2:
   lea rax, [rdx + 8]
   cmp rax, r13
@@ -3941,50 +4021,149 @@ asm
   jmp @cm2Tail
 @cm2Done:
   ret
+@cm2First:
+  bsf rax, rax
+  shr eax, 3
+  lea rdx, [rbx + rax + SYLZ_MINMATCH]
+  ret
 
 @back:
-  { extend backwards over the pending literals }
-  cmp r8, r9
-  jbe @emit
+  { extend backwards over the pending literals: one test for "the bytes
+    before differ, or no literal is pending" (which of the two it is the
+    branch predictor cannot tell) }
   mov rax, r8
   sub rax, rdi
   cmp rax, r10
-  jbe @emit
+  jbe @emit                       { the match starts the input }
   movzx edx, byte ptr [r8 - 1]
-  cmp dl, [rax - 1]
-  jne @emit
+  xor dl, [rax - 1]
+  cmp r8, r9
+  sete sil
+  or dl, sil
+  jnz @emit
   sub r8, 1
   add rbp, 1
   jmp @back
 
 @emit:
-  cmp r14, [rsp + 16]
-  jae @full                       { no room for a record: flushed, then back here }
   lea rax, [r8 + rbp]             { match end, kept to the end of the emit }
   mov rbx, r8
   sub rbx, r9                     { literal length }
-  { the record, as EmitSequence4 writes it: literals, match length,
-    distance - 1 }
+  cmp rbx, MAX_LL4
+  ja @manyLits
+@emitOff:
+  { records (the limit 0), or the open chunk full: the caller's }
+  cmp r14, [rsp + 80]
+  jae @record
+  { the offset, distance - 1: written either way, kept (the pointer
+    moves on) if the distance is not the previous one }
+  mov rdx, [rsp + 16]
+  lea esi, [rdi - 1]
+  mov [rdx], si
+  xor esi, esi
+  cmp rdi, [rsp + 48]
+  setne sil
   mov [rsp + 48], rdi             { the previous distance from here on }
-  lea rdx, [rdi - 1]
-  mov [r14 + 4], dx
-  cmp rbx, REC4_ESC
-  jae @recLong
-  cmp rbp, $FFFF
-  ja @recLong
-  mov [r14], bx
-  mov [r14 + 2], bp
-  add r14, 6
-  jmp @recDone
-@recLong:
-  mov word ptr [r14], REC4_ESC    { the lengths as two u32 after it }
-  mov word ptr [r14 + 2], 0
-  mov [r14 + 6], ebx
-  mov [r14 + 10], ebp
-  add r14, 18
-@recDone:
-  test rbx, rbx
-  jz @litDone
+  lea rdx, [rdx + rsi * 2]
+  mov [rsp + 16], rdx
+  xor esi, 1                      { k: 1 = at the previous distance }
+  { the tokens, as PutTokens4 writes them }
+  cmp rbx, MAX_LL4
+  ja @tokOut
+  cmp rbp, MAX_ML4
+  ja @tokLong
+  imul esi, esi, CODES4_KIND
+  imul edx, ebx, CODES4_ROW
+  add esi, edx
+  add rsi, [rsp + 56]             { exact[k, literals] }
+  movzx edx, byte ptr [rsi + rbp]
+  cmp edx, 255
+  je @tokPair
+  mov [r14], dl
+  add r14, 1
+@tokDone:
+  { the literals, MAX_LL4 at most: one 16-byte copy (also when there are
+    none: no branch on that) }
+  cmp r9, [rsp + 72]
+  ja @litBytes
+  movdqu xmm0, [r9]
+  movdqu [r15], xmm0
+@litDone:
+  add r15, rbx
+  cmp rax, [rsp]
+  jae @noInsert
+  { insert the match's second and third, and the two before its end }
+  mov rdx, [r8 + 1]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  lea esi, [r8 + 1]
+  mov [r11 + rdx * 2], si
+  imul edx, dword ptr [r8 + 2], -1640531535
+  shr edx, cl
+  add esi, 1
+  mov [r12 + rdx * 2], si
+  mov rdx, [rax - 2]
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  lea esi, [rax - 2]
+  mov [r11 + rdx * 2], si
+  imul edx, dword ptr [rax - 1], -1640531535
+  shr edx, cl
+  add esi, 1
+  mov [r12 + rdx * 2], si
+@noInsert:
+  mov r8, rax
+  mov r9, rax
+  jmp @loop
+
+@manyLits:
+  { over MAX_LL4 literals: 4 bytes at a new distance are not taken (the
+    match was not extended backwards, so ip is where it was found) }
+  cmp rbp, SYLZ_MINMATCH
+  jne @emitOff
+  cmp rdi, [rsp + 48]
+  je @emitOff
+  mov rbx, [rsp + 48]
+  neg rbx
+  add r8, 1
+  cmp r8, [rsp + 64]
+  jae @far
+  mov rax, r8
+  sub rax, r10
+  cmp rax, 65536
+  jae @probe
+  { the look one byte on (level 2's long table, level 3's both) put ip
+    itself in the tables: an entry equal to ip's low 16 bits is a distance
+    of 65536, before src here, so no candidate (MidCand's dist > pos) }
+  mov rbp, [r8]
+  mov edx, [r8 + rbx + 1]
+  cmp edx, [r8 + 1]
+  je @repHit
+  mov rdx, rbp
+  shl rdx, 16
+  imul rdx, [rsp + 8]
+  shr rdx, cl
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], r8w
+  sub ax, r8w
+  jz @mlShort
+  cmp ebp, [r8 + rax - 65536]
+  je @longHit
+@mlShort:
+  imul edx, ebp, -1640531535
+  shr edx, cl
+  movzx eax, word ptr [r12 + rdx * 2]
+  mov [r12 + rdx * 2], r8w
+  sub ax, r8w
+  jz @miss
+  cmp ebp, [r8 + rax - 65536]
+  jne @miss
+  jmp @shortHit
+
+@litLong:
+  { any number of literals, 16 bytes at a time }
   lea rdx, [r9 + rbx + 16]
   cmp rdx, r13
   ja @litBytes
@@ -4007,47 +4186,66 @@ asm
   add rdx, 1
   cmp rdx, rbx
   jb @litByte
-@litDone:
-  add r15, rbx
-  cmp rax, [rsp]
-  jae @noInsert
-  { insert the match's second and third, and the two before its end }
-  mov rsi, r8
-  sub rsi, r10
-  add rsi, 1
-  mov rdx, [r8 + 1]
-  shl rdx, 16
-  imul rdx, [rsp + 8]
-  shr rdx, cl
-  mov [r11 + rdx * 2], si
-  add rsi, 1
-  mov edx, [r8 + 2]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  mov [r12 + rdx * 2], si
-  mov rsi, rax
-  sub rsi, r10
-  sub rsi, 2
-  mov rdx, [rax - 2]
-  shl rdx, 16
-  imul rdx, [rsp + 8]
-  shr rdx, cl
-  mov [r11 + rdx * 2], si
-  add rsi, 1
-  mov edx, [rax - 1]
-  imul edx, edx, -1640531535
-  shr edx, cl
-  mov [r12 + rdx * 2], si
-@noInsert:
-  mov r8, rax
-  mov r9, rax
-  jmp @loop
+  jmp @litDone
 
-@full:
+@tokPair:
+  { no code for the pair: the literals' token (literals only), then the
+    match's (no literals) }
+  imul edx, ebx, CODES4_ROW
+  sub rsi, rdx                    { exact[k, 0] }
+  add rdx, [rsp + 56]
+  movzx edx, byte ptr [rdx + CODES4_KIND]   { exact[1, literals, 0] }
+  mov [r14], dl
+  movzx edx, byte ptr [rsi + rbp]
+  mov [r14 + 1], dl
+  add r14, 2
+  jmp @tokDone
+
+@tokLong:
+  { a match of MAX_ML4 + 1 .. ML_SPLIT4: its first MAX_ML4 bytes (one
+    less when that would leave a single byte) where the pair has a code,
+    then the rest as a token at the same distance, no literals; another
+    split is PutTokens4's }
+  cmp rbp, ML_SPLIT4
+  ja @tokOut
+  lea edi, [rbp - SYLZ_MINREP]
+  mov edx, MAX_ML4
+  cmp edi, edx
+  cmova edi, edx                  { the first part }
+  mov [rsp + 88], rdi
+  imul edx, esi, CODES4_KIND
+  imul edi, ebx, CODES4_ROW
+  add rdx, rdi
+  add rdx, [rsp + 56]
+  add rdx, [rsp + 88]
+  movzx edx, byte ptr [rdx]       { codes[k, literals, first part] }
+  cmp edx, 255
+  je @tokOut
+  mov [r14], dl
+  mov rdx, rbp
+  sub rdx, [rsp + 88]             { the rest }
+  add rdx, [rsp + 56]
+  movzx edx, byte ptr [rdx + CODES4_KIND]   { codes[1, 0, rest] }
+  mov [r14 + 1], dl
+  add r14, 2
+  jmp @tokDone
+
+@record:
+  { the sequence (ip, mlen, distance) is the caller's to record, or to
+    write after it closes the full chunk; nothing written }
   mov rax, [rsp + 24]
   mov [rax + 88], r8
   mov [rax + 104], rbp
-  mov [rax + 112], rdi
+  mov [rax + 144], rdi
+  mov qword ptr [rax + 120], 2
+  jmp @out
+
+@tokOut:
+  { PutTokens4's other cases: the caller's }
+  mov rax, [rsp + 24]
+  mov [rax + 88], r8
+  mov [rax + 104], rbp
+  mov [rax + 112], rsi
   mov qword ptr [rax + 120], 1
   jmp @out
 @last:
@@ -4056,10 +4254,12 @@ asm
 @out:
   mov rdx, [rsp + 48]
   mov [rax + 96], rdx
+  mov rdx, [rsp + 16]
+  mov [rax + 64], rdx
   mov [rax + 40], r14
   mov [rax + 48], r15
   mov [rax + 56], r9
-  add rsp, 64
+  add rsp, 96
 {$ifdef WIN64}
   pop rdi
   pop rsi
@@ -4105,17 +4305,24 @@ var
 begin
   if ctx.table = nil then
     ctx.table := GetMem(SizeOf(UInt16) shl CTX_TABLELOG);
+  EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
+  e.roomy := cap >= SylzBound(n);
+  { level 3's tables (2^16 entries each) fill a 256 KiB L2 cache and one
+    probe in nine leaves it; format v4 keeps them all the same: level 2's
+    were 20% faster at level 3 but 0.3 points bigger (silesia.tar, 38.97%
+    against 39.25%), and v4's level 3 is faster than v2's with them }
   if level = 2 then
     hashLog := MID_MAXLOG - 1
   else
     hashLog := MID_MAXLOG;
-  FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
-  EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
-  e.roomy := cap >= SylzBound(n);
-  e.sample := FAST_SAMPLE4;
+  { v4: a chunk's first sequences recorded, the ones after them written
+    at once (FlushChunk4, EmitDirect4) }
+  e.prefix := FAST_PREFIX4;
+  e.recEnd := e.recs + 3 * FAST_PREFIX4;
 {$ifdef SYLZ_ASM_X64}
   if SylzUseAsm and not e.v4 and not SylzPreferC and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
   begin
+    FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
     st.src := src;
     st.iend := src + n;
     st.mflimit := src + n - SEARCH_TAIL;
@@ -4131,38 +4338,52 @@ begin
     e.lit := st.lit;
     Exit(EmitFinish(e, st.anchor, src + n - st.anchor));
   end;
-{$endif}
-{$ifdef SYLZ_ASM_X64}
   if SylzUseAsm and e.v4 and not SylzPreferC and (cap >= SylzBound(n))
      and (n >= SEARCH_TAIL + 1) then
   begin
+    { CompressMid4X64's tables hold the low 16 bits of pointers: src's are
+      what 0, the position, is in the others }
+    FillWord(ctx.table^, 2 shl hashLog, UInt16(PtrUInt(src)));
     s4.src := src;
     s4.iend := src + n;
     s4.mflimit := src + n - SEARCH_TAIL;
     s4.tl := ctx.table;
     s4.ts := ctx.table + (1 shl hashLog);
-    s4.lit := e.lit;
     s4.anchor := src;
-    s4.recEnd := e.recEnd;
     s4.hashShift := 64 - hashLog;
     s4.lazy := Ord(level = 3);
     s4.ip := src;
-    s4.rep := 1;
     s4.more := 0;
+    s4.codes := @e.codes;
     repeat
-      s4.rec := e.rec;
+      s4.tok := e.ctrl;
+      s4.off := e.off;
+      s4.tokEnd := nil;   { records: each sequence comes back (more = 2) }
+      if e.direct then
+        s4.tokEnd := e.tokEnd;
+      s4.lit := e.lit;
+      s4.rep := e.rep;
       CompressMid4X64(@s4);
-      e.rec := s4.rec;
       e.lit := s4.lit;
+      e.rep := s4.rep;
+      if e.direct then
+      begin
+        e.ctrl := s4.tok;
+        e.off := s4.off;
+      end;
       if s4.more = 0 then
         Break;
-      if not FlushChunk4(e) then   { the records were full }
-        Exit(-1);
+      if s4.more = 1 then
+        { a sequence that is not one token or a pair: its offset is
+          written }
+        e.ctrl := PutTokens4(e.codes, e.ctrl, s4.k, s4.ip - s4.anchor, s4.mlen)
+      else if not EmitSequence4(e, s4.anchor, s4.ip - s4.anchor, s4.dist, s4.mlen) then
+        Exit(-1);   { a record, or the first sequence after a full chunk }
     until False;
-    e.rep := s4.rep;
     Exit(EmitFinish(e, s4.anchor, src + n - s4.anchor));
   end;
 {$endif}
+  FillChar(ctx.table^, SizeOf(UInt16) shl (hashLog + 1), 0);
 {$ifdef SYLZ_C}
   if SylzUseAsm and (cap >= SylzBound(n)) and (n >= SEARCH_TAIL + 1) then
   begin
