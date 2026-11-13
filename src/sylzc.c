@@ -462,15 +462,29 @@ DECODER_INLINE intptr_t decode4_seqs(sylzc_d4 *st, int toOffset)
         }
         if (ll > lend - lit || ll > oend - op)
             return -1;
-        for (intptr_t i = 0; i < ll; i++)
-            op[i] = lit[i];
+        /* in wide steps where there is room past the run or the match:
+           a block can open with megabytes of literals, or of one byte
+           repeated at the first distance, before it reads an offset */
+        if (ll <= lend - lit - 16 && ll <= oend - op - 16)
+            for (intptr_t i = 0; i < ll; i += 16)
+                copy16(op + i, lit + i);
+        else
+            for (intptr_t i = 0; i < ll; i++)
+                op[i] = lit[i];
         op += ll;
         lit += ll;
         if ((intptr_t)rep > op - dst || ml > oend - op)
             return -1;
         const uint8_t *m = op - rep;
-        while (ml-- > 0)
-            *op++ = *m++;
+        if (ml > oend - op - 16)
+            while (ml-- > 0)
+                *op++ = *m++;
+        else if (rep >= 16) {
+            for (intptr_t i = 0; i < ml; i += 16)
+                copy16(op + i, m + i);
+            op += ml;
+        } else
+            op = copy_short(op, rep, ml);
     }
     st->tok = tok;
     st->offp = offp;

@@ -170,7 +170,15 @@ How it got there, each step measured on silesia.tar and the mixed corpus
   the C escape's 128-byte copies written out (+1-2%), prefetch 256 /
   1024 / 2048 bytes ahead or with prefetchw, offsets stored complemented
   (a format change that saves the loop a `not`: -2..+1% cycles). The
-  machine was shared and busy: +-5%.
+  machine was shared and busy: +-5%. Review: the exact loop now also
+  runs before the block's first offset, byte by byte in C, so a block
+  that opens with 8 MB of zeros (one byte at the first distance) and
+  then xml decoded 4.9x slower with C than on master, 8 MB of random
+  bytes first 2.3x; the Pascal one was already 6x slower than v2 there
+  on master. Both copy in wide steps where there is room past the run
+  or match (cycles per decode, zeros / random: C 43.7 / 13.0 M ->
+  8.7 / 5.7 M, master 8.9 / 5.5 M; Pascal 67.4 / 8.0 M -> 10.5 /
+  8.8 M, v2 11.3 / 9.7 M); silesia.tar and mixed.tar unchanged.
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
