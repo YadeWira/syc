@@ -13,8 +13,9 @@
   SYLZ_DUMP=PREFIX writes each compressed block to PREFIX.LEVEL;
   SYLZ_LOAD=PREFIX decodes those blocks instead of compressing (compress
   speed shows as 0); SYLZ_NOASM=1 uses the Pascal code paths only;
-  SYLZ_NOBMI2=1 the Huffman decoder without BMI2; SYLZ_C=1 the C paths
-  instead of the assembler ones where both exist. }
+  SYLZ_NOBMI2=1 the Huffman decoder without BMI2; SYLZ_NOHUFASM=1 the
+  Pascal Huffman bulk loops (the LZ paths as they are); SYLZ_C=1 the C
+  paths instead of the assembler ones where both exist. }
 program sylzbench;
 
 {$mode objfpc}{$H+}
@@ -166,11 +167,19 @@ begin
   flags := 0;
   levels := [1, 2, 4, 6, 9, 12];
   if GetEnvironmentVariable('SYLZ_C') <> '' then
+  begin
     SylzPreferC := True;
+    HufPreferC := True;
+  end;
   if GetEnvironmentVariable('SYLZ_NOBMI2') <> '' then
     HufUseBmi2 := False;
+  if GetEnvironmentVariable('SYLZ_NOHUFASM') <> '' then
+    HufUseAsm := False;
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
+  begin
     SylzUseAsm := False;
+    HufUseAsm := False;
+  end;
 
   minTime := 1.0;
   argi := 1;

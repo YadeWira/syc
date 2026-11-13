@@ -214,7 +214,8 @@ begin
   fast := name <> 'pascal';
   SylzUseAsm := fast;
   SylzPreferC := name = 'c';
-  HufUseAsm := name = 'auto';
+  HufUseAsm := fast;
+  HufPreferC := name = 'c';
 {$ifndef SYLZ_PUREPASCAL}
   Blake2sUseC := fast;
   CdcUseC := fast;

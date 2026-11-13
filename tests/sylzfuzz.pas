@@ -179,7 +179,7 @@ procedure DecodeAll(src: PByte; csize, n: SizeInt);
 const
   PATHS = 3;
 var
-  keepAsm, keepC, keepHuf: Boolean;
+  keepAsm, keepC, keepHuf, keepHufC: Boolean;
   outs: array[0..PATHS - 1] of TGuarded;
   rs: array[0..PATHS - 1] of SizeInt;
   j: Integer;
@@ -187,17 +187,20 @@ begin
   keepAsm := SylzUseAsm;
   keepC := SylzPreferC;
   keepHuf := HufUseAsm;
+  keepHufC := HufPreferC;
   for j := 0 to PATHS - 1 do
   begin
     SylzUseAsm := j < 2;
     SylzPreferC := j = 1;
-    HufUseAsm := j = 0;
+    HufUseAsm := j < 2;
+    HufPreferC := j = 1;
     outs[j] := GuardedAlloc(n);
     rs[j] := SylzDecompress(src, csize, outs[j].p, n);
   end;
   SylzUseAsm := keepAsm;
   SylzPreferC := keepC;
   HufUseAsm := keepHuf;
+  HufPreferC := keepHufC;
   for j := 1 to PATHS - 1 do
     if (rs[j] <> rs[0])
        or ((rs[0] = n) and (n > 0) and (CompareByte(outs[0].p^, outs[j].p^, n) <> 0)) then
@@ -356,6 +359,17 @@ begin
     r := DecodeChunk(eight, bad.p, csize, outp.p, n);
     if r > csize then
       Fail('Huffman chunk took more than its bytes', n, -1);
+    { the Pascal bulk loops, the reference, must agree with this path }
+    if HufUseAsm then
+    begin
+      old := GuardedAlloc(n);
+      HufUseAsm := False;
+      if (DecodeChunk(eight, bad.p, csize, old.p, n) <> r)
+         or ((r >= 0) and (n > 0) and (CompareByte(outp.p^, old.p^, n) <> 0)) then
+        Fail('Huffman decoders disagree on a damaged chunk', n, -1);
+      HufUseAsm := True;
+      GuardedFree(old);
+    end;
     GuardedFree(outp);
     Inc(corrupt);
   end;
@@ -384,8 +398,10 @@ begin
     Inc(k);
     SylzUseAsm := Odd(k);   { alternate the assembler and Pascal decoders }
     SylzPreferC := k mod 4 = 1;   { and, on x86_64, C instead of assembler }
-    { and the Huffman decoder's: Pascal, assembler, assembler with BMI2 }
+    { and the Huffman decoder's: Pascal, assembler (C with SylzPreferC,
+      and elsewhere), assembler with BMI2 }
     HufUseAsm := k mod 3 <> 0;
+    HufPreferC := SylzPreferC;
     HufUseBmi2 := bmi2 and (k mod 3 = 2);
     OneCase;
     HufCase;
