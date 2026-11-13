@@ -316,8 +316,10 @@ const
   HC_CHAINMASK = HC_CHAINSIZE - 1;
   { hash chain depth of levels 4..8 }
   HC_ATTEMPTS: array[4..8] of Integer = (2, 4, 8, 16, 64);
-  HC_REP_ENOUGH = 16;   { format v4, levels 4..8: see CompressHCCore }
+  { format v4, levels 4..8: see CompressHCCore }
+  HC_REP_ENOUGH = 8;
   HC_REP_GAIN  = 2;
+  HC_ACCEL4: array[4..8] of Integer = (6, 6, 6, 6, 6);
   { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }
   MID_MAXLOG   = 16;
@@ -456,6 +458,14 @@ type
   end;
   TTable4 = array[0..255] of UInt32;
 
+const
+  ROWS4 = MAX_LL4 + 2;   { PairOf4's rows }
+
+type
+  { What a chunk's sequences look up (PairOf4): a chunk's table is made
+    from these counts. }
+  TPairCounts4 = array[0..1, 0..ROWS4 - 1, 0..MAX_ML4] of UInt32;
+
 type
   { The control stream is written straight into dst (after the header);
     literals go to a scratch buffer and are appended when the block ends. }
@@ -475,6 +485,11 @@ type
     codes: TCodes4;
     codesGen: SizeInt;
     sample: SizeInt;  { chunk tables from one sequence in this many }
+    { v4: what the recorded sequences look up; counted: the compressor
+      counts each sequence as it records it (levels 4..8 in C: a pass
+      over the records less), else FlushChunk4 counts them }
+    counted: Boolean;
+    cnt: TPairCounts4;
     roomy: Boolean;   { dst holds SylzBound(n): no sequence can run out of room }
     failed: Boolean;  { a flush called from C found no room }
   end;
@@ -494,6 +509,7 @@ begin
   e.tokRep := 1;
   e.codesGen := 0;
   e.sample := 1;
+  e.counted := False;
   e.failed := False;
   e.srcEnd := srcEnd;
   e.entropy := flags and SYLZ_ENTROPY <> 0;
@@ -772,12 +788,6 @@ begin
   Result := p;
 end;
 
-const
-  ROWS4 = MAX_LL4 + 2;   { PairOf4's rows }
-
-type
-  TPairCounts4 = array[0..1, 0..ROWS4 - 1, 0..MAX_ML4] of UInt32;
-
 { A table for the chunk whose lookups cnt counts, into t (and its codes
   into c); returns how many lookups it leaves without a code of their own
   (each costs a byte more), and in staticMiss how many SYLZ_TOKENS4
@@ -930,7 +940,6 @@ procedure sylzc_put_chunk4(st: Pointer); cdecl; external name 'sylzc_put_chunk4'
   the offset stream. False when dst has no room. }
 function FlushChunk4(var e: TEmit): Boolean;
 var
-  cnt: TPairCounts4;
   t: TTable4;
   c: TCodes4;
   r, rend: PUInt16;
@@ -950,27 +959,34 @@ begin
     (the fast levels: the count costs as much as the search saves; a
     record with its lengths in the next ones is then read as it is, and
     so are those: a few stray counts) }
-  FillChar(cnt, SizeOf(cnt), 0);
   r := e.recs;
   prev := e.tokRep;
-  if e.sample = 1 then
-    while r < rend do
-    begin
-      GetRec4(r, ll, ml, dist);
-      if PairOf4(ll, ml, row, col) then
-        Inc(cnt[Ord(dist = prev), row, col]);
-      prev := dist;
-    end
+  if e.counted then
+    { e.cnt has them }
   else
-    while r < rend do
-    begin
-      if r > e.recs then
-        prev := SizeInt(r[-1]) + 1;
-      if PairOf4(r[0], r[1], row, col) then
-        Inc(cnt[Ord(SizeInt(r[2]) + 1 = prev), row, col]);
-      Inc(r, 3 * e.sample);
-    end;
-  miss := BuildTable4(cnt, t, c, staticMiss, staticOk);
+  begin
+    FillChar(e.cnt, SizeOf(e.cnt), 0);
+    if e.sample = 1 then
+      while r < rend do
+      begin
+        GetRec4(r, ll, ml, dist);
+        if PairOf4(ll, ml, row, col) then
+          Inc(e.cnt[Ord(dist = prev), row, col]);
+        prev := dist;
+      end
+    else
+      while r < rend do
+      begin
+        if r > e.recs then
+          prev := SizeInt(r[-1]) + 1;
+        if PairOf4(r[0], r[1], row, col) then
+          Inc(e.cnt[Ord(SizeInt(r[2]) + 1 = prev), row, col]);
+        Inc(r, 3 * e.sample);
+      end;
+  end;
+  miss := BuildTable4(e.cnt, t, c, staticMiss, staticOk);
+  if e.counted then
+    FillChar(e.cnt, SizeOf(e.cnt), 0);   { for the next chunk }
   own := not staticOk or ((miss - staticMiss) * e.sample + TABLE4_BYTES < 0);
   { room: what is left of dst after the offsets and literals so far }
   limit := e.oend - (e.off - e.offs) - (e.lit - e.lits);
@@ -3568,7 +3584,7 @@ function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
 var
   iend: PByte;
   mfl, pos, anchor, ml, ref, ml0, ref0, start0, ml2, ref2, start2,
-    ml3, ref3, start3, newMl, corr, rl: SizeInt;
+    ml3, ref3, start3, newMl, corr, rl, rs, run: SizeInt;
   state: Integer;   { 0 search at pos, 2 / 3 lz4hc's _Search2 / _Search3 }
 
   function Emit(p, len, r: SizeInt): Boolean;
@@ -3598,33 +3614,69 @@ begin
     begin
       if state = 0 then
       begin
-        if e.v4 and (pos > anchor) and (e.rep <= pos)
-           and (Read32(src + pos - e.rep) = Read32(src + pos)) then
+        if e.v4 then
         begin
-          { format v4: a match at the previous offset costs a token and no
-            offset: taken unless the chains have one over HC_REP_GAIN bytes
-            longer (not searched for past HC_REP_ENOUGH) }
-          rl := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
-            src + pos - e.rep + SYLZ_MINMATCH, iend);
-          ml := 0;
-          if rl < HC_REP_ENOUGH then
-            ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
-          if rl + HC_REP_GAIN >= ml then
+          { format v4. A match at the previous offset costs a token and no
+            offset bytes: before each search, that offset is tried one
+            byte on (as levels 2-3 do: the byte in between is often what
+            changed), and its match is taken, back to where it starts,
+            unless the chains have one over HC_REP_GAIN bytes longer at
+            pos (not searched for from HC_REP_ENOUGH bytes on).
+            silesia.tar, level 4: 37.89 -> 37.57%, the searches it saves
+            paying for the tests.
+            A run of literals is searched every 1 + run shr HC_ACCEL4
+            bytes, as the fast levels do: data with nothing to find costs
+            a fraction of the time (mixed corpus, level 4: -40% cycles
+            for +0.2 points; silesia.tar -5% for +0.03), and a match
+            found after a step is extended back over what was stepped
+            over. }
+          run := pos - anchor;
+          if (e.rep <= pos) and (Read32(src + pos + 1 - e.rep) = Read32(src + pos + 1)) then
           begin
-            if not Emit(pos, rl, pos - e.rep) then
-              Exit(-1);
-            pos := pos + rl;
+            rs := pos + 1;
+            rl := SYLZ_MINMATCH + CountMatch(src + rs + SYLZ_MINMATCH,
+              src + rs - e.rep + SYLZ_MINMATCH, iend);
+            ml := 0;
+            if rl < HC_REP_ENOUGH then
+              ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+            if rl + HC_REP_GAIN >= ml then
+            begin
+              while (rs > anchor) and (rs > e.rep) and (src[rs - 1] = src[rs - 1 - e.rep]) do
+              begin
+                Dec(rs);
+                Inc(rl);
+              end;
+              if not Emit(rs, rl, rs - e.rep) then
+                Exit(-1);
+              pos := rs + rl;
+              Continue;
+            end;
+          end
+          else
+            ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+          if ml < SYLZ_MINMATCH then
+          begin
+            pos := pos + 1 + run shr HC_ACCEL4[level];
             Continue;
+          end;
+          ref := s.mpos;
+          while (pos > anchor) and (ref > 0) and (src[pos - 1] = src[ref - 1]) do
+          begin
+            Dec(pos);
+            Dec(ref);
+            Inc(ml);
           end;
         end
         else
-          ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
-        if ml < SYLZ_MINMATCH then
         begin
-          Inc(pos);
-          Continue;
+          ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+          if ml < SYLZ_MINMATCH then
+          begin
+            Inc(pos);
+            Continue;
+          end;
+          ref := s.mpos;
         end;
-        ref := s.mpos;
         start0 := pos; ref0 := ref; ml0 := ml;
         state := 2;
       end;
@@ -3753,6 +3805,8 @@ type
     search: Pointer;           { HcSearchX64 or sylzc_hc_search }
     anchor: SizeInt;           { out }
     e: TEmitC;
+    cnt: PUInt32;              { v4: e.cnt, counted as the sequences are recorded }
+    accel: SizeInt;            { v4: HC_ACCEL4 of the level }
   end;
 
 procedure sylzc_compress_hc(st: Pointer); cdecl; external name 'sylzc_compress_hc';
@@ -3796,7 +3850,13 @@ begin
 {$endif}
     EmitToC(e, sc.e, src + n);
     if e.v4 then
-      sylzc_compress_hc4(@sc)
+    begin
+      e.counted := True;
+      FillChar(e.cnt, SizeOf(e.cnt), 0);
+      sc.cnt := @e.cnt[0, 0, 0];
+      sc.accel := HC_ACCEL4[level];
+      sylzc_compress_hc4(@sc);
+    end
     else
       sylzc_compress_hc(@sc);
     EmitFromC(e, sc.e);

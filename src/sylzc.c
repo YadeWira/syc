@@ -1333,8 +1333,9 @@ void sylzc_bt_insert(sylzc_bt *b)
 /* ── levels 4-8: lz4hc's parse ────────────────────────────────────────── */
 
 #define HCW_OPTIMAL_ML 18
-#define HC_REP_ENOUGH 16   /* format v4: see CompressHCCore in sylz.pas */
+#define HC_REP_ENOUGH 8    /* format v4: see CompressHCCore in sylz.pas */
 #define HC_REP_GAIN 2
+#define ROWS4 (MAX_LL4 + 2)
 
 /* In/out of sylzc_compress_hc (THcCState in sylz.pas). search is the
    chain search to use: the x86_64 assembler one (it follows the C calling
@@ -1344,6 +1345,8 @@ typedef struct {
     void (*search)(sylzc_hc *);
     intptr_t anchor;              /* out */
     sylzc_emit e;
+    uint32_t *cnt;                /* v4: TEmit's pair counts */
+    intptr_t accel;               /* v4: HC_ACCEL4 of the level */
 } sylzc_hcparse;
 
 static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intptr_t longest)
@@ -1355,17 +1358,116 @@ static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intp
     return st->s->longest;
 }
 
+/* What FlushChunk4 in sylz.pas counts for a sequence (PairOf4), counted
+   as the sequence is recorded: a pass over the records less. */
+static inline __attribute__((always_inline)) void count_pair4(uint32_t *cnt, int k,
+    intptr_t ll, intptr_t ml)
+{
+    intptr_t row = ll, col = ml;
+    if (__builtin_expect(ll > MAX_LL4 || ml > MAX_ML4, 0)) {
+        if (ll > LIT_SPLIT4) {
+            row = 0;
+            if (ml <= MAX_ML4)
+                row = MAX_LL4 + 1;
+        } else if (ll > MAX_LL4)
+            row -= MAX_LL4;
+        if (ml > MAX_ML4) {
+            if (ml > ML_SPLIT4)
+                return;
+            col = MAX_ML4;
+            if (ml - col < MINREP)
+                col = ml - MINREP;
+        }
+    }
+    cnt[(k * ROWS4 + row) * (MAX_ML4 + 1) + col]++;
+}
+
 /* Emit in CompressHCCore: a match shorter than MINMATCH stays literals */
 static inline __attribute__((always_inline)) void hc_emit(sylzc_hcparse *st, intptr_t p,
     intptr_t len, intptr_t r, const int v4)
 {
     if (len < MINMATCH)
         return;
-    if (v4)
-        emit_sequence4(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
-    else
+    if (v4) {
+        sylzc_emit *e = &st->e;
+        if (e->rec >= e->recEnd)
+            e->flush(e);          /* before the count: it is the next chunk's */
+        count_pair4(st->cnt, p - r == e->rep, p - st->anchor, len);
+        emit_sequence4(e, st->s->src + st->anchor, p - st->anchor, p - r, len);
+    } else
         emit_sequence(&st->e, st->s->src + st->anchor, p - st->anchor, p - r, len);
     st->anchor = p + len;
+}
+
+/* Format v4's search at a position with no match yet (state 0 of
+   CompressHCCore in sylz.pas), for as long as it finds nothing: each
+   position's test of the previous offset one byte on, then
+   sylzc_hc_search with lowLimit = pos (same candidates, same result),
+   here so that a run of literals stays in one loop with its values in
+   registers. Returns 0 at scanEnd, 1 with a chain match at s->pos
+   (s->longest, s->mpos), 2 when the previous offset matches at s->pos + 1. */
+static inline __attribute__((always_inline)) int hc_scan4(sylzc_hc *s, intptr_t rep,
+    intptr_t anchor, intptr_t scanEnd, intptr_t accel)
+{
+    const uint8_t *src = s->src, *iend = s->iend;
+    uint16_t *head = s->head, *chain = s->chain;
+    intptr_t pos = s->pos, next = s->nextToInsert;
+    const intptr_t attempts = s->attempts;
+    int kind = 0;
+    do {
+        const uint8_t *ip = src + pos;
+        uint32_t first = read32(ip), h, d;
+        if (rep <= pos && read32(ip + 1 - rep) == read32(ip + 1)) {
+            kind = 2;
+            break;
+        }
+        for (; next < pos; next++) {
+            h = hash4(read32(src + next), HC_HASHLOG);
+            d = (uint32_t)(next - head[h]) & 0xFFFF;
+            if (d > next)
+                d = 0;                 /* 0 terminates the chain */
+            chain[next & 0xFFFF] = (uint16_t)d;
+            head[h] = (uint16_t)next;
+        }
+        /* pos goes in now: the next search would insert it the same */
+        h = hash4(first, HC_HASHLOG);
+        d = (uint32_t)(pos - head[h]) & 0xFFFF;
+        if (d > pos)
+            d = 0;
+        chain[pos & 0xFFFF] = (uint16_t)d;
+        head[h] = (uint16_t)pos;
+        next = pos + 1;
+        if (d) {
+            intptr_t cand = pos - d, tries = attempts, longest = MINMATCH - 1;
+            for (;;) {
+                if (read32(src + cand) == first) {
+                    intptr_t fwd = MINMATCH + count_match_inl(ip + MINMATCH,
+                        src + cand + MINMATCH, iend);
+                    if (fwd > longest) {
+                        longest = fwd;
+                        s->mpos = cand;
+                    }
+                }
+                if (--tries == 0)
+                    break;
+                d = chain[cand & 0xFFFF];
+                if (d == 0)
+                    break;
+                cand -= d;
+                if (cand < 0 || pos - cand > HC_MAXDIST)
+                    break;
+            }
+            if (longest >= MINMATCH) {
+                s->longest = longest;
+                kind = 1;
+                break;
+            }
+        }
+        pos += 1 + ((pos - anchor) >> accel);
+    } while (pos < scanEnd);
+    s->pos = pos;
+    s->nextToInsert = next;
+    return kind;
 }
 
 /* CompressHCCore in sylz.pas (LZ4HC_compress_hashChain), same output; the
@@ -1386,28 +1488,50 @@ static inline __attribute__((always_inline)) void compress_hc_core(sylzc_hcparse
     mfl = n - 12;
     while (pos < mfl) {
         if (state == 0) {
-            intptr_t rp = st->e.rep;
-            if (v4 && pos > st->anchor && rp <= pos
-                && read32(s->src + pos - rp) == read32(s->src + pos)) {
-                /* a match at the previous offset: taken unless the chains
-                   have one over HC_REP_GAIN bytes longer */
-                intptr_t rl = MINMATCH + count_match(s->src + pos + MINMATCH,
-                    s->src + pos - rp + MINMATCH, s->iend);
-                ml = 0;
-                if (rl < HC_REP_ENOUGH)
-                    ml = hc_find(st, pos, pos, MINMATCH - 1);
-                if (rl + HC_REP_GAIN >= ml) {
-                    hc_emit(st, pos, rl, pos - rp, v4);
-                    pos += rl;
+            if (v4) {
+                const uint8_t *src = s->src;
+                intptr_t rp = st->e.rep, kind;
+                s->pos = pos;
+                kind = hc_scan4(s, rp, st->anchor, mfl, st->accel);
+                pos = s->pos;
+                if (kind == 0)
+                    break;
+                ml = s->longest;
+                if (kind == 2) {
+                    /* the previous offset matches one byte on: taken, back
+                       to where it starts, unless the chains have a match
+                       over HC_REP_GAIN bytes longer here */
+                    intptr_t rs = pos + 1;
+                    intptr_t rl = MINMATCH + count_match(src + rs + MINMATCH,
+                        src + rs - rp + MINMATCH, s->iend);
+                    ml = 0;
+                    if (rl < HC_REP_ENOUGH)
+                        ml = hc_find(st, pos, pos, MINMATCH - 1);
+                    if (rl + HC_REP_GAIN >= ml) {
+                        while (rs > st->anchor && rs > rp && src[rs - 1] == src[rs - 1 - rp]) {
+                            rs--;
+                            rl++;
+                        }
+                        hc_emit(st, rs, rl, rs - rp, v4);
+                        pos = rs + rl;
+                        continue;
+                    }
+                }
+                ref = s->mpos;
+                /* the scan may have stepped over the match's first bytes */
+                while (pos > st->anchor && ref > 0 && src[pos - 1] == src[ref - 1]) {
+                    pos--;
+                    ref--;
+                    ml++;
+                }
+            } else {
+                ml = hc_find(st, pos, pos, MINMATCH - 1);
+                if (ml < MINMATCH) {
+                    pos++;
                     continue;
                 }
-            } else
-                ml = hc_find(st, pos, pos, MINMATCH - 1);
-            if (ml < MINMATCH) {
-                pos++;
-                continue;
+                ref = s->mpos;
             }
-            ref = s->mpos;
             start0 = pos; ref0 = ref; ml0 = ml;
             state = 2;
         }
