@@ -3914,6 +3914,20 @@ const
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
   OPT_LEVEL10: TSylzOptParams = (btCut: 256; btMaxLen: 1024; sufficient: 512;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+  { Formats v4 and v5 at level 10: depth 128 finds what 256 does
+    (silesia.tar, the mixed corpus, nci, xml: within 0.004 points) in
+    3-4% fewer cycles, a margin over v2's speed at this level. }
+  OPT4_LEVEL10: TSylzOptParams = (btCut: 128; btMaxLen: 1024; sufficient: 512;
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+
+{ Level 10's parameters for the format flags asks for. }
+function OptLevel10(flags: Integer): TSylzOptParams;
+begin
+  if flags and SYLZ_V4 <> 0 then
+    Result := OPT4_LEVEL10
+  else
+    Result := OPT_LEVEL10;
+end;
 
 type
   TOptNode = record
@@ -5054,7 +5068,7 @@ begin
       if level = SYLZ_MAXLEVEL - 1 then
         Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9))
       else
-        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10));
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OptLevel10(flags)));
     end;
     Inc(level, SYLZ_EC_SHIFT);
   end;
@@ -5073,7 +5087,7 @@ begin
   else if level = 9 then
     Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL9)
   else if level = 10 then
-    Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL10)
+    Result := CompressOpt(ctx, src, n, dst, cap, OptLevel10(flags))
   else
     Result := CompressHC(ctx, src, n, dst, cap, level);
 end;
