@@ -437,6 +437,9 @@ const
     length, COL4_EXT: extended) }
   ROW4_EXT   = MAX_LL4 + 1;
   COL4_EXT   = MAX_ML4 + 1;
+  ROWS4      = ROW4_EXT + 1;
+  COLS4      = COL4_EXT + 1;
+  NCELLS4    = 2 * ROWS4 * COLS4;   { a cell's index: (kind * ROWS4 + row) * COLS4 + column }
   { the shortest match of each kind: what a match extension counts from }
   MINML4: array[0..1] of SizeInt = (SYLZ_MINMATCH, SYLZ_MINREP);
   { The token stream comes in chunks of CHUNK4_SEQS sequences. The table
@@ -452,6 +455,9 @@ const
   CHUNK4_LONG     = 2;
   CHUNK4_SHORTMAX = 1 shl 14;   { a 2-byte header holds fewer token bytes than this }
   CHUNK4_MAX      = 1 shl 30;   { and a 4-byte one fewer than this }
+  CELL4_KEPT  = UInt32($40000000);
+  CELL4_SHORT = UInt32($80000000);
+  CELL4_ENTRY = UInt32($3FFFFFFF);
   { table entry (u16): bits 0..4 literals (TAB4_EXT: extended), 5..10
     match length (TAB4_EXT_ML: extended), bit 11 previous offset }
   TAB4_EXT    = 31;
@@ -469,20 +475,16 @@ const
   REC4_LONG = 3;
 
 type
-  { The codes of a token table; sylzc.c reads it by these offsets. exact:
-    [0 new offset / 1 previous offset, literals, match], 255 = no code;
-    the escapes: litx literals only, extended; llx[kind, match] literals
-    extended and that match; mlx[kind, literals] those literals and the
-    match extended ([kind, 0] always has a code; for the others 255 = no
-    code); bothx[kind] both extended, 255 = no code. }
-  TCodes4 = record
-    exact: array[0..1, 0..MAX_LL4, 0..MAX_ML4] of Byte;
-    llx: array[0..1, 0..MAX_ML4] of Byte;
-    litx: Byte;
-    mlx: array[0..1, 0..MAX_LL4] of Byte;
-    bothx: array[0..1] of Byte;
-  end;
+  { The codes of a token table by cell, [kind, row, column]; sylzc.c reads
+    it in this layout. 255 = no code, except in the cells every table has
+    (FixedCell4), which are not asked: one of them holds code 255. Row
+    ROW4_EXT: column 0 the literal-only escape, a match length the escape
+    for a long run and that match; column COL4_EXT: the match extended,
+    after the row's literals. }
+  TCodes4 = array[0..1, 0..ROW4_EXT, 0..COL4_EXT] of Byte;
   TTable4 = array[0..255] of UInt32;
+  { each code's cell, as an index into TCodes4 }
+  TCells4 = array[0..255] of UInt16;
 
 type
   { The control stream is written straight into dst (after the header);
@@ -502,6 +504,7 @@ type
     tokRep: SizeInt;
     table: TTable4;
     codes: TCodes4;
+    cells: TCells4;
     codesGen: SizeInt;
     sample: SizeInt;  { chunk tables from one sequence in this many }
     roomy: Boolean;   { dst holds SylzBound(n): no sequence can run out of room }
@@ -510,7 +513,16 @@ type
   PEmit = ^TEmit;
 
 var
-  Codes4: TCodes4;   { SYLZ_TOKENS4's }
+  { SYLZ_TOKENS4's codes and cells, and which of its codes are of cells
+    every table has (they never change) }
+  Codes4: TCodes4;
+  Cells4: TCells4;
+  Fixed4: array[0..255] of Boolean;
+  { each cell's table entry, with CELL4_KEPT on the cells a chunk's update
+    leaves alone (those every table has, and those the encoder has no use
+    for) and CELL4_SHORT on the matches under SYLZ_MINMATCH at the
+    previous offset }
+  CellInfo4: array[0..NCELLS4 - 1] of UInt32;
 
 procedure EmitInit(out e: TEmit; dst: PByte; cap: SizeInt; scratch, srcEnd: PByte;
   flags: Integer; offs: PByte; recs: PUInt16);
@@ -538,6 +550,7 @@ begin
   begin
     e.table := SYLZ_TOKENS4;
     e.codes := Codes4;
+    e.cells := Cells4;
   end;
 end;
 
@@ -637,24 +650,6 @@ begin
     Result := Result or (UInt32(col) shl 8);
 end;
 
-{ The code of a cell in c. }
-function CodeAt4(var c: TCodes4; k, row, col: SizeInt): PByte;
-begin
-  if row = ROW4_EXT then
-  begin
-    if col = COL4_EXT then
-      Result := @c.bothx[k]
-    else if col = 0 then
-      Result := @c.litx
-    else
-      Result := @c.llx[k, col];
-  end
-  else if col = COL4_EXT then
-    Result := @c.mlx[k, row]
-  else
-    Result := @c.exact[k, row, col];
-end;
-
 { The codes of a table an encoder can use, or false: no entry twice, a
   code for every cell the encoder falls back on (FixedCell4), and code
   255, "none" in c, on an escape the encoder takes without asking: the
@@ -663,20 +658,16 @@ function BuildCodes4(const t: TTable4; out c: TCodes4): Boolean;
 var
   code: Integer;
   k, row, col: SizeInt;
-  p: PByte;
 begin
   Result := False;
   FillChar(c, SizeOf(c), 255);
   for code := 0 to 254 do
   begin
-    if not CellOf4(t[code], k, row, col) then
+    if not CellOf4(t[code], k, row, col) or (c[k, row, col] <> 255) then
       Exit;
-    p := CodeAt4(c, k, row, col);
-    if p^ <> 255 then
-      Exit;
-    p^ := Byte(code);
+    c[k, row, col] := Byte(code);
   end;
-  if not CellOf4(t[255], k, row, col) or (CodeAt4(c, k, row, col)^ <> 255)
+  if not CellOf4(t[255], k, row, col) or (c[k, row, col] <> 255)
      or not (((row = 0) and (col = COL4_EXT)) or ((row = ROW4_EXT) and (col = 0))) then
     Exit;
   { every fixed cell but code 255's has its code by now }
@@ -684,9 +675,37 @@ begin
     for row := 0 to ROW4_EXT do
       for col := 0 to COL4_EXT do
         if FixedCell4(k, row, col) and ValidCell4(k, row, col)
-           and (CodeAt4(c, k, row, col)^ = 255) and (t[255] <> EntryOf4(k, row, col)) then
+           and (c[k, row, col] = 255) and (t[255] <> EntryOf4(k, row, col)) then
           Exit;
   Result := True;
+end;
+
+{ SYLZ_TOKENS4 as the encoder uses it. }
+procedure InitTable4;
+var
+  code: Integer;
+  k, row, col: SizeInt;
+  e: UInt32;
+begin
+  if not BuildCodes4(SYLZ_TOKENS4, Codes4) then
+    RunError(201);
+  for code := 0 to 255 do
+  begin
+    CellOf4(SYLZ_TOKENS4[code], k, row, col);
+    Cells4[code] := UInt16((k * ROWS4 + row) * COLS4 + col);
+    Fixed4[code] := FixedCell4(k, row, col);
+  end;
+  for k := 0 to 1 do
+    for row := 0 to ROW4_EXT do
+      for col := 0 to COL4_EXT do
+      begin
+        e := EntryOf4(k, row, col);
+        if FixedCell4(k, row, col) or not ValidCell4(k, row, col) then
+          e := e or CELL4_KEPT
+        else if (k = 1) and (col < SYLZ_MINMATCH) and (row <= MAX_LL4) then
+          e := e or CELL4_SHORT;
+        CellInfo4[(k * ROWS4 + row) * COLS4 + col] := e;
+      end;
 end;
 
 { A table entry as the block stores it, and back; false: not an entry. }
@@ -735,12 +754,12 @@ procedure PutPair4(const c: TCodes4; var p: PByte; k, ll, ml: SizeInt);
 var
   code: Byte;
 begin
-  code := c.exact[k, ll, ml];
+  code := c[k, ll, ml];
   if code = 255 then
   begin
-    p^ := c.exact[1, ll, 0];
+    p^ := c[1, ll, 0];
     Inc(p);
-    code := c.exact[k, 0, ml];
+    code := c[k, 0, ml];
   end;
   p^ := code;
   Inc(p);
@@ -788,9 +807,9 @@ function PutTokens4(const c: TCodes4; p: PByte; k, ll, ml: SizeInt): PByte;
 var
   part: SizeInt;
 begin
-  if (ll <= MAX_LL4) and (ml <= MAX_ML4) and (c.exact[k, ll, ml] <> 255) then
+  if (ll <= MAX_LL4) and (ml <= MAX_ML4) and (c[k, ll, ml] <> 255) then
   begin
-    p^ := c.exact[k, ll, ml];
+    p^ := c[k, ll, ml];
     Exit(p + 1);
   end;
   if ll > LIT_SPLIT4 then
@@ -799,23 +818,23 @@ begin
       the table has that code }
     if ml <= MAX_ML4 then
     begin
-      if c.llx[k, ml] <> 255 then
+      if c[k, ROW4_EXT, ml] <> 255 then
       begin
-        p^ := c.llx[k, ml];
+        p^ := c[k, ROW4_EXT, ml];
         Inc(p);
         PutExt(p, ll);
         Exit(p);
       end;
     end
-    else if c.bothx[k] <> 255 then
+    else if c[k, ROW4_EXT, COL4_EXT] <> 255 then
     begin
-      p^ := c.bothx[k];
+      p^ := c[k, ROW4_EXT, COL4_EXT];
       Inc(p);
       PutExt(p, ll);
       PutExt(p, ml - MINML4[k]);
       Exit(p);
     end;
-    p^ := c.litx;
+    p^ := c[1, ROW4_EXT, 0];
     Inc(p);
     PutExt(p, ll);
     ll := 0;
@@ -827,25 +846,25 @@ begin
       { a 4-byte match at a new offset takes the run's escape, which every
         table has, from MAX_LL4 literals on: split, it could cost more
         bytes than it saves, and SylzBound would not hold }
-      p^ := c.llx[0, SYLZ_MINMATCH];
+      p^ := c[0, ROW4_EXT, SYLZ_MINMATCH];
       Inc(p);
       PutExt(p, ll);
       Exit(p);
     end;
-    p^ := c.exact[1, MAX_LL4, 0];
+    p^ := c[1, MAX_LL4, 0];
     Inc(p);
     Dec(ll, MAX_LL4);
   end;
   if ml > ML_SPLIT4 then
   begin
     { the literals in the escape's token, or in one of their own before it }
-    if (ll > 0) and (c.mlx[k, ll] = 255) then
+    if (ll > 0) and (c[k, ll, COL4_EXT] = 255) then
     begin
-      p^ := c.exact[1, ll, 0];
+      p^ := c[1, ll, 0];
       Inc(p);
       ll := 0;
     end;
-    p^ := c.mlx[k, ll];
+    p^ := c[k, ll, COL4_EXT];
     Inc(p);
     PutExt(p, ml - MINML4[k]);
   end
@@ -867,7 +886,7 @@ begin
         if ml - part < SYLZ_MINREP then
           part := ml - SYLZ_MINREP;
       end;
-      p^ := c.exact[1, 0, part];
+      p^ := c[1, 0, part];
       Inc(p);
       Dec(ml, part);
     end;
@@ -878,9 +897,6 @@ begin
 end;
 
 const
-  ROWS4 = ROW4_EXT + 1;   { PairOf4's rows and columns }
-  COLS4 = COL4_EXT + 1;
-  CELLS4 = 2 * ROWS4 * COLS4;
   COUNT4_MAX = $FFFFF;    { a sort key's count: 20 bits over 12 of cell or code }
 
 type
@@ -911,63 +927,94 @@ begin
   end;
 end;
 
-{ The table t (its codes in c) changed for the chunk whose lookups cnt
-  counts, one sequence in sample: the cells asked for most take the codes
-  of the cells asked for least, while that saves more token bytes than
-  the UPDATE4_BYTES a replacement costs, and at most maxRepl of them; the
-  codes the encoder falls back on stay. A match under SYLZ_MINMATCH at the
-  previous offset gets a code whatever it saves, and keeps it while the
-  chunk uses it: the optimal parser chose it for the price of one token
-  (SylzBound). Returns how many codes changed, listed in repl; ties go to
-  the lower cell (kind, row, column) and the lower code. }
+{ The table t (its codes in c, its cells in cells) changed for the chunk
+  whose lookups cnt counts, one sequence in sample: the cells asked for
+  most take the codes of the cells asked for least, while that saves more
+  token bytes than the UPDATE4_BYTES a replacement costs, and at most
+  maxRepl of them; the codes the encoder falls back on stay. A match
+  under SYLZ_MINMATCH at the previous offset gets a code whatever it
+  saves, and keeps it while the chunk uses it: the optimal parser chose it
+  for the price of one token (SylzBound). Returns how many codes changed,
+  listed in repl; ties go to the lower cell (kind, row, column) and the
+  lower code. }
 function UpdateTable4(const cnt: TPairCounts4; sample, maxRepl: SizeInt;
-  var t: TTable4; var c: TCodes4; out repl: TUpdate4): SizeInt;
+  var t: TTable4; var c: TCodes4; var cells: TCells4; out repl: TUpdate4): SizeInt;
 var
-  add: array[0..CELLS4 - 1] of UInt32;   { count shl 12 or (4095 - cell) }
+  add: array[0..NCELLS4 - 1] of UInt32;   { count shl 12 or (4095 - cell) }
   del: array[0..255] of UInt32;          { (COUNT4_MAX - count) shl 12 or (255 - code) }
-  na, nd, k, row, col, code, i, cell: SizeInt;
-  v, a, d: UInt32;
+  free: array[0..255] of Byte;           { codes of cells not asked for, ascending }
+  cf: PUInt32;
+  pc: PByte;
+  na, nd, nf, code, i, cell: SizeInt;
+  v, a, d, least, info: UInt32;
 begin
+  cf := @cnt[0, 0, 0];
+  pc := @c[0, 0, 0];
+  { what one more code must be asked for to pay for itself, at best }
+  least := UInt32((UPDATE4_BYTES + sample + sample - 1) div sample);
   na := 0;
-  for k := 0 to 1 do
-    for row := 1 to ROW4_EXT do
-      for col := MINML4[k] to COL4_EXT do
-      begin
-        v := cnt[k, row, col];
-        if (v = 0) or FixedCell4(k, row, col) or (CodeAt4(c, k, row, col)^ <> 255) then
-          Continue;
-        if v > COUNT4_MAX - 1 then
-          v := COUNT4_MAX - 1;
-        if (k = 1) and (col < SYLZ_MINMATCH) and (row <= MAX_LL4) then
-          v := COUNT4_MAX;
-        add[na] := (v shl 12) or UInt32(4095 - ((k * ROWS4 + row) * COLS4 + col));
-        Inc(na);
-      end;
+  for cell := 0 to NCELLS4 - 1 do
+  begin
+    v := cf[cell];
+    if (v = 0) or (pc[cell] <> 255) then
+      Continue;
+    { (the cell with code 255 is one of those kept; a sampled record's
+      stray count can fall on a cell of no use) }
+    info := CellInfo4[cell];
+    if info and CELL4_KEPT <> 0 then
+      Continue;
+    if info and CELL4_SHORT <> 0 then
+      v := COUNT4_MAX
+    else if v < least then
+      Continue
+    else if v > COUNT4_MAX - 1 then
+      v := COUNT4_MAX - 1;
+    add[na] := (v shl 12) or UInt32(4095 - cell);
+    Inc(na);
+  end;
   if na = 0 then
     Exit(0);
+  { the codes that can go: first those of cells not asked for at all, in
+    code order, then the others from the least asked for }
   nd := 0;
+  nf := 0;
   for code := 0 to 254 do
   begin
-    CellOf4(t[code], k, row, col);
-    if FixedCell4(k, row, col) then
+    if Fixed4[code] then
       Continue;
-    v := cnt[k, row, col];
-    if (k = 1) and (col < SYLZ_MINMATCH) and (v > 0) then
-      Continue;
-    if v > COUNT4_MAX then
-      v := COUNT4_MAX;
-    del[nd] := ((COUNT4_MAX - v) shl 12) or UInt32(255 - code);
-    Inc(nd);
+    v := cf[cells[code]];
+    if v = 0 then
+    begin
+      free[nf] := Byte(code);
+      Inc(nf);
+    end
+    else if CellInfo4[cells[code]] and CELL4_SHORT = 0 then
+    begin
+      if v > COUNT4_MAX then
+        v := COUNT4_MAX;
+      del[nd] := ((COUNT4_MAX - v) shl 12) or UInt32(255 - code);
+      Inc(nd);
+    end;
   end;
   SortDown4(@add[0], na);
-  SortDown4(@del[0], nd);
-  if na > nd then
-    na := nd;
+  if na > nf then
+    SortDown4(@del[0], nd);
+  if na > nf + nd then
+    na := nf + nd;
   Result := 0;
   for i := 0 to na - 1 do
   begin
     a := add[i] shr 12;
-    d := COUNT4_MAX - (del[i] shr 12);
+    if i < nf then
+    begin
+      d := 0;
+      code := free[i];
+    end
+    else
+    begin
+      d := COUNT4_MAX - (del[i - nf] shr 12);
+      code := 255 - SizeInt(del[i - nf] and 255);
+    end;
     if a <> COUNT4_MAX then
     begin
       { the first replacement also pays the byte of their count; a
@@ -976,15 +1023,11 @@ begin
          or (SizeInt(a - d) * sample < UPDATE4_BYTES + sample + Ord(Result = 0)) then
         Break;
     end;
-    code := 255 - SizeInt(del[i] and 255);
-    CellOf4(t[code], k, row, col);
-    CodeAt4(c, k, row, col)^ := 255;
+    pc[cells[code]] := 255;
     cell := 4095 - SizeInt(add[i] and 4095);
-    k := cell div (ROWS4 * COLS4);
-    row := (cell div COLS4) mod ROWS4;
-    col := cell mod COLS4;
-    t[code] := EntryOf4(k, row, col);
-    CodeAt4(c, k, row, col)^ := Byte(code);
+    cells[code] := UInt16(cell);
+    pc[cell] := Byte(code);
+    t[code] := CellInfo4[cell] and CELL4_ENTRY;
     repl[Result] := Byte(code);
     Inc(Result);
   end;
@@ -1078,7 +1121,7 @@ begin
         Inc(cnt[k, row, col]);
       Inc(r, 3 * sample);
     end;
-  nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, repl);
+  nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, e.cells, repl);
   { room: what is left of dst after the offsets and literals so far }
   limit := e.oend - (e.off - e.offs) - (e.lit - e.lits);
   head := e.ctrl;
@@ -1130,7 +1173,7 @@ begin
       Exit(False);
     code := 255;
     if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
-      code := e.codes.exact[k, ll, ml];
+      code := e.codes[k, ll, ml];
     if code <> 255 then
     begin
       p^ := Byte(code);
@@ -4473,6 +4516,14 @@ const
   OPT4_ROWS = MAX_LL4 + 2;
   OPT4_COLS = 2 * MAX_ML4 + 2;   { lengths 0 .. 2 * MAX_ML4 + 1 }
   OPT4_NEVER = High(Int32) div 4;
+  { Off the price of a pair with no code of its own (two tokens), in
+    bytes: the chunk's update gives codes to the pairs the parse uses, so
+    at the full price the parse keeps to the table it started with and
+    the table never learns. Level 9, twelve Silesia files, off 0 / 0.5 /
+    0.75 / 1: 74 049 235, 73 968 067, 73 937 832, 73 963 946 bytes; -ec 9,
+    off 0 / 0.75 / 1 / 1.25: 68 666 254, 68 547 466, 68 555 596,
+    68 568 476. }
+  OPT4_MISS = 0.75;
 
 type
   { What format v4's DP needs besides the window; fixed layout, the C
@@ -4481,6 +4532,7 @@ type
     subLen, minRep: Int32;
     seq, esc, short: Int32;     { penalties, bits }
     scale: Int32;               { OPT_SCALE }
+    miss: Int32;                { OPT4_MISS, bits }
     litPrice: PInt32;           { a literal's price by byte value, bits }
     wsrc: PByte;                { the window's input }
     before: SizeInt;            { input bytes before the window }
@@ -4537,7 +4589,7 @@ begin
   Result := 0;
   if kind = 0 then
     Result := 2 * a.scale;
-  if (row = OPT4_ROW_LONG) and (ml > MAX_ML4) and (c^.bothx[kind] <> 255) then
+  if (row = OPT4_ROW_LONG) and (ml > MAX_ML4) and (c^[kind, ROW4_EXT, COL4_EXT] <> 255) then
   begin
     { the run's token is the match's too, with a second extension }
     Inc(Result, a.scale * Int32(ExtBytes(ml - MINML4[kind])));
@@ -4546,7 +4598,7 @@ begin
   if ml > ML_SPLIT4 then
   begin
     { the literals in the escape's token where it has that code }
-    if (l > 0) and (c^.mlx[kind, l] = 255) then
+    if (l > 0) and (c^[kind, l, COL4_EXT] = 255) then
       Inc(Result, tok);
     Inc(Result, tok + a.scale * Int32(ExtBytes(ml - MINML4[kind])) + a.esc);
     Exit;
@@ -4559,14 +4611,14 @@ begin
       first := ml - SYLZ_MINREP;
     Inc(Result, tok * Int32((ml - first + MAX_ML4 - 1) div MAX_ML4));
   end;
-  if (row = OPT4_ROW_LONG) and (ml <= MAX_ML4) and (c^.llx[kind, ml] <> 255) then
+  if (row = OPT4_ROW_LONG) and (ml <= MAX_ML4) and (c^[kind, ROW4_EXT, ml] <> 255) then
     { the run's token is the match's too }
-  else if c^.exact[kind, l, first] <> 255 then
+  else if c^[kind, l, first] <> 255 then
     Inc(Result, tok)
   else if ml < SYLZ_MINMATCH then
     Result := OPT4_NEVER
   else
-    Inc(Result, 2 * tok);
+    Inc(Result, 2 * tok - a.miss);
   if (row = OPT4_ROW_LONG) and (ml < SYLZ_MINMATCH) then
     Result := OPT4_NEVER;   { an extended run and 2 or 3 bytes: SylzBound }
 end;
@@ -4776,6 +4828,7 @@ begin
     a4.esc := q.esc;
     a4.short := q.short;
     a4.scale := OPT_SCALE;
+    a4.miss := Round(OPT4_MISS * OPT_SCALE);
     a4.litPrice := @flat[0];
     a4.codes := @e.codes;
     mtabGen := 0;
@@ -6501,6 +6554,5 @@ end;
 
 initialization
   BuildExactCodes;
-  if not BuildCodes4(SYLZ_TOKENS4, Codes4) then
-    RunError(201);
+  InitTable4;
 end.

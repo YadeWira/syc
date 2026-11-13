@@ -644,20 +644,18 @@ typedef struct {
     void *owner;                  /* v4: sylz.pas's TEmit */
 } sylzc_emit;
 
-/* TCodes4 in sylz.pas: the codes of a format v4 token table (the
-   optimal parser's prices). exact[0 new offset / 1 previous
-   offset][literals][match], 255 = no code; the escapes (mlx[kind][0]
-   always has a code; in the others and in bothx 255 = no code) */
+/* TCodes4 in sylz.pas: the codes of a format v4 token table by cell,
+   [0 new offset / 1 previous offset][row][column], 255 = no code (not
+   asked of the cells every table has). Row: the literals, ROW4_EXT
+   extended; column: the match length, COL4_EXT extended. */
 #define MAX_LL4    16
 #define MAX_ML4    32
 #define LIT_SPLIT4 32
 #define ML_SPLIT4  64
+#define ROW4_EXT   (MAX_LL4 + 1)
+#define COL4_EXT   (MAX_ML4 + 1)
 struct sylzc_codes4 {
-    uint8_t exact[2][MAX_LL4 + 1][MAX_ML4 + 1];
-    uint8_t llx[2][MAX_ML4 + 1];
-    uint8_t litx;
-    uint8_t mlx[2][MAX_LL4 + 1];
-    uint8_t bothx[2];
+    uint8_t cell[2][ROW4_EXT + 1][COL4_EXT + 1];
 };
 
 static void put_ext(uint8_t **pp, intptr_t v)
@@ -785,10 +783,10 @@ static inline __attribute__((always_inline)) void emit_fast4(sylzc_emit *e,
 static uint8_t *put_pair4(const struct sylzc_codes4 *t, uint8_t *p, int k,
                           intptr_t ll, intptr_t ml)
 {
-    int c = t->exact[k][ll][ml];
+    int c = t->cell[k][ll][ml];
     if (c == 255) {
-        *p++ = t->exact[1][ll][0];
-        c = t->exact[k][0][ml];
+        *p++ = t->cell[1][ll][0];
+        c = t->cell[k][0][ml];
     }
     *p++ = (uint8_t)c;
     return p;
@@ -802,35 +800,35 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
     intptr_t part;
     if (ll > LIT_SPLIT4) {
         if (ml <= MAX_ML4) {
-            if (t->llx[k][ml] != 255) {
-                *p++ = t->llx[k][ml];
+            if (t->cell[k][ROW4_EXT][ml] != 255) {
+                *p++ = t->cell[k][ROW4_EXT][ml];
                 put_ext(&p, ll);
                 return p;
             }
-        } else if (t->bothx[k] != 255) {
-            *p++ = t->bothx[k];
+        } else if (t->cell[k][ROW4_EXT][COL4_EXT] != 255) {
+            *p++ = t->cell[k][ROW4_EXT][COL4_EXT];
             put_ext(&p, ll);
             put_ext(&p, ml - (k ? MINREP : MINMATCH));
             return p;
         }
-        *p++ = t->litx;
+        *p++ = t->cell[1][ROW4_EXT][0];
         put_ext(&p, ll);
         ll = 0;
     } else if (ll > MAX_LL4) {
         if (k == 0 && ml == MINMATCH) {
-            *p++ = t->llx[0][MINMATCH];
+            *p++ = t->cell[0][ROW4_EXT][MINMATCH];
             put_ext(&p, ll);
             return p;
         }
-        *p++ = t->exact[1][MAX_LL4][0];
+        *p++ = t->cell[1][MAX_LL4][0];
         ll -= MAX_LL4;
     }
     if (ml > ML_SPLIT4) {
-        if (ll > 0 && t->mlx[k][ll] == 255) {
-            *p++ = t->exact[1][ll][0];
+        if (ll > 0 && t->cell[k][ll][COL4_EXT] == 255) {
+            *p++ = t->cell[1][ll][0];
             ll = 0;
         }
-        *p++ = t->mlx[k][ll];
+        *p++ = t->cell[k][ll][COL4_EXT];
         put_ext(&p, ml - (k ? MINREP : MINMATCH));
     } else if (ml > MAX_ML4) {
         part = MAX_ML4;
@@ -845,7 +843,7 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
                 if (ml - part < MINREP)
                     part = ml - MINREP;
             }
-            *p++ = t->exact[1][0][part];
+            *p++ = t->cell[1][0][part];
             ml -= part;
         }
     } else
@@ -885,7 +883,7 @@ void sylzc_put_chunk4(sylzc_put4 *st)
         k = dist == prev;
         prev = dist;
         if (ll <= MAX_LL4 && ml <= MAX_ML4)
-            code = t->exact[k][ll][ml];
+            code = t->cell[k][ll][ml];
         if (__builtin_expect(code != 255, 1))
             *p++ = (uint8_t)code;
         else
@@ -2138,6 +2136,7 @@ typedef struct {
     int32_t subLen, minRep;
     int32_t seq, esc, shortOff;   /* penalties, bits */
     int32_t scale;
+    int32_t miss;                 /* off the price of a pair with no code, bits */
     const int32_t *litPrice;
     const uint8_t *wsrc;
     intptr_t before;              /* input bytes before the window */
@@ -2163,10 +2162,10 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
     int32_t tok = a->scale + a->seq, first, r;
     int32_t l = row == OPT4_ROW_LONG ? 0 : row;
     r = kind == 0 ? 2 * a->scale : 0;
-    if (row == OPT4_ROW_LONG && ml > MAX_ML4 && c->bothx[kind] != 255)
+    if (row == OPT4_ROW_LONG && ml > MAX_ML4 && c->cell[kind][ROW4_EXT][COL4_EXT] != 255)
         return r + a->scale * ext_bytes(ml - (kind ? MINREP : MINMATCH));
     if (ml > ML_SPLIT4) {
-        if (l > 0 && c->mlx[kind][l] == 255)
+        if (l > 0 && c->cell[kind][l][COL4_EXT] == 255)
             r += tok;
         return r + tok + a->scale * ext_bytes(ml - (kind ? MINREP : MINMATCH)) + a->esc;
     }
@@ -2177,14 +2176,14 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
             first = ml - MINREP;
         r += tok * ((ml - first + MAX_ML4 - 1) / MAX_ML4);
     }
-    if (row == OPT4_ROW_LONG && ml <= MAX_ML4 && c->llx[kind][ml] != 255)
+    if (row == OPT4_ROW_LONG && ml <= MAX_ML4 && c->cell[kind][ROW4_EXT][ml] != 255)
         ;   /* the run's token is the match's too */
-    else if (c->exact[kind][l][first] != 255)
+    else if (c->cell[kind][l][first] != 255)
         r += tok;
     else if (ml < MINMATCH)
         r = OPT4_NEVER;
     else
-        r += 2 * tok;
+        r += 2 * tok - a->miss;
     if (row == OPT4_ROW_LONG && ml < MINMATCH)
         r = OPT4_NEVER;
     return r;
