@@ -4,7 +4,9 @@
   to v5, and every output capacity 0..SylzBound(n): compress must return
   -1 (and with cap >= SylzBound(n) never does) or a block that fits cap
   and decodes back to the input; nothing may be written past cap, nor
-  past the decoded output (canary bytes). About 11 M cases.
+  past the decoded output (canary bytes). About 11 M cases; then a 16 MiB
+  run with the capacities around its size, for the room checks of long
+  sequences.
 
   Usage: sylzedge   (SYLZ_NOASM=1: Pascal code paths only; SYLZ_C=1: C
   instead of assembler where both exist) }
@@ -18,6 +20,7 @@ uses
 const
   MAXN = 300;
   CANARY = 64;
+  LONG_CANARY = 1024;   { the long run's: an overrun there grows with n }
 
 var
   src, dst, outb: PByte;
@@ -110,10 +113,41 @@ begin
       if fails > 20 then
         Halt(1);
     end;
-  SylzCtxFree(ctx);
   FreeMem(outb);
   FreeMem(dst);
   FreeMem(src);
+  { one long run, with every capacity around what its tokens take: an
+    extension byte stands for 255, and v4's room checks once counted one
+    per 256 (16 MiB of zeros wrote 244 bytes past cap) }
+  n := 16 shl 20;
+  src := GetMem(n);
+  FillChar(src^, n, 0);
+  src[0] := 7;
+  dst := GetMem(SylzBound(n) + LONG_CANARY);
+  kind := 5;
+  for level := SYLZ_MINLEVEL to SYLZ_MAXLEVEL do
+    for flags := 0 to 3 do
+    begin
+      cap := n div 256 - 64;
+      while cap < n div 255 + 64 do
+      begin
+        Inc(cases);
+        FillChar(dst^, cap + LONG_CANARY, $A5);
+        r := SylzCompressEx(ctx, src, n, dst, cap, level, flags);
+        for i := cap to cap + LONG_CANARY - 1 do
+          if dst[i] <> $A5 then
+          begin
+            Report('WRITE PAST CAP');
+            Break;
+          end;
+        if (r < -1) or (r > cap) then
+          Report('BAD SIZE');
+        Inc(cap, 5);
+      end;
+    end;
+  FreeMem(dst);
+  FreeMem(src);
+  SylzCtxFree(ctx);
   WriteLn('ok: ', cases, ' cases, ', fails, ' failures');
   if fails > 0 then
     Halt(1);

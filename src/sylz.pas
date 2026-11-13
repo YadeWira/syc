@@ -1019,8 +1019,10 @@ begin
     k := Ord(dist = prev);
     prev := dist;
     { the tokens of a sequence, at most: 2 and a literal extension, 3 and
-      the rest of a split match or a match extension; and its offset }
-    if p + 8 + ll shr 8 + ml shr 8 + 2 > limit then
+      the rest of a split match or a match extension; and its offset. An
+      extension is a byte per 255, not per 256: with shr 8 a long run in a
+      block of a few MiB wrote past cap. }
+    if p + 8 + (ll + ml) div 255 + 2 > limit then
       Exit(False);
     code := 255;
     if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
@@ -1068,7 +1070,7 @@ var
 begin
   { the tokens of a sequence, at most (see FlushChunk4), its offset, and
     every literal so far }
-  if e.ctrl + 8 + litLen shr 8 + matchLen shr 8 + 2
+  if e.ctrl + 8 + (litLen + matchLen) div 255 + 2
      + (e.off - e.offs) + (e.lit - e.lits) + litLen > e.oend then
     Exit(False);
   k := Ord(dist = e.rep);
