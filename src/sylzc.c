@@ -130,6 +130,7 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
 
 static void copy8(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 8); }
 static void copy16(uint8_t *d, const uint8_t *s) { __builtin_memcpy(d, s, 16); }
+static uint16_t read16(const uint8_t *p) { uint16_t v; __builtin_memcpy(&v, p, 2); return v; }
 
 /* DecodeSafe in sylz.pas: exact, fully checked, to the end of the block */
 DECODER_INLINE intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
@@ -348,6 +349,9 @@ intptr_t sylzc_decode(const uint8_t *ctrl, const uint8_t *cend,
    flags */
 #define TOK4_LLEXT 0x1000000u
 #define TOK4_MLEXT 0x2000000u
+#define MAXDIST 65536   /* SYLZ_MAXDIST */
+/* the output, 512 bytes ahead of p (an address, never used as a pointer) */
+#define PREFETCH(p) __builtin_prefetch((const void *)((uintptr_t)(p) + 512))
 
 /* TDecode4State in sylz.pas */
 typedef struct {
@@ -358,29 +362,26 @@ typedef struct {
     intptr_t rep;
     intptr_t status;
     const uint32_t *tokens;
+    const uint32_t *fast;
+    const uint8_t *offs0;
+    const void *shorts;
 } sylzc_d4;
 
-/* A match copy for a distance under 16 (ml may be 0: nothing kept) */
+/* A match of any length at a distance under 16, in 8-byte steps (ml may
+   be 0: nothing kept) */
 DECODER_INLINE uint8_t *copy_short(uint8_t *op, uintptr_t off, intptr_t ml)
 {
     static const uint8_t period[8] = {0, 8, 8, 9, 8, 10, 12, 14};
     const uint8_t *m = op - off;
-    if (off >= 8) {
-        do {
-            copy8(op, m);
-            op += 8;
-            m += 8;
-            ml -= 8;
-        } while (ml > 0);
-        return op + ml;
+    if (off < 8) {
+        /* the first 8 bytes one by one; they repeat with period off, so
+           the rest copies from the nearest multiple of off that is >= 8 */
+        op[0] = m[0]; op[1] = m[1]; op[2] = m[2]; op[3] = m[3];
+        op[4] = m[4]; op[5] = m[5]; op[6] = m[6]; op[7] = m[7];
+        op += 8;
+        m = op - period[off];
+        ml -= 8;
     }
-    /* off < 8: the first 8 bytes one by one; they repeat with period off,
-       so the rest copies from the nearest multiple of off that is >= 8 */
-    op[0] = m[0]; op[1] = m[1]; op[2] = m[2]; op[3] = m[3];
-    op[4] = m[4]; op[5] = m[5]; op[6] = m[6]; op[7] = m[7];
-    op += 8;
-    m = op - period[off];
-    ml -= 8;
     while (ml > 0) {
         copy8(op, m);
         op += 8;
@@ -390,18 +391,40 @@ DECODER_INLINE uint8_t *copy_short(uint8_t *op, uintptr_t off, intptr_t ml)
     return op + ml;
 }
 
-/* One chunk of format v4's sequences (DecodeChunk4 in sylz.pas): 0, or
-   -1 on corrupt input.
+/* The same for an exact code's match (32 bytes at most), with no loop:
+   8-byte steps that each read what the one before wrote, 16 bytes, and
+   16 more for a match over 16. Under 8 the first step is the period
+   spread over 8 bytes by a multiplication (the low `off` bytes, times a
+   1 in every byte a copy of them starts at), and the others read the
+   nearest multiple of off that is >= 8 back. */
+DECODER_INLINE void copy_short32(uint8_t *op, uintptr_t off, uintptr_t ml)
+{
+    static const uint8_t period[8] = {0, 8, 8, 9, 8, 10, 12, 14};
+    static const uint64_t spread[8] = {
+        0, 0x0101010101010101u, 0x0001000100010001u, 0x0001000001000001u,
+        0x0000000100000001u, 0x0000010000000001u, 0x0001000000000001u,
+        0x0100000000000001u};
+    const uint8_t *m = op - off;
+    if (off >= 8)
+        copy8(op, m);
+    else {
+        uint64_t v;
+        __builtin_memcpy(&v, m, 8);
+        v = (v & (~(uint64_t)0 >> (64 - 8 * off))) * spread[off];
+        __builtin_memcpy(op, &v, 8);
+        m = op - period[off];
+    }
+    copy8(op + 8, m + 8);
+    if (ml > 16) {
+        copy8(op + 16, m + 16);
+        copy8(op + 24, m + 24);
+    }
+}
 
-   The fast loop: a sequence with an exact code takes one token, at most
-   2 offset bytes and 16 literals, and writes inside 64 bytes of output
-   (16 literal bytes, then 32 match bytes after at most 16 literals), so
-   k = min(tokens, offset bytes / 2, literals / 16, output / 64) of them
-   need no bounds check: the inner loop counts k down. The offset is read
-   whether the token takes one or not, and chosen without a branch. An
-   escape is checked on its own, then k is counted again. What is left
-   when k = 0 goes through the exact, fully checked loop (DecodeSeqs4). */
-DECODER_INLINE intptr_t decode4_core(sylzc_d4 *st)
+/* DecodeSeqs4 in sylz.pas: the chunk's sequences from st->tok on, exact
+   and fully checked; with toOffset, only until the block has read an
+   offset. 0, or -1 on corrupt input. */
+DECODER_INLINE intptr_t decode4_seqs(sylzc_d4 *st, int toOffset)
 {
     const uint32_t *tokens = st->tokens;
     const uint8_t *tok = st->tok, *tend = st->tend;
@@ -410,96 +433,7 @@ DECODER_INLINE intptr_t decode4_core(sylzc_d4 *st)
     uint8_t *op = st->op, *oend = st->oend, *dst = st->dst;
     uintptr_t rep = (uintptr_t)st->rep;
 
-    for (;;) {
-        intptr_t k = tend - tok, c;
-        c = (offend - offp) >> 1;
-        if (c < k) k = c;
-        c = (lend - lit) >> 4;
-        if (c < k) k = c;
-        c = (oend - op) >> 6;
-        if (c < k) k = c;
-        if (k <= 0)
-            break;
-        do {
-            uint32_t e = tokens[*tok];
-            uintptr_t off = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
-            uintptr_t nb = (e >> 16) & 0xFF;   /* 2 or 0 */
-            if (__builtin_expect(e > 0xFFFFFF, 0))
-                goto escape;
-            tok++;
-            copy16(op, lit);
-            op += e & 0xFF;
-            lit += e & 0xFF;
-            offp += nb;
-            off = nb ? off : rep;
-            rep = off;
-            if (__builtin_expect(off > (uintptr_t)(op - dst), 0))
-                return -1;
-            if (__builtin_expect(off >= 16, 1)) {
-                const uint8_t *m = op - off;
-                copy16(op, m);
-                copy16(op + 16, m + 16);
-                op += (e >> 8) & 0xFF;
-            } else
-                op = copy_short(op, off, (e >> 8) & 0xFF);
-        } while (--k);
-        continue;
-escape:
-        {
-            /* extended field(s): read through m, so giving up leaves
-               everything at the token, nothing written yet */
-            uint32_t e = tokens[*tok];
-            const uint8_t *m = tok + 1;
-            intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
-            uintptr_t off = rep;
-            if (e & TOK4_LLEXT) {
-                do {
-                    if (m >= tend) { ll = -1; break; }
-                    ll += *m++;
-                } while (m[-1] == 255);
-            }
-            if ((e & TOK4_MLEXT) && ll >= 0) {
-                do {
-                    if (m >= tend) { ll = -1; break; }
-                    ml += *m++;
-                } while (m[-1] == 255);
-            }
-            /* room for the wide copies: 16 literal bytes past the run, 64
-               output bytes past the sequence */
-            if (ll < 0 || ll > lend - lit - 16 || ll + ml > oend - op - 64)
-                break;   /* the checked loop does this sequence exactly */
-            if (e & 0xFF0000) {
-                /* k > 0: the offset stream has these 2 bytes */
-                off = (uintptr_t)(offp[0] | (uint32_t)offp[1] << 8) + 1;
-                offp += 2;
-            }
-            tok = m;
-            do {
-                copy16(op, lit);
-                op += 16;
-                lit += 16;
-                ll -= 16;
-            } while (ll > 0);
-            op += ll;
-            lit += ll;
-            rep = off;
-            if (off > (uintptr_t)(op - dst))
-                return -1;
-            if (off >= 16) {
-                const uint8_t *s = op - off;
-                do {
-                    copy16(op, s);
-                    op += 16;
-                    s += 16;
-                    ml -= 16;
-                } while (ml > 0);
-                op += ml;
-            } else
-                op = copy_short(op, off, ml);
-        }
-    }
-    /* DecodeSeqs4 in sylz.pas */
-    while (tok < tend) {
+    while (tok < tend && !(toOffset && offp != st->offs0)) {
         uint32_t e = tokens[*tok++];
         intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
         if (e & TOK4_LLEXT) {
@@ -528,15 +462,29 @@ escape:
         }
         if (ll > lend - lit || ll > oend - op)
             return -1;
-        for (intptr_t i = 0; i < ll; i++)
-            op[i] = lit[i];
+        /* in wide steps where there is room past the run or the match:
+           a block can open with megabytes of literals, or of one byte
+           repeated at the first distance, before it reads an offset */
+        if (ll <= lend - lit - 16 && ll <= oend - op - 16)
+            for (intptr_t i = 0; i < ll; i += 16)
+                copy16(op + i, lit + i);
+        else
+            for (intptr_t i = 0; i < ll; i++)
+                op[i] = lit[i];
         op += ll;
         lit += ll;
         if ((intptr_t)rep > op - dst || ml > oend - op)
             return -1;
         const uint8_t *m = op - rep;
-        while (ml-- > 0)
-            *op++ = *m++;
+        if (ml > oend - op - 16)
+            while (ml-- > 0)
+                *op++ = *m++;
+        else if (rep >= 16) {
+            for (intptr_t i = 0; i < ml; i += 16)
+                copy16(op + i, m + i);
+            op += ml;
+        } else
+            op = copy_short(op, rep, ml);
     }
     st->tok = tok;
     st->offp = offp;
@@ -544,6 +492,160 @@ escape:
     st->op = op;
     st->rep = (intptr_t)rep;
     return 0;
+}
+
+/* One chunk of format v4's sequences (DecodeChunk4 in sylz.pas): 0, or
+   -1 on corrupt input.
+
+   The fast loop: a sequence with an exact code takes one token, at most
+   2 offset bytes and 16 literals, and writes inside 64 bytes of output
+   (16 literal bytes, then 32 match bytes after at most 16 literals), so
+   k = min(tokens, offset bytes / 2, literals / 16, output / 64) of them
+   need no bounds check: the inner loop counts k down. Once the block has
+   read an offset (decode4_seqs does the sequences before that), the
+   previous distance is the offset before the next one in the stream: a
+   token advances the stream by the bytes it takes and reads the two
+   before it, with nothing to choose. One test sends a token off the
+   straight path: a distance under 16, or, in the block's first
+   SYLZ_MAXDIST bytes, any distance (`far` is 0 there), since only then
+   can one reach before the output's start. The output is fetched 512
+   bytes ahead: its lines are new to the cache, and the stores wait for
+   them otherwise. An escape is checked on its own, then k is counted
+   again. What is left when k = 0 goes through the exact, fully checked
+   loop. */
+DECODER_INLINE intptr_t decode4_core(sylzc_d4 *st)
+{
+    if (st->offp == st->offs0 && decode4_seqs(st, 1) < 0)
+        return -1;
+
+    const uint32_t *tokens = st->tokens;
+    const uint8_t *tok = st->tok, *tend = st->tend;
+    const uint8_t *offp = st->offp, *offend = st->offend;
+    const uint8_t *lit = st->lit, *lend = st->lend;
+    uint8_t *op = st->op, *oend = st->oend, *dst = st->dst;
+    uintptr_t rep = (uintptr_t)st->rep;
+
+    for (;;) {
+        intptr_t k = tend - tok, c;
+        c = (offend - offp) >> 1;
+        if (c < k) k = c;
+        c = (lend - lit) >> 4;
+        if (c < k) k = c;
+        c = (oend - op) >> 6;
+        if (c < k) k = c;
+        if (k <= 0)
+            break;
+        uintptr_t far = MAXDIST;
+        if (op - dst < MAXDIST) {
+            /* a few sequences, then count again */
+            far = 0;
+            if (k > 16) k = 16;
+        }
+        do {
+            uint32_t e = tokens[*tok];
+            if (__builtin_expect(e > 0xFFFFFF, 0))
+                goto escape;
+            tok++;
+            copy16(op, lit);
+            op += e & 0xFF;
+            lit += e & 0xFF;
+            offp += (e >> 16) & 0xFF;   /* 2 or 0 */
+            rep = (uintptr_t)read16(offp - 2) + 1;
+            const uint8_t *m = op - rep;
+            if (__builtin_expect(rep - 16 >= far, 0)) {
+                if (rep > (uintptr_t)(op - dst))
+                    return -1;
+                if (rep < 16) {
+                    copy_short32(op, rep, (e >> 8) & 0xFF);
+                    goto matched;
+                }
+            }
+            copy16(op, m);
+            copy16(op + 16, m + 16);
+matched:
+            op += (e >> 8) & 0xFF;
+            PREFETCH(op);
+        } while (--k);
+        continue;
+escape:
+        {
+            /* extended field(s): read through m, so giving up leaves
+               everything at the token, nothing written yet */
+            uint32_t e = tokens[*tok];
+            const uint8_t *m = tok + 1;
+            intptr_t ll = e & 0xFF, ml = (e >> 8) & 0xFF;
+            uintptr_t off = rep;
+            if (e & TOK4_LLEXT) {
+                do {
+                    if (m >= tend) { ll = -1; break; }
+                    ll += *m++;
+                } while (m[-1] == 255);
+            }
+            if ((e & TOK4_MLEXT) && ll >= 0) {
+                do {
+                    if (m >= tend) { ll = -1; break; }
+                    ml += *m++;
+                } while (m[-1] == 255);
+            }
+            /* room for the wide copies: 16 literal bytes past the run, 128
+               output bytes past the sequence */
+            if (ll < 0 || ll > lend - lit - 16 || ll + ml > oend - op - 128)
+                break;   /* the checked loop does this sequence exactly */
+            if (e & 0xFF0000) {
+                /* k > 0: the offset stream has these 2 bytes */
+                off = (uintptr_t)read16(offp) + 1;
+                offp += 2;
+            }
+            tok = m;
+            if (__builtin_expect(lend - lit >= 128, 1)) {
+                /* 128 bytes with no test on the run's length: most runs
+                   end in them, and a loop's exit would be mispredicted
+                   for nearly every run */
+                intptr_t i;
+                for (i = 0; i < 128; i += 16)
+                    copy16(op + i, lit + i);
+                /* past the run only its 16 bytes of room are there */
+                for (; i + 16 < ll; i += 32) {
+                    copy16(op + i, lit + i);
+                    copy16(op + i + 16, lit + i + 16);
+                    PREFETCH(op + i);
+                }
+                if (i < ll)
+                    copy16(op + i, lit + i);
+            } else {
+                for (intptr_t i = 0; i < ll; i += 16)
+                    copy16(op + i, lit + i);
+            }
+            op += ll;
+            lit += ll;
+            rep = off;
+            if (off > (uintptr_t)(op - dst))
+                return -1;
+            if (off >= 16) {
+                const uint8_t *s = op - off;
+                copy16(op, s);
+                copy16(op + 16, s + 16);
+                if (ml > 32) {
+                    /* the same for a match: 128 bytes in all, then a loop */
+                    for (int i = 32; i < 128; i += 16)
+                        copy16(op + i, s + i);
+                    for (intptr_t i = 128; i < ml; i += 32) {
+                        copy16(op + i, s + i);
+                        copy16(op + i + 16, s + i + 16);
+                        PREFETCH(op + i);
+                    }
+                }
+                op += ml;
+            } else
+                op = copy_short(op, off, ml);
+        }
+    }
+    st->tok = tok;
+    st->offp = offp;
+    st->lit = lit;
+    st->op = op;
+    st->rep = (intptr_t)rep;
+    return decode4_seqs(st, 0);
 }
 
 #if defined(__i386__) && !defined(SYLZC_NO_SSE2)
