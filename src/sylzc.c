@@ -587,6 +587,7 @@ intptr_t sylzc_decode4(sylzc_d4 *st)
 #define ESC_BOTH  255
 #define MINREP    2      /* v4: shortest match at the previous offset */
 
+static uint16_t read16(const uint8_t *p) { uint16_t v; __builtin_memcpy(&v, p, 2); return v; }
 static uint32_t read32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
 static uint64_t read64(const uint8_t *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
 
@@ -2252,7 +2253,6 @@ typedef struct {
     intptr_t before;              /* input bytes before the window */
     const int32_t *mtab;          /* [kind][row][length] */
     const struct sylzc_codes4 *codes;
-    int32_t *reps;                /* each node's previous distance */
 } sylzc_dp4args;
 
 /* LitStep4 in sylz.pas */
@@ -2301,31 +2301,33 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
 void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
                    const int32_t *off, const int32_t *cnt, const sylzc_dp4args *a)
 {
-    int32_t *reps = a->reps;
     const uint8_t *wsrc = a->wsrc;
+    const int32_t minRep = a->minRep;
     for (int32_t i = 0; i < w; i++) {
         int32_t k = cnt[i];
         if (k < 0)
             continue;
         int32_t cost = nodes[i].cost;
         int32_t ll = nodes[i].ll;
-        int32_t r = reps[i];
+        int32_t r = nodes[i].dist;
         int32_t tc = cost + a->litPrice[wsrc[i]] + lit_step4(ll, a);
         if (tc < nodes[i + 1].cost) {
             nodes[i + 1].cost = tc;
             nodes[i + 1].ll = ll + 1;
             nodes[i + 1].ml = 0;
-            reps[i + 1] = r;
+            nodes[i + 1].dist = r;
         }
         int32_t row = ll <= MAX_LL4 ? ll : ll <= LIT_SPLIT4 ? ll - MAX_LL4 : OPT4_ROW_LONG;
         const int32_t *rowN = a->mtab + row * OPT4_COLS;
         const int32_t *rowR = rowN + OPT4_ROWS * OPT4_COLS;
-        /* the previous distance */
-        if (r <= a->before + i) {
-            int32_t rl = (int32_t)count_match(wsrc + i, wsrc + i - r, wsrc + w);
-            if (rl >= a->minRep) {
+        /* the previous distance: its first bytes, then the count */
+        if (r <= a->before + i
+            && (minRep >= 4 ? read32(wsrc + i) == read32(wsrc + i - r)
+                            : read16(wsrc + i) == read16(wsrc + i - r))) {
+            int32_t rl = (int32_t)count_match_inl(wsrc + i, wsrc + i - r, wsrc + w);
+            if (rl >= minRep) {
                 int32_t base = cost + (r < 16 ? a->shortOff : 0);
-                int32_t ml = a->minRep - 1;
+                int32_t ml = minRep - 1;
                 while (ml < rl) {
                     if (ml < a->subLen)
                         ml++;
@@ -2341,7 +2343,6 @@ void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
                         nodes[j].ll = 0;
                         nodes[j].ml = ml;
                         nodes[j].dist = r;
-                        reps[j] = r;
                     }
                 }
             }
@@ -2375,7 +2376,6 @@ void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
                     nodes[j].ll = 0;
                     nodes[j].ml = ml;
                     nodes[j].dist = dist;
-                    reps[j] = dist;
                 }
             }
             prevLen = len;

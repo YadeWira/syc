@@ -3881,6 +3881,7 @@ const
   OPT_WINDOW  = 4096;
   OPT_MAXCAND = 64;
   OPT_NOSKIP  = High(Int32);
+  OPT_FORCED_KEEP4 = 64;   { see CompressOptCore }
 
 type
   TSylzOptParams = record
@@ -3917,7 +3918,8 @@ type
     cost: Int32;    { in bits, relative to the window's start }
     ll: Int32;      { pending literals at this node }
     ml: Int32;      { 0: reached by a literal, else by a match of ml bytes }
-    dist: Int32;
+    dist: Int32;    { the match's distance; format v4: of the path's last
+                      match, whatever reached the node }
   end;
   POptNode = ^TOptNode;
 
@@ -3928,7 +3930,7 @@ const
   OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
   OPT_INDEX_BYTES = (OPT_WINDOW + 1) * SizeOf(Int32);   { off, cnt }
   OPT_WORK_BYTES  = OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES
-                    + 3 * OPT_INDEX_BYTES;   { off, cnt; format v4: each node's offset }
+                    + 2 * OPT_INDEX_BYTES;   { off, cnt }
 
 { The optimal parser's match finder: a binary tree (LZMA's bt4 without
   its 2- and 3-byte hashes). Every position is inserted into a binary
@@ -4409,7 +4411,6 @@ type
     before: SizeInt;            { input bytes before the window }
     mtab: PInt32;               { mtab4 }
     codes: Pointer;             { Codes4 }
-    reps: PInt32;               { each node's previous distance; reps[0] set }
   end;
   POptDp4Args = ^TOptDp4Args;
 
@@ -4487,10 +4488,11 @@ begin
     Result := OPT4_NEVER;   { an extended run and 2 or 3 bytes: SylzBound }
 end;
 
-{ OptDpPas for format v4. Each node also carries the distance of the last
-  match on its path (a.reps), which a match can take again for a token
-  and no offset bytes: tried first at every position, every length from
-  a.minRep. }
+{ OptDpPas for format v4. Each node carries the distance of the last
+  match on its path (its dist, nodes[0]'s set by the caller), which a
+  match can take again for a token and no offset bytes: tried first at
+  every position, every length from a.minRep. Its first bytes are
+  compared before the match is counted: most positions have none. }
 procedure OptDp4Pas(nodes: POptNode; w: SizeInt; cands, off, cnt: PInt32;
   const a: TOptDp4Args);
 var
@@ -4505,20 +4507,22 @@ begin
       Continue;
     cost := nodes[i].cost;
     ll := nodes[i].ll;
-    r := a.reps[i];
+    r := nodes[i].dist;
     tc := cost + a.litPrice[a.wsrc[i]] + LitStep4(ll, a);
     if tc < nodes[i + 1].cost then
     begin
       nodes[i + 1].cost := tc;
       nodes[i + 1].ll := Int32(ll + 1);
       nodes[i + 1].ml := 0;
-      a.reps[i + 1] := Int32(r);
+      nodes[i + 1].dist := Int32(r);
     end;
     row := Opt4Row(ll);
     rowN := a.mtab + row * OPT4_COLS;
     rowR := rowN + OPT4_ROWS * OPT4_COLS;
     { the previous distance }
-    if r <= a.before + i then
+    if (r <= a.before + i)
+       and (((a.minRep >= 4) and (Read32(a.wsrc + i) = Read32(a.wsrc + i - r)))
+            or ((a.minRep < 4) and (PUInt16(a.wsrc + i)^ = PUInt16(a.wsrc + i - r)^))) then
     begin
       rl := CountMatch(a.wsrc + i, a.wsrc + i - r, a.wsrc + w);
       if rl >= a.minRep then
@@ -4544,7 +4548,6 @@ begin
             nodes[j].ll := 0;
             nodes[j].ml := Int32(ml);
             nodes[j].dist := Int32(r);
-            a.reps[j] := Int32(r);
           end;
         end;
       end;
@@ -4585,7 +4588,6 @@ begin
           nodes[j].ll := 0;
           nodes[j].ml := Int32(ml);
           nodes[j].dist := Int32(dist);
-          a.reps[j] := Int32(dist);
         end;
       end;
       prevLen := len;
@@ -4697,7 +4699,6 @@ begin
     a4.codes := @e.codes;
     mtabGen := 0;
     a4.mtab := @mtab4[0, 0, 0];
-    a4.reps := cnt + (OPT_WINDOW + 1);
     for k := 0 to 1 do
       for i := 0 to OPT4_ROWS - 1 do
         for j := 0 to OPT4_COLS - 1 do
@@ -4810,7 +4811,7 @@ begin
         a4.wsrc := a.wsrc;
         a4.litPrice := a.litPrice;
         a4.before := start;
-        a4.reps[0] := Int32(lastDist);
+        nodes[0].dist := Int32(lastDist);
 {$ifdef SYLZ_C}
         if SylzUseAsm then
           sylzc_opt_dp4(nodes, Int32(w), cands, off, cnt, @a4)
@@ -4860,6 +4861,13 @@ begin
         lastDist := forcedDist;
         anchor := pos + forcedLen;
         start := anchor;
+        { format v4: of a match taken as is, only the last positions go
+          into the tree. Each one inside it costs a walk and a long
+          compare, and what they would find later the match's source
+          mostly has too (level 9: silesia.tar -6% cycles for +0.05
+          points, the mixed corpus -11% for +0.01) }
+        if e.v4 and (anchor - OPT_FORCED_KEEP4 > b.nextToInsert) then
+          b.nextToInsert := anchor - OPT_FORCED_KEEP4;
       end
       else
         start := start + w;
