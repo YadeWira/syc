@@ -149,6 +149,28 @@ How it got there, each step measured on silesia.tar and the mixed corpus
   both corpora; speed is not: v4 compresses 11-19% slower at levels
   0-3 and decodes within -9..+9% of v2; v5 decodes up to 14% slower
   than v3 on silesia.tar. So "better in everything" is not met yet.
+- **Decoder, second round** (2026-11-13, CPU 24, decode only, best of
+  3 x 1 s, the same blocks for both builds). Once the block has read an
+  offset, the previous distance is the offset before the next one in the
+  stream, so the counted loop reads it from there instead of selecting
+  and keeping it (assembler: 20 instructions a sequence); once the
+  output is SYLZ_MAXDIST long, no distance needs a check. Distances under
+  16 with no loop (the period spread by a multiplication, TShort4),
+  escapes that copy 128 bytes before any length test, the output
+  prefetched 512 bytes ahead. v4 against v2, levels 0-10: assembler
+  silesia.tar +19..+34%, mixed.tar +7..+17% (before: -0..+11%, -3..+4%);
+  C silesia +19..+31%, mixed +8..+15% (before: +2..+11%, -3..+5%). v5
+  shares the loop: against v3 +13..+14% silesia, +3..+5% mixed (levels
+  1, 3, 6, 9; the rest is v3's Huffman decoder). Pascal (SYLZ_NOASM=1):
+  silesia +1..+12%, mixed -6..+3% against v2's Pascal decoder (before:
+  -18..-38%); FPC kept the escape loops' counts on the stack until they
+  moved to a procedure of their own (CopyWide16). Tried and dropped
+  (wall clock, within noise or worse): `rep movsb` for literal runs over
+  256 / 2048 bytes (mixed -2..-4%), 64-byte steps in the long loops,
+  the C escape's 128-byte copies written out (+1-2%), prefetch 256 /
+  1024 / 2048 bytes ahead or with prefetchw, offsets stored complemented
+  (a format change that saves the loop a `not`: -2..+1% cycles). The
+  machine was shared and busy: +-5%.
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
