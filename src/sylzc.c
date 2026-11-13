@@ -1273,9 +1273,15 @@ typedef struct {
    made for levels 2 and 3, the level's parameters (a shift by a variable
    takes three operations on x86 without BMI2, and the fields of st would
    be read again after each byte stored) */
-/* v4's levels 2-3 inline the match count: a call there makes the loop
-   keep fewer of its variables in registers */
+/* v4's levels 2-3 inline the match count on 64-bit targets: a call
+   there makes the loop keep fewer of its variables in registers (on
+   win32, mingw would then call libgcc's __ctzdi2, which FPC does not
+   link) */
+#if UINTPTR_MAX > 0xFFFFFFFF
 #define MID_COUNT(a, b, l) (v4 ? count_match_inl(a, b, l) : count_match(a, b, l))
+#else
+#define MID_COUNT(a, b, l) count_match(a, b, l)
+#endif
 
 static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st, const int v4,
     const int hashLog, const intptr_t lazy, const intptr_t skip, const intptr_t lazyEnough,
