@@ -633,6 +633,8 @@ static intptr_t fast_dist(intptr_t pos, uint16_t stored)
     return d ? d : 65536;
 }
 
+struct sylzc_codes4;
+
 /* The encoder's output streams (TEmit's write pointers). */
 typedef struct {
     uint8_t *ctrl, *lit;          /* control and literal write pointers */
@@ -642,6 +644,8 @@ typedef struct {
     uint16_t *rec, *recEnd;       /* v4: where the next sequence is recorded */
     void (*flush)(void *);        /* v4: called with this struct when rec == recEnd */
     void *owner;                  /* v4: sylz.pas's TEmit */
+    uint8_t *off;                 /* v4, tokens written at once: the offset write pointer */
+    const struct sylzc_codes4 *codes4;   /* and SYLZ_TOKENS4's codes */
 } sylzc_emit;
 
 /* TCodes4 in sylz.pas: the codes of a format v4 token table (the
@@ -836,6 +840,35 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
     } else
         p = put_pair4(t, p, k, ll, ml);
     return p;
+}
+
+/* EmitDirect4 in sylz.pas without its room check, for a loop that keeps
+   the token, offset and literal write pointers in registers; k: the
+   distance is the previous sequence's */
+static inline __attribute__((always_inline)) void emit_direct4(const struct sylzc_codes4 *t,
+    const uint8_t *srcEnd, uint8_t **ptok, uint8_t **poff, uint8_t **plit,
+    const uint8_t *lit, intptr_t litLen, intptr_t dist, int k, intptr_t matchLen)
+{
+    uint8_t *p = *ptok, *off = *poff, *w = *plit;
+    int code = 255;
+    if (litLen <= MAX_LL4 && matchLen <= MAX_ML4)
+        code = t->exact[k][litLen][matchLen];
+    if (__builtin_expect(code != 255, 1))
+        *p++ = (uint8_t)code;
+    else
+        p = put_tokens4(t, p, k, litLen, matchLen);
+    *ptok = p;
+    /* written either way (the buffer has the room), kept if the sequence
+       takes it */
+    off[0] = (uint8_t)(dist - 1);
+    off[1] = (uint8_t)((dist - 1) >> 8);
+    *poff = off + 2 - 2 * k;
+    if (__builtin_expect(litLen <= 16 && srcEnd - lit >= 16, 1))
+        copy16(w, lit);
+    else
+        for (intptr_t i = 0; i < litLen; i++)
+            w[i] = lit[i];
+    *plit = w + litLen;
 }
 
 /* TPut4C in sylz.pas */
@@ -1091,8 +1124,7 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
     uint16_t *tl = st->tl, *ts = st->ts;
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
-    uint16_t *rec = e.rec;   /* v4: emit_fast4's pointers */
-    uint8_t *wlit = e.lit;
+    uint8_t *tok = e.ctrl, *woff = e.off, *wlit = e.lit;   /* v4: emit_direct4's pointers */
     intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit, rep = 1;
 
     if (n < 12 + 1)
@@ -1114,7 +1146,8 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
         else {
             dist = mid_cand(ts, mid_hash_short(src + pos, hashLog), src, pos);
-            if (dist == 0) {
+            /* v4: with no literals pending the short table's match must be 5 bytes */
+            if (dist == 0 || (v4 && pos == anchor && src[pos + 4] != src[pos + 4 - dist])) {
                 pos += 1 + ((pos - anchor) >> st->skip);
                 continue;
             }
@@ -1155,8 +1188,14 @@ found:
             pos--;
             len++;
         }
+        /* v4: after more than MAX_LL4 literals 4 bytes at a new offset are not taken */
+        if (v4 && len == MINMATCH && dist != rep && pos - anchor > MAX_LL4) {
+            pos += 1 + ((pos - anchor) >> st->skip);
+            continue;
+        }
         if (v4)
-            emit_fast4(&e, &rec, &wlit, src + anchor, pos - anchor, dist, len);
+            emit_direct4(e.codes4, e.srcEnd, &tok, &woff, &wlit, src + anchor, pos - anchor,
+                         dist, dist == rep, len);
         else
             emit_sequence(&e, src + anchor, pos - anchor, dist, len);
         rep = dist;
@@ -1172,7 +1211,8 @@ found:
     }
 done:
     if (v4) {
-        e.rec = rec;
+        e.ctrl = tok;
+        e.off = woff;
         e.lit = wlit;
         e.rep = rep;
     }
