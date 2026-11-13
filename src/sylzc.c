@@ -1295,8 +1295,7 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
         else {
             dist = mid_cand(ts, mid_hash_short(src + pos, hashLog), src, pos);
-            /* v4: with no literals pending the short table's match must be 5 bytes */
-            if (dist == 0 || (v4 && pos == anchor && src[pos + 4] != src[pos + 4 - dist])) {
+            if (dist == 0) {
                 pos += 1 + ((pos - anchor) >> st->skip);
                 continue;
             }
@@ -1336,11 +1335,6 @@ found:
         while (pos > anchor && pos > dist && src[pos - 1] == src[pos - 1 - dist]) {
             pos--;
             len++;
-        }
-        /* v4: after more than MAX_LL4 literals 4 bytes at a new offset are not taken */
-        if (v4 && len == MINMATCH && dist != rep && pos - anchor > MAX_LL4) {
-            pos += 1 + ((pos - anchor) >> st->skip);
-            continue;
         }
         if (v4)
             emit_open4(&e, &rec, &tok, &woff, &wlit, src + anchor, pos - anchor, dist, len, rep);

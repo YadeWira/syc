@@ -3079,12 +3079,6 @@ begin
       else
       begin
         dist := MidCand(ts, MidHashShort(src + pos, hashLog), src, pos);
-        { format v4: right after a match (no literals pending) 4 bytes at
-          a new offset save one byte and cost the decoder a sequence; the
-          short table's candidate must match 5 there }
-        if (dist > 0) and e.v4 and (pos = anchor)
-           and (src[pos + 4] <> src[pos + 4 - dist]) then
-          dist := 0;
         if dist = 0 then
         begin
           Inc(pos, 1 + (pos - anchor) shr MID_SKIP);
@@ -3137,14 +3131,6 @@ begin
       begin
         Dec(pos);
         Inc(len);
-      end;
-      { format v4: after more than MAX_LL4 literals 4 bytes at a new offset
-        save no byte (the run takes a token of its own, or an extension)
-        and cost the decoder a sequence, often an escape: not taken }
-      if e.v4 and (len = SYLZ_MINMATCH) and (dist <> rep) and (pos - anchor > MAX_LL4) then
-      begin
-        Inc(pos, 1 + (pos - anchor) shr MID_SKIP);
-        Continue;
       end;
       if not EmitSequence(e, src + anchor, pos - anchor, dist, len) then
         Exit(-1);
@@ -3603,14 +3589,15 @@ end;
 
 type
   { In/out state of format v4's assembler compressor of levels 2-3; fixed
-    field order. With more = 1 it stopped at a sequence it leaves to
-    PutTokens4 (over MAX_LL4 literals, or a match over ML_SPLIT4): ip -
-    anchor literals, a match of mlen, k; its offset is written. The caller
-    writes the tokens at tok and calls again. }
+    field order. It writes each sequence at tok: a record (EmitSequence4),
+    or with direct = 1 its tokens and offset (EmitDirect4). With more = 1
+    it stopped at a sequence (ip - anchor literals, a match of mlen at
+    dist) because tok reached outEnd: the caller turns the chunk and calls
+    again. }
   TMid4EncState = record
     src, iend, mflimit: PByte;   {   0,   8,  16: in }
     tl, ts: PUInt16;             {  24,  32: in, long and short tables }
-    tok: PByte;                  {  40: in/out, token write pointer }
+    tok: PByte;                  {  40: in/out, token or record write pointer }
     lit: PByte;                  {  48: in/out }
     anchor: PByte;               {  56: in/out (first: src) }
     off: PByte;                  {  64: in/out, offset write pointer }
@@ -3621,8 +3608,9 @@ type
     mlen, k: SizeInt;            { 104, 112: out, with more }
     more: SizeInt;               { 120: in/out (first: 0) }
     codes: Pointer;              { 128: in, the table's TCodes4 }
-    tokEnd: PByte;               { 136: in, the open chunk's end (nil: records) }
-    dist: SizeInt;               { 144: out, with more = 2 }
+    outEnd: PByte;               { 136: in, where the records or the open chunk end }
+    dist: SizeInt;               { 144: out, with more }
+    direct: SizeInt;             { 152: in, tokens at tok (1) or records (0) }
   end;
   PMid4EncState = ^TMid4EncState;
 
@@ -3674,10 +3662,12 @@ asm
 {$else}
   mov rax, rdi
 {$endif}
-  sub rsp, 96
+  sub rsp, 112
   mov [rsp + 24], rax             { state }
   mov rdx, [rax + 136]
-  mov [rsp + 80], rdx             { the open chunk's end, or 0: records }
+  mov [rsp + 80], rdx             { where the records or the open chunk end }
+  mov rdx, [rax + 152]
+  mov [rsp + 96], rdx             { tokens (1) or records (0) }
   mov rdx, [rax + 16]
   mov [rsp], rdx                  { mflimit }
   mov rdx, 889523592379
@@ -3703,21 +3693,15 @@ asm
   mov r8, [rax + 88]              { ip }
   cmp qword ptr [rax + 120], 0
   je @first
-  cmp qword ptr [rax + 120], 2
-  je @resumed
-  mov rbp, [rax + 104]            { back with a sequence's tokens written }
+
+@resumed:
+  { back after a turn: the sequence it stopped at (ip, mlen, dist) }
+  mov rbp, [rax + 104]
+  mov rdi, [rax + 144]
   lea rax, [r8 + rbp]
   mov rbx, r8
   sub rbx, r9
-  jmp @litLong
-
-@resumed:
-  { back with the sequence (ip, mlen) recorded or written, its literals
-    copied: the tables, then on }
-  mov rbp, [rax + 104]
-  lea rax, [r8 + rbp]
-  xor ebx, ebx
-  jmp @litDone
+  jmp @emitGo
 
 @first:
   { position 0: only the previous distance (1), one byte on }
@@ -3759,11 +3743,8 @@ asm
   movzx eax, word ptr [r12 + rdx * 2]
   mov [r12 + rdx * 2], r8w
   sub ax, r8w
-  { here the short table's match must be 5 bytes }
-  mov rdx, [r8 + rax - 65536]
-  xor rdx, rbp
-  shl rdx, 24
-  jz @shortHit
+  cmp ebp, [r8 + rax - 65536]
+  je @shortHit
 @miss:
   add r8, 1
   cmp r8, [rsp + 64]
@@ -4049,12 +4030,13 @@ asm
   lea rax, [r8 + rbp]             { match end, kept to the end of the emit }
   mov rbx, r8
   sub rbx, r9                     { literal length }
-  cmp rbx, MAX_LL4
-  ja @manyLits
-@emitOff:
-  { records (the limit 0), or the open chunk full: the caller's }
+  { the records or the open chunk full: the caller turns it, then back
+    here }
   cmp r14, [rsp + 80]
-  jae @record
+  jae @full
+@emitGo:
+  cmp qword ptr [rsp + 96], 0
+  je @recordIt
   { the offset, distance - 1: written either way, kept (the pointer
     moves on) if the distance is not the previous one }
   mov rdx, [rsp + 16]
@@ -4117,50 +4099,6 @@ asm
   mov r8, rax
   mov r9, rax
   jmp @loop
-
-@manyLits:
-  { over MAX_LL4 literals: 4 bytes at a new distance are not taken (the
-    match was not extended backwards, so ip is where it was found) }
-  cmp rbp, SYLZ_MINMATCH
-  jne @emitOff
-  cmp rdi, [rsp + 48]
-  je @emitOff
-  mov rbx, [rsp + 48]
-  neg rbx
-  add r8, 1
-  cmp r8, [rsp + 64]
-  jae @far
-  mov rax, r8
-  sub rax, r10
-  cmp rax, 65536
-  jae @probe
-  { the look one byte on (level 2's long table, level 3's both) put ip
-    itself in the tables: an entry equal to ip's low 16 bits is a distance
-    of 65536, before src here, so no candidate (MidCand's dist > pos) }
-  mov rbp, [r8]
-  mov edx, [r8 + rbx + 1]
-  cmp edx, [r8 + 1]
-  je @repHit
-  mov rdx, rbp
-  shl rdx, 16
-  imul rdx, [rsp + 8]
-  shr rdx, cl
-  movzx eax, word ptr [r11 + rdx * 2]
-  mov [r11 + rdx * 2], r8w
-  sub ax, r8w
-  jz @mlShort
-  cmp ebp, [r8 + rax - 65536]
-  je @longHit
-@mlShort:
-  imul edx, ebp, -1640531535
-  shr edx, cl
-  movzx eax, word ptr [r12 + rdx * 2]
-  mov [r12 + rdx * 2], r8w
-  sub ax, r8w
-  jz @miss
-  cmp ebp, [r8 + rax - 65536]
-  jne @miss
-  jmp @shortHit
 
 @litLong:
   { any number of literals, 16 bytes at a time }
@@ -4230,9 +4168,29 @@ asm
   add r14, 2
   jmp @tokDone
 
-@record:
-  { the sequence (ip, mlen, distance) is the caller's to record, or to
-    write after it closes the full chunk; nothing written }
+@recordIt:
+  { the record, as EmitSequence4 writes it: literals, match length,
+    distance - 1; then the literals }
+  mov [rsp + 48], rdi             { the previous distance from here on }
+  lea edx, [rdi - 1]
+  mov [r14 + 4], dx
+  cmp rbx, REC4_ESC
+  jae @recLong
+  cmp rbp, $FFFF
+  ja @recLong
+  mov [r14], bx
+  mov [r14 + 2], bp
+  add r14, 6
+  jmp @litLong
+@recLong:
+  mov word ptr [r14], REC4_ESC    { the lengths as two u32 after it }
+  mov word ptr [r14 + 2], 0
+  mov [r14 + 6], ebx
+  mov [r14 + 10], ebp
+  add r14, 18
+  jmp @litLong
+
+@full:
   mov rax, [rsp + 24]
   mov [rax + 88], r8
   mov [rax + 104], rbp
@@ -4241,13 +4199,47 @@ asm
   jmp @out
 
 @tokOut:
-  { PutTokens4's other cases: the caller's }
-  mov rax, [rsp + 24]
-  mov [rax + 88], r8
-  mov [rax + 104], rbp
-  mov [rax + 112], rsi
-  mov qword ptr [rax + 120], 1
-  jmp @out
+  { PutTokens4's other cases, in Pascal: rbx literals, rbp match, esi k;
+    with the registers it may change and the loop needs saved (rbp is
+    free after this) }
+  push rax
+  push rcx
+  push r8
+  push r9
+  push r10
+  push r11
+  mov rdx, [rsp + 48 + 56]        { the codes }
+{$ifdef WIN64}
+  mov r9, rbx                     { ll }
+  mov r8, rsi                     { k }
+  mov rcx, rdx                    { codes }
+  mov rdx, r14                    { p }
+  mov rax, rbp                    { ml }
+  mov rbp, rsp
+  and rsp, -16
+  sub rsp, 48
+  mov [rsp + 32], rax
+{$else}
+  mov rdi, rdx                    { codes }
+  mov rdx, rsi                    { k }
+  mov rsi, r14                    { p }
+  mov rcx, rbx                    { ll }
+  mov r8, rbp                     { ml }
+  mov rbp, rsp
+  and rsp, -16
+{$endif}
+  call PutTokens4
+  mov rsp, rbp
+  mov r14, rax
+  pop r11
+  pop r10
+  pop r9
+  pop r8
+  pop rcx
+  pop rax
+  cmp rbx, MAX_LL4
+  ja @litLong
+  jmp @tokDone
 @last:
   mov rax, [rsp + 24]
   mov qword ptr [rax + 120], 0
@@ -4259,7 +4251,7 @@ asm
   mov [rax + 40], r14
   mov [rax + 48], r15
   mov [rax + 56], r9
-  add rsp, 96
+  add rsp, 112
 {$ifdef WIN64}
   pop rdi
   pop rsi
@@ -4356,29 +4348,34 @@ begin
     s4.more := 0;
     s4.codes := @e.codes;
     repeat
-      s4.tok := e.ctrl;
+      s4.direct := Ord(e.direct);
       s4.off := e.off;
-      s4.tokEnd := nil;   { records: each sequence comes back (more = 2) }
       if e.direct then
-        s4.tokEnd := e.tokEnd;
+      begin
+        s4.tok := e.ctrl;
+        s4.outEnd := e.tokEnd;
+      end
+      else
+      begin
+        s4.tok := PByte(e.rec);
+        s4.outEnd := PByte(e.recEnd);
+      end;
       s4.lit := e.lit;
       s4.rep := e.rep;
       CompressMid4X64(@s4);
-      e.lit := s4.lit;
-      e.rep := s4.rep;
       if e.direct then
       begin
         e.ctrl := s4.tok;
         e.off := s4.off;
-      end;
+      end
+      else
+        e.rec := PUInt16(s4.tok);
+      e.lit := s4.lit;
+      e.rep := s4.rep;
       if s4.more = 0 then
         Break;
-      if s4.more = 1 then
-        { a sequence that is not one token or a pair: its offset is
-          written }
-        e.ctrl := PutTokens4(e.codes, e.ctrl, s4.k, s4.ip - s4.anchor, s4.mlen)
-      else if not EmitSequence4(e, s4.anchor, s4.ip - s4.anchor, s4.dist, s4.mlen) then
-        Exit(-1);   { a record, or the first sequence after a full chunk }
+      if not TurnChunk4(e) then   { the records or the chunk were full }
+        Exit(-1);
     until False;
     Exit(EmitFinish(e, s4.anchor, src + n - s4.anchor));
   end;
@@ -6196,7 +6193,7 @@ const
   V5_OPT_STATS: TSylzOptParams = (btCut: 2; btMaxLen: 256; sufficient: 16;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
 
-function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+function CompressAny(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer; flags: Integer): SizeInt;
 var
   attempts: Integer;
@@ -6269,6 +6266,22 @@ begin
     if attempts = 0 then
       attempts := HC_ATTEMPTS[level];
     Result := CompressHC(ctx, src, n, dst, cap, attempts);
+  end;
+end;
+
+function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
+  cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+begin
+  Result := CompressAny(ctx, src, n, dst, cap, level, flags);
+  { formats v4 and v5: a block bigger than its input, or one that did not
+    fit cap, goes out as a block with no sequences: its header and the
+    input as the tail literals }
+  if (flags and SYLZ_V4 <> 0) and ((Result < 0) or (Result > HEADER_SIZE + n))
+     and (cap >= HEADER_SIZE + n) then
+  begin
+    PUInt32(dst)^ := HDR_V4;
+    Move(src^, dst[HEADER_SIZE], n);
+    Result := HEADER_SIZE + n;
   end;
 end;
 
