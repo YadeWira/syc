@@ -18,7 +18,7 @@ program sylzedge;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, sylz;
+  SysUtils, sylz, sylzhuf;
 
 const
   MAXN = 300;
@@ -258,9 +258,15 @@ end;
 
 begin
   if GetEnvironmentVariable('SYLZ_NOASM') <> '' then
+  begin
     SylzUseAsm := False;
+    HufUseAsm := False;
+  end;
   if GetEnvironmentVariable('SYLZ_C') <> '' then
+  begin
     SylzPreferC := True;
+    HufPreferC := True;
+  end;
   seed := 1;
   fails := 0;
   cases := 0;

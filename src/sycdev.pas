@@ -838,7 +838,7 @@ end;
 procedure SelfTest;
 var
   text, binary, runs, noise, tiny: TBytes;
-  keep: array[0..6] of Boolean;
+  keep: array[0..7] of Boolean;
   flags: Integer;
   p: Integer;
   paths: TPathSets;
@@ -851,6 +851,7 @@ begin
   keep[4] := CdcUseC;
   keep[5] := CryptoUseC;
   keep[6] := CrcUseC;
+  keep[7] := HufPreferC;
   stPassed := 0;
   stFailed := 0;
   stPrefix := '';
@@ -903,6 +904,7 @@ begin
     CdcUseC := keep[4];
     CryptoUseC := keep[5];
     CrcUseC := keep[6];
+    HufPreferC := keep[7];
     Phase('s: a stream and an archive');
     CommandsCase(text, binary, 300000, 160000);
   finally
@@ -913,6 +915,7 @@ begin
     CdcUseC := keep[4];
     CryptoUseC := keep[5];
     CrcUseC := keep[6];
+    HufPreferC := keep[7];
     stPrefix := '';
   end;
 end;

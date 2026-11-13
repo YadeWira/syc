@@ -83,17 +83,24 @@ function HufDecodeChunk8(src: PByte; srcLen: SizeInt; dst: PByte; n: SizeInt): S
 procedure HufLengths(freq: PUInt32; len: PByte);
 
 var
-  { x86-64: decode with the assembler bulk loop, and in it BMI2's shrx
-    and LZCNT (set at startup from cpuid). Both can be cleared (tests, benchmarks);
-    unused on other targets. }
+  { Decode with the fast bulk loops: the assembler ones on x86-64 (with
+    BMI2's shrx and LZCNT if HufUseBmi2, set at startup from cpuid), the
+    C ones elsewhere; cleared, the Pascal ones. HufPreferC takes the C
+    loops on x86-64 too. All can be changed (tests, benchmarks); with
+    -dSYLZ_PUREPASCAL there are only the Pascal loops. }
   HufUseAsm: Boolean = True;
   HufUseBmi2: Boolean = False;
+  HufPreferC: Boolean = False;
 
 implementation
 
 {$if defined(CPUX86_64) and not defined(SYLZ_PUREPASCAL)}
 {$define HUF_ASM_X64}
 {$asmmode intel}
+{$endif}
+{ the C bulk loops: linked with sylzc.o by sylz.pas, on every target }
+{$ifndef SYLZ_PUREPASCAL}
+{$define HUF_BULK}
 {$endif}
 
 function HufBound(n: SizeInt): SizeInt;
@@ -575,9 +582,10 @@ begin
   Result := (r.p - r.start) * 8 - r.count <= (r.pend - r.start) * 8;
 end;
 
-{$ifdef HUF_ASM_X64}
+{$ifdef HUF_BULK}
 type
-  { In/out state of the assembler bulk decoder; fixed field order. }
+  { In/out state of the bulk decoders (assembler, and C: sylzc_hufbulk in
+    sylzc.c); fixed field order. Offsets on 64-bit targets. }
   THufBulk = record
     buf: array[0..3] of UInt64;   {   0: in/out, the streams' bit buffers }
     cnt: array[0..3] of Int64;    {  32: in/out, valid bits in each }
@@ -589,6 +597,25 @@ type
   end;
   PHufBulk = ^THufBulk;
 
+  { In/out state of the mode 3 bulk decoders (sylzc_hufbulk8 in C);
+    fixed field order. }
+  THufBulk8 = record
+    pos: array[0..7] of UInt64;   {  0: in/out, each stream's next bit, as its address times 8 }
+    table: Pointer;               { 64: in }
+    out0: PByte;                  { 72: in/out, the next output byte }
+    outEnd: PByte;                { 80: in, out0 after the last round to run }
+  end;
+  PHufBulk8 = ^THufBulk8;
+
+{ The bulk loops in C (sylzc.c), with the assembler kernels' contracts
+  (below: HufBulkX64, HufBulk8X64), for where there is no assembler. The
+  Pascal loops are the reference; FPC keeps their streams' state in
+  memory, and on arm64 they made v5 decode 4-12% slower than v3. }
+procedure sylzc_huf_bulk4(st: PHufBulk); cdecl; external name 'sylzc_huf_bulk4';
+procedure sylzc_huf_bulk8(st: PHufBulk8); cdecl; external name 'sylzc_huf_bulk8';
+{$endif}
+
+{$ifdef HUF_ASM_X64}
 { The bulk loop of HufDecodeChunk: rounds of a refill and five symbols per
   stream, until out0 reaches outEnd (at least one round; the caller counts
   how many rounds the input allows: a refill reads 8 bytes at p and moves
@@ -1117,16 +1144,6 @@ asm
   pop r12
   pop rbx
 end;
-
-type
-  { In/out state of the mode 3 bulk decoder; fixed field order. }
-  THufBulk8 = record
-    pos: array[0..7] of UInt64;   {  0: in/out, each stream's next bit, as its address times 8 }
-    table: Pointer;               { 64: in }
-    out0: PByte;                  { 72: in/out, the next output byte }
-    outEnd: PByte;                { 80: in, out0 after the last round to run }
-  end;
-  PHufBulk8 = ^THufBulk8;
 
 { The bulk loop of HufDecodeChunk8: rounds of five symbols from each of
   the eight streams (40 output bytes: symbol j of stream k at out0 + 8j +
@@ -1683,7 +1700,7 @@ var
   c0, c1, c2, c3: SizeInt;
   p0, p1, p2, p3, plimit: PByte;
   d0, d1, d2, d3: PByte;
-{$ifdef HUF_ASM_X64}
+{$ifdef HUF_BULK}
   bulk: THufBulk;
 {$endif}
 begin
@@ -1739,7 +1756,7 @@ begin
   plimit := send - 8;
   i := 0;
   bulkEnd := lastN - 4;
-{$ifdef HUF_ASM_X64}
+{$ifdef HUF_BULK}
   if (lastN >= 5) and HufUseAsm then
   begin
     FillChar(bulk, SizeOf(bulk), 0);
@@ -1762,10 +1779,16 @@ begin
       if used = 0 then
         Break;
       bulk.outEnd := bulk.out0 + 5 * used;
-      if HufUseBmi2 then
+    {$ifdef HUF_ASM_X64}
+      if HufPreferC then
+        sylzc_huf_bulk4(@bulk)
+      else if HufUseBmi2 then
         HufBulkBmi2(@bulk)
       else
         HufBulkX64(@bulk);
+    {$else}
+      sylzc_huf_bulk4(@bulk);
+    {$endif}
       Dec(j, used);
     end;
     i := bulk.out0 - d0;
@@ -1872,7 +1895,7 @@ var
   b: UInt64;
   v: UInt32;
   o: PByte;
-{$ifdef HUF_ASM_X64}
+{$ifdef HUF_BULK}
   bulk: THufBulk8;
 {$endif}
 begin
@@ -1910,7 +1933,7 @@ begin
     below rejects }
   rounds := n div 8 div 5;
   o := dst;
-{$ifdef HUF_ASM_X64}
+{$ifdef HUF_BULK}
   if HufUseAsm then
   begin
     for k := 0 to 7 do
@@ -1931,10 +1954,16 @@ begin
       if used <= 0 then
         Break;
       bulk.outEnd := bulk.out0 + 40 * used;
-      if HufUseBmi2 then
+    {$ifdef HUF_ASM_X64}
+      if HufPreferC then
+        sylzc_huf_bulk8(@bulk)
+      else if HufUseBmi2 then
         HufBulk8Bmi2(@bulk)
       else
         HufBulk8X64(@bulk);
+    {$else}
+      sylzc_huf_bulk8(@bulk);
+    {$endif}
       for k := 0 to 7 do
         pos[k] := SizeInt(bulk.pos[k] - UInt64(SizeUInt(src)) * 8);
       Dec(rounds, used);

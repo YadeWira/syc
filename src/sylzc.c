@@ -1955,6 +1955,251 @@ void sylzc_opt_cands(sylzc_optcands *st)
     st->w = w;
 }
 
+/* ── Huffman bulk loops (sylzhuf.pas) ─────────────────────────────────── */
+
+/* The bulk loops of HufDecodeChunk (v3's four streams) and HufDecodeChunk8
+   (v5's eight), for where there is no x86-64 assembler (arm64, 32-bit x86,
+   macOS). FPC's aarch64 code for the Pascal loops keeps the streams'
+   state in memory, and v5 decoded 4-12% slower than v3 there; here every
+   stream's buffer stays in a register. Same contract as HufBulkX64 and
+   HufBulk8X64: the caller has counted the rounds the input allows, the
+   kernel runs exactly those, and the Pascal tails finish the chunk.
+
+   A table entry (THufTable): the code's length in the low byte, the
+   symbol in the high one. A length is at most HUF_MAXBITS (11), so a
+   shift by the whole entry & 63 is a shift by the length (arm64 and x86
+   shift by the count's low 6 bits anyway, so the mask costs nothing). */
+#define HUF_MASK 2047   /* HUF_TABLESIZE - 1 */
+
+/* THufBulk in sylzhuf.pas: fixed field order (same offsets on 32-bit
+   targets: q falls on 88 either way) */
+typedef struct {
+    uint64_t buf[4];         /* in/out: the streams' bit buffers */
+    int64_t cnt[4];          /* in/out: valid bits in each */
+    const uint8_t *p[4];     /* in/out: the next bytes to load */
+    const uint16_t *table;
+    uint8_t *out0;           /* in/out: stream 0's next output */
+    int64_t q;               /* symbols per stream: the outputs' stride */
+    uint8_t *outEnd;         /* out0 after the last round to run */
+} sylzc_hufbulk;
+
+/* A stream's refill (Giesen's, branch-free): the 8 bytes at p go above
+   the c valid bits, p moves by the whole bytes that fit; 56 or more bits
+   are valid after it, enough for five codes. The bits above c are the
+   stream's next ones, so oring them in again changes nothing. c keeps
+   its count in the low byte only (each symbol subtracts its whole
+   entry: see HUF4_SYM), so the refill takes that byte. */
+#define HUF4_REFILL(b, c, p) do {                     \
+        uint32_t cc_ = (c) & 255;                     \
+        (b) |= read64(p) << cc_;                      \
+        (p) += (63 - cc_) >> 3;                       \
+        (c) = cc_ | 56;                               \
+    } while (0)
+
+/* One symbol: the low byte of c stays exact because the length never
+   borrows from the bits above it (five codes take at most 55 of the 56
+   or more bits a refill leaves, whatever the input). */
+#define HUF4_SYM(b, c, o, j) do {                     \
+        uint32_t v_ = t[(b) & HUF_MASK];              \
+        (o)[j] = (uint8_t)(v_ >> 8);                  \
+        (b) >>= v_ & 63;                              \
+        (c) -= v_;                                    \
+    } while (0)
+
+/* The j-th symbol of every stream: the four chains interleaved, each
+   symbol waiting for its own stream's previous one only. On 64-bit
+   targets the five rows are written out: gcc -O2 kept the loop (a counter
+   and a branch per four symbols). On 32-bit x86 the loop was 4-7% faster
+   (its eight halves of buffers do not fit the registers either way, and
+   the loop is smaller). */
+#define HUF4_ROW(j) do {                              \
+        HUF4_SYM(b0, c0, o0, j);                      \
+        HUF4_SYM(b1, c1, o1, j);                      \
+        HUF4_SYM(b2, c2, o2, j);                      \
+        HUF4_SYM(b3, c3, o3, j);                      \
+    } while (0)
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define HUF4_ROWS() do {                              \
+        HUF4_ROW(0);                                  \
+        HUF4_ROW(1);                                  \
+        HUF4_ROW(2);                                  \
+        HUF4_ROW(3);                                  \
+        HUF4_ROW(4);                                  \
+    } while (0)
+#else
+#define HUF4_ROWS() do {                              \
+        for (int j_ = 0; j_ < 5; j_++)                \
+            HUF4_ROW(j_);                             \
+    } while (0)
+#endif
+
+/* Rounds of a refill and five symbols per stream until out0 reaches
+   outEnd (at least one round). A round reads 8 bytes at each p and moves
+   it by at most 7: the caller's count keeps those reads inside the
+   chunk. */
+void sylzc_huf_bulk4(sylzc_hufbulk *st)
+{
+    const uint16_t *t = st->table;
+    uint64_t b0 = st->buf[0], b1 = st->buf[1], b2 = st->buf[2], b3 = st->buf[3];
+    uint32_t c0 = (uint32_t)st->cnt[0], c1 = (uint32_t)st->cnt[1],
+             c2 = (uint32_t)st->cnt[2], c3 = (uint32_t)st->cnt[3];
+    const uint8_t *p0 = st->p[0], *p1 = st->p[1], *p2 = st->p[2], *p3 = st->p[3];
+    intptr_t q = (intptr_t)st->q;
+    /* one output pointer per stream: four adds a round, where indexing by
+       q, 2q, 3q would take a register each and an add per store on arm64 */
+    uint8_t *o0 = st->out0, *o1 = o0 + q, *o2 = o0 + 2 * q, *o3 = o0 + 3 * q;
+    uint8_t *end = st->outEnd;
+    do {
+        HUF4_REFILL(b0, c0, p0);
+        HUF4_REFILL(b1, c1, p1);
+        HUF4_REFILL(b2, c2, p2);
+        HUF4_REFILL(b3, c3, p3);
+        HUF4_ROWS();
+        o0 += 5;
+        o1 += 5;
+        o2 += 5;
+        o3 += 5;
+    } while (o0 < end);
+    st->buf[0] = b0;
+    st->buf[1] = b1;
+    st->buf[2] = b2;
+    st->buf[3] = b3;
+    st->cnt[0] = c0 & 255;
+    st->cnt[1] = c1 & 255;
+    st->cnt[2] = c2 & 255;
+    st->cnt[3] = c3 & 255;
+    st->p[0] = p0;
+    st->p[1] = p1;
+    st->p[2] = p2;
+    st->p[3] = p3;
+    st->out0 = o0;
+}
+
+/* THufBulk8 in sylzhuf.pas: fixed field order */
+typedef struct {
+    uint64_t pos[8];         /* in/out: each stream's next bit, as its address times 8 */
+    const uint16_t *table;
+    uint8_t *out0;           /* in/out: the next output byte */
+    uint8_t *outEnd;         /* out0 after the last round to run */
+} sylzc_hufbulk8;
+
+
+/* A stream's load at the start of a round: the 8 bytes at its bit
+   position r (from base), shifted so that its next bit is bit 0: 57 bits
+   or more, enough for five codes. On 64-bit targets bit 63 is then set
+   as a mark (it takes the place of a bit no code of the round reaches):
+   it moves down with the bits taken, so at the round's end its leading
+   zeros are the bits the round took, one clz, as HufBulk8X64 does. On
+   32-bit ones a 64-bit clz is two (a branch between them); there the
+   round adds up the entries instead (HUF8_TAKE). */
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define HUF8_MARK ((uint64_t)1 << 63)
+#define HUF8_TAKE(c, v) ((void)(c))
+#define HUF8_TAKEN(b, c) ((uintptr_t)__builtin_clzll(b))
+#else
+#define HUF8_MARK 0
+/* c adds up the whole entries: their low bytes are the lengths, which
+   sum to 55 at most in a round (no carry out of the byte) */
+#define HUF8_TAKE(c, v) ((c) += (v))
+#define HUF8_TAKEN(b, c) ((uintptr_t)((c) & 255))
+#endif
+#define HUF8_LOAD(b, r) ((b) = (read64(base + ((r) >> 3)) >> ((r) & 7)) | HUF8_MARK)
+
+/* One symbol of stream k, the j-th of the round, to o[8j + k] */
+#define HUF8_SYM(b, c, k, j) do {                     \
+        uint32_t v_ = t[(b) & HUF_MASK];              \
+        o[8 * (j) + (k)] = (uint8_t)(v_ >> 8);        \
+        (b) >>= v_ & 63;                              \
+        HUF8_TAKE(c, v_);                             \
+    } while (0)
+
+/* The j-th symbol of every stream, in stream order: the eight chains
+   interleaved (a chain is a table load and a shift, ~6-7 cycles; eight of
+   them hide it where four cannot). The five rows written out on 64-bit
+   targets, the loop on 32-bit ones, as for HUF4_ROWS. */
+#define HUF8_ROW(j) do {                              \
+        HUF8_SYM(b0, c0, 0, j);                       \
+        HUF8_SYM(b1, c1, 1, j);                       \
+        HUF8_SYM(b2, c2, 2, j);                       \
+        HUF8_SYM(b3, c3, 3, j);                       \
+        HUF8_SYM(b4, c4, 4, j);                       \
+        HUF8_SYM(b5, c5, 5, j);                       \
+        HUF8_SYM(b6, c6, 6, j);                       \
+        HUF8_SYM(b7, c7, 7, j);                       \
+    } while (0)
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define HUF8_ROWS() do {                              \
+        HUF8_ROW(0);                                  \
+        HUF8_ROW(1);                                  \
+        HUF8_ROW(2);                                  \
+        HUF8_ROW(3);                                  \
+        HUF8_ROW(4);                                  \
+    } while (0)
+#else
+#define HUF8_ROWS() do {                              \
+        for (int j_ = 0; j_ < 5; j_++)                \
+            HUF8_ROW(j_);                             \
+    } while (0)
+#endif
+
+/* Rounds of five symbols from each of the eight streams (40 output
+   bytes: symbol j of stream k at out0 + 8j + k) until out0 reaches outEnd
+   (at least one round). Each round reads the 8 bytes at each stream's
+   position; the caller's count keeps them inside the chunk. Unlike
+   HufBulk8X64 nothing is read after the last round.
+
+   The positions are kept as bit offsets from the lowest stream's byte,
+   in uintptr_t (a chunk is under 2^20 bytes), where the record's address
+   times 8 needs 64 bits on 32-bit targets. Eight buffers, eight offsets,
+   the table and the output: 19 registers, which arm64 has. */
+void sylzc_huf_bulk8(sylzc_hufbulk8 *st)
+{
+    const uint16_t *t = st->table;
+    uint64_t lo = st->pos[0];
+    for (int k = 1; k < 8; k++)
+        if (st->pos[k] < lo)
+            lo = st->pos[k];
+    const uint8_t *base = (const uint8_t *)(uintptr_t)(lo >> 3);
+    uint64_t base8 = lo & ~(uint64_t)7;
+    uintptr_t r0 = (uintptr_t)(st->pos[0] - base8), r1 = (uintptr_t)(st->pos[1] - base8),
+              r2 = (uintptr_t)(st->pos[2] - base8), r3 = (uintptr_t)(st->pos[3] - base8),
+              r4 = (uintptr_t)(st->pos[4] - base8), r5 = (uintptr_t)(st->pos[5] - base8),
+              r6 = (uintptr_t)(st->pos[6] - base8), r7 = (uintptr_t)(st->pos[7] - base8);
+    uint8_t *o = st->out0, *end = st->outEnd;
+    do {
+        uint64_t b0, b1, b2, b3, b4, b5, b6, b7;
+        uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0;
+        HUF8_LOAD(b0, r0);
+        HUF8_LOAD(b1, r1);
+        HUF8_LOAD(b2, r2);
+        HUF8_LOAD(b3, r3);
+        HUF8_LOAD(b4, r4);
+        HUF8_LOAD(b5, r5);
+        HUF8_LOAD(b6, r6);
+        HUF8_LOAD(b7, r7);
+        HUF8_ROWS();
+        r0 += HUF8_TAKEN(b0, c0);
+        r1 += HUF8_TAKEN(b1, c1);
+        r2 += HUF8_TAKEN(b2, c2);
+        r3 += HUF8_TAKEN(b3, c3);
+        r4 += HUF8_TAKEN(b4, c4);
+        r5 += HUF8_TAKEN(b5, c5);
+        r6 += HUF8_TAKEN(b6, c6);
+        r7 += HUF8_TAKEN(b7, c7);
+        o += 40;
+    } while (o < end);
+    st->pos[0] = base8 + r0;
+    st->pos[1] = base8 + r1;
+    st->pos[2] = base8 + r2;
+    st->pos[3] = base8 + r3;
+    st->pos[4] = base8 + r4;
+    st->pos[5] = base8 + r5;
+    st->pos[6] = base8 + r6;
+    st->pos[7] = base8 + r7;
+    st->out0 = o;
+}
+
+
 /* ── CRC-32 (for syc's container) ─────────────────────────────────────── */
 
 /* crc32 in syc.pas: CRC-32 (IEEE, reflected, $EDB88320), as zlib's, by
