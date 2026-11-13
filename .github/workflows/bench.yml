@@ -3,8 +3,9 @@ name: bench
 # On demand (Actions > bench > Run workflow): sylz's formats against each
 # other on GitHub's own machines, real arm64 and macOS hardware among them.
 # silesia.tar, one block, one thread, every level, v2 against v4 and v3
-# against v5. Each runner's table is in the job summary and an artifact.
-# Shared cloud machines: compare formats within one job, not across jobs.
+# against v5, interleaved. Each runner's table is in the job summary and
+# an artifact. Shared cloud machines: compare formats within one job, not
+# across jobs.
 
 on:
   workflow_dispatch:
@@ -55,20 +56,40 @@ jobs:
       - name: Bench
         shell: bash
         run: |
+          # The formats interleaved, level by level, in 3 rounds: cloud
+          # machines drift by tens of percent between minutes, so only
+          # measurements taken side by side compare. The best of the 3.
           B=out/sylzbench
           [ -f out/sylzbench.exe ] && B=out/sylzbench.exe
-          L=0,1,2,3,4,5,6,7,8,9,10
-          {
-            echo "## ${{ matrix.name }}"
-            echo
-            echo '```'
-            uname -a 2>/dev/null || true
-            for f in '' '-v4' '-ec' '-v4 -ec'; do
-              echo "--- sylzbench $f"
-              $B $f -l $L -t 1 silesia.tar
+          : > raw.txt
+          for r in 1 2 3; do
+            for L in 0 1 2 3 4 5 6 7 8 9 10; do
+              for f in v2 v4 v3 v5; do
+                case $f in v2) o= ;; v4) o=-v4 ;; v3) o=-ec ;; v5) o='-v4 -ec' ;; esac
+                $B $o -l $L -t 0.5 silesia.tar | tail -1 | sed "s/^sylz/$f/" >> raw.txt
+              done
             done
-            echo '```'
-          } | tee bench-${{ matrix.name }}.md
+          done
+          PY=python3; command -v python3 >/dev/null || PY=python
+          $PY - raw.txt > bench-${{ matrix.name }}.md <<'PY'
+          import sys
+          best = {}
+          for l in open(sys.argv[1]):
+              f = l.split()
+              key = (f[0], int(f[1]))
+              c, d, r = float(f[2]), float(f[4]), float(f[7])
+              o = best.get(key)
+              best[key] = (max(c, o[0]) if o else c, max(d, o[1]) if o else d, r)
+          print('## ${{ matrix.name }}: silesia.tar, MB/s (best of 3 interleaved rounds)\n')
+          for a, b in (('v2', 'v4'), ('v3', 'v5')):
+              print('| level | ratio %s | ratio %s | compress %s | compress %s | | decompress %s | decompress %s | |' % (a, b, a, b, a, b))
+              print('|---|---|---|---|---|---|---|---|---|')
+              for L in range(11):
+                  x, y = best[(a, L)], best[(b, L)]
+                  print('| %d | %.2f%% | %.2f%% | %.1f | %.1f | %+.1f%% | %.0f | %.0f | %+.1f%% |' % (
+                      L, x[2], y[2], x[0], y[0], 100 * (y[0] / x[0] - 1), x[1], y[1], 100 * (y[1] / x[1] - 1)))
+              print()
+          PY
           cat bench-${{ matrix.name }}.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
