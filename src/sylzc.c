@@ -1133,12 +1133,24 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
     pos = 0;
     while (pos < mflimit) {
         if (v4 && rep <= pos + 1 && read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
-            /* the previous offset, one byte on, taken as it is */
-            tl[mid_hash_long(src + pos, hashLog)] = (uint16_t)pos;
+            /* the previous offset, one byte on, or the long table's
+               candidate here if that match is short and this one longer */
+            len = MINMATCH + count_match(src + pos + 1 + MINMATCH, src + pos + 1 - rep + MINMATCH, src + n);
+            dist = 0;
+            if (len < st->nextBelow)
+                dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
+            else
+                tl[mid_hash_long(src + pos, hashLog)] = (uint16_t)pos;
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
-            pos++;
-            dist = rep;
-            len = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+            len2 = 0;
+            if (dist > 0)
+                len2 = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+            if (len2 > len + 1)
+                len = len2;
+            else {
+                pos++;
+                dist = rep;
+            }
             goto found;
         }
         dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);

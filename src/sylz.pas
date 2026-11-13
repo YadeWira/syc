@@ -2631,13 +2631,30 @@ begin
     begin
       if e.v4 and (rep <= pos + 1) and (Read32(src + pos + 1 - rep) = Read32(src + pos + 1)) then
       begin
-        { format v4: the previous offset, one byte on, taken as it is }
-        tl[MidHashLong(src + pos, hashLog)] := UInt16(pos);
+        { format v4: the previous offset, one byte on; when that match is
+          shorter than MID_NEXT_BELOW, the long table's candidate here
+          instead if it reaches further (binary data has many short
+          repeats in the way of a long match: 64 KiB of mozilla, level 2,
+          16279 -> 15879 bytes) }
+        len := SYLZ_MINMATCH + CountMatch(src + pos + 1 + SYLZ_MINMATCH,
+          src + pos + 1 - rep + SYLZ_MINMATCH, iend);
+        dist := 0;
+        if len < MID_NEXT_BELOW then
+          dist := MidCand(tl, MidHashLong(src + pos, hashLog), src, pos)
+        else
+          tl[MidHashLong(src + pos, hashLog)] := UInt16(pos);
         ts[MidHashShort(src + pos, hashLog)] := UInt16(pos);
-        Inc(pos);
-        dist := rep;
-        len := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
-          src + pos - dist + SYLZ_MINMATCH, iend);
+        len2 := 0;
+        if dist > 0 then
+          len2 := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
+            src + pos - dist + SYLZ_MINMATCH, iend);
+        if len2 > len + 1 then
+          len := len2
+        else
+        begin
+          Inc(pos);
+          dist := rep;
+        end;
       end
       else
       begin
@@ -3226,7 +3243,7 @@ asm
   jae @last
   mov rsi, r8
   sub rsi, r10                    { pos }
-  { the previous distance, one byte on: taken as it is }
+  { the previous distance, one byte on (CompressMidCore) }
   mov rdi, [rsp + 48]
   lea rax, [r8 + 1]
   sub rax, rdi
@@ -3235,21 +3252,58 @@ asm
   mov edx, [rax]
   cmp edx, [r8 + 1]
   jne @noRep
+  lea rbx, [r8 + 1]
+  mov [rsp + 40], rdi
+  call @count                     { rdx = match end at rbx, distance [rsp + 40] }
+  mov rbp, rdx
+  sub rbp, rbx                    { its length }
+  mov rsi, r8
+  sub rsi, r10                    { pos again (@count takes rsi) }
   mov rdx, [r8]
   shl rdx, 16
   imul rdx, [rsp + 8]
   shr rdx, cl
+  cmp rbp, MID_NEXT_BELOW
+  jae @repLong
+  { a short one: the long table's candidate at pos instead, if it
+    reaches further }
+  movzx eax, word ptr [r11 + rdx * 2]
+  mov [r11 + rdx * 2], si
+  mov edx, [r8]
+  imul edx, edx, -1640531535
+  shr edx, cl
+  mov [r12 + rdx * 2], si
+  mov edx, esi
+  sub edx, eax
+  and edx, $FFFF
+  mov eax, 65536
+  test edx, edx
+  cmovz edx, eax
+  cmp rdx, rsi
+  ja @repTake
+  mov rax, r8
+  sub rax, rdx
+  mov eax, [rax]
+  cmp eax, [r8]
+  jne @repTake
+  mov rbx, r8
+  mov [rsp + 40], rdx
+  call @count
+  sub rdx, r8
+  lea rax, [rbp + 1]
+  cmp rdx, rax
+  jbe @repTake
+  mov rbp, rdx
+  mov rdi, [rsp + 40]
+  jmp @back
+@repLong:
   mov [r11 + rdx * 2], si         { pos into both tables }
   mov edx, [r8]
   imul edx, edx, -1640531535
   shr edx, cl
   mov [r12 + rdx * 2], si
-  add r8, 1
-  mov rbx, r8
-  mov [rsp + 40], rdi
-  call @count                     { rdx = match end at rbx, distance [rsp + 40] }
-  mov rbp, rdx
-  sub rbp, r8
+@repTake:
+  add r8, 1                       { the previous distance, one byte on }
   jmp @back
 @noRep:
   { long table }
