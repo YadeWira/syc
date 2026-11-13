@@ -1,0 +1,76 @@
+name: bench
+
+# On demand (Actions > bench > Run workflow): sylz's formats against each
+# other on GitHub's own machines, real arm64 and macOS hardware among them.
+# silesia.tar, one block, one thread, every level, v2 against v4 and v3
+# against v5. Each runner's table is in the job summary and an artifact.
+# Shared cloud machines: compare formats within one job, not across jobs.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Free Pascal (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fpc
+      - name: Install Free Pascal (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fpc
+      - name: Install Free Pascal (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = 'https://sourceforge.net/projects/freepascal/files/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe/download'
+          curl.exe -L --fail --retry 3 -o "$env:TEMP\fpc-setup.exe" $url
+          Start-Process -Wait -FilePath "$env:TEMP\fpc-setup.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+          $fpc = Get-ChildItem C:\FPC -Recurse -Filter fpc.exe | Select-Object -First 1
+          Split-Path $fpc.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then ./build.sh -Px86_64 -Twin64; else ./build.sh; fi
+      - name: Silesia
+        shell: bash
+        run: |
+          curl -L --fail --retry 3 -o silesia.zip https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
+          mkdir silesia && cd silesia && unzip -q ../silesia.zip && cd ..
+          tar cf silesia.tar -C silesia .
+      - name: Bench
+        shell: bash
+        run: |
+          B=out/sylzbench
+          [ -f out/sylzbench.exe ] && B=out/sylzbench.exe
+          L=0,1,2,3,4,5,6,7,8,9,10
+          {
+            echo "## ${{ matrix.name }}"
+            echo
+            echo '```'
+            uname -a 2>/dev/null || true
+            for f in '' '-v4' '-ec' '-v4 -ec'; do
+              echo "--- sylzbench $f"
+              $B $f -l $L -t 1 silesia.tar
+            done
+            echo '```'
+          } | tee bench-${{ matrix.name }}.md
+          cat bench-${{ matrix.name }}.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}
+          path: bench-${{ matrix.name }}.md

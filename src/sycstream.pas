@@ -2,7 +2,7 @@
 
     stream := "SYZ0" 4 codec:u8 level:u8 block* end
               codec 1 = sylz (format v2 or v3 blocks), 2 = sylz (v4 or
-              v5 blocks: provisional, syc 0.6.0-); level is what the
+              v5 blocks, frozen at syc 0.8.0); level is what the
               writer used, for information. Versions 1-3 (syc 0.2.2-0.3.4)
               have no codec byte and are read too: 3 = v2 or v3 blocks, 2 =
               v3 literal chunks with three stream sizes, 1 = v2 only.
@@ -40,7 +40,8 @@ const
                         (syc 0.2.2-); 0 was sylz v1 (syc 0.2.0-0.2.1) }
   FORMAT_ENC   = 5;   { 5: encrypted (wiki: syc encryption) }
   CODEC_SYLZ   = 1;
-  CODEC_SYLZ4  = 2;   { sylz blocks of format v4 or v5 (syc 0.6.0-, experimental) }
+  CODEC_SYLZ4  = 2;   { sylz blocks of formats v2 to v5 (syc 0.7.0-; 0.6.0 wrote an
+                        earlier layout of v4/v5, which is not read) }
   STORED_FLAG  = UInt32($80000000);
   PAYLOAD_MASK = UInt32($7FFFFFFF);
 
@@ -276,8 +277,8 @@ var
           + '(changed, moved or from another stream)', [name, total]));
       if (hdr[4] >= 4) and (hdr[5] = CODEC_SYLZ4) then
         Fail(EXIT_CORRUPT, Format('%s: corrupt data or checksum mismatch in the block at output offset %d'
-          + ' (or blocks of format v4/v5 from another version of syc: they are provisional,'
-          + ' read only by the syc that wrote them)', [name, total]));
+          + ' (or blocks of format v4/v5 written by syc 0.6.0, an earlier layout that'
+          + ' later versions do not read)', [name, total]));
       Fail(EXIT_CORRUPT, Format('%s: corrupt data or checksum mismatch in the block at output offset %d',
         [name, total]));
     end;

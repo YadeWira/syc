@@ -1,11 +1,11 @@
-/* test_plugin — loads a sylz zpaq-std plugin (sylz or sylzec) the way zpaq-std does and
+/* test_plugin — loads a sylz zpaq-std plugin (sylz, sylzec, sylz4 or sylz5) the way zpaq-std does and
    checks it against zs_codec.h's contract.
 
    Usage: test_plugin [--codec N] PLUGIN FILE...
 
    - zpaqstd_codec_v1 is exported, abi/name/levels are as expected; with
      --codec N, zpaqstd_codecs_v1(N) is the codec tested, (0) is what
-     zpaqstd_codec_v1 returns, and the list ends with NULL after sylzec
+     zpaqstd_codec_v1 returns, and the list ends with NULL after sylz5
    - loading the plugin leaves the floating-point state (MXCSR, x87 control
      word) of the process unchanged
    - every file, at every level: compress with bound() bytes, decompress
@@ -14,8 +14,9 @@
      small, and then returns a negative number
    - corrupted and truncated streams: decompress returns a negative number
      or the original size, never writes past cap
-   - sylz: a block flagged as format v3 is refused (it reads v2 only);
-     sylzec: such a block decodes (it reads v3, and v2)
+   - each codec reads the block formats it should and refuses the others:
+     a v3 block (sylzec, sylz5 read it) and a v4 block with no tokens
+     (sylz4, sylz5 read it)
    - several threads compress and decompress at the same time
 
    Build (Linux):  cc -O2 -pthread plugin/test_plugin.c -o out/test_plugin -ldl
@@ -57,7 +58,7 @@ typedef const zs_codec* (*zs_codec_entry)(void);
 
 static const zs_codec* C;
 static int failures;
-static int is_ec;   /* sylzec: format v3, which it must read */
+static int fmt;     /* the codec's format: 2 sylz, 3 sylzec, 4 sylz4, 5 sylz5 */
 
 #define CHECK(cond, ...) do { if (!(cond)) { printf("FAIL: " __VA_ARGS__); printf("\n"); failures++; } } while (0)
 
@@ -126,8 +127,9 @@ static int check_one(const unsigned char* src, size_t n, int level, int quiet_co
         }
         long long r3 = C->decompress(comp, (size_t)c - 1 - rnd() % ((size_t)c - 1), out, n, 0);
         if (r3 == (long long)n && n > 0) { printf("FAIL: truncated stream accepted\n"); bad = 1; }
-        /* the plugin reads format v2 only: a valid format v3 block (no
-           sequences, the literals as one raw chunk) must be refused */
+        /* a valid format v3 block (no sequences, the literals as one raw
+           chunk) and a valid format v4 block (no tokens, the literals as
+           the tail): each codec reads exactly the formats it should */
         if (n > 0 && n <= 65536) {
             unsigned char* v3 = malloc(n + 9);
             v3[0] = 0; v3[1] = 0; v3[2] = 0; v3[3] = 0x80;          /* ctrlLen 0, v3 */
@@ -136,9 +138,19 @@ static int check_one(const unsigned char* src, size_t n, int level, int quiet_co
             v3[8] = 0;                                                 /* raw chunk */
             memcpy(v3 + 9, src, n);
             long long r4 = C->decompress(v3, n + 9, out, n, 0);
-            if (!is_ec && r4 >= 0) { printf("FAIL: format v3 block accepted (%lld)\n", r4); bad = 1; }
-            if (is_ec && (r4 != (long long)n || memcmp(out, src, n) != 0)) {
+            int want3 = fmt == 3 || fmt == 5;
+            if (!want3 && r4 >= 0) { printf("FAIL: format v3 block accepted (%lld)\n", r4); bad = 1; }
+            if (want3 && (r4 != (long long)n || memcmp(out, src, n) != 0)) {
                 printf("FAIL: format v3 block not decoded (%lld)\n", r4); bad = 1;
+            }
+            unsigned char* v4 = v3;
+            v4[0] = 0; v4[1] = 0; v4[2] = 0; v4[3] = 0x40;          /* tokLen 0, v4 */
+            memcpy(v4 + 4, src, n);
+            long long r5 = C->decompress(v4, n + 4, out, n, 0);
+            int want4 = fmt >= 4;
+            if (!want4 && r5 >= 0) { printf("FAIL: format v4 block accepted (%lld)\n", r5); bad = 1; }
+            if (want4 && (r5 != (long long)n || memcmp(out, src, n) != 0)) {
+                printf("FAIL: format v4 block not decoded (%lld)\n", r5); bad = 1;
             }
             free(v3);
         }
@@ -212,21 +224,28 @@ int main(int argc, char** argv)
         CHECK(list != NULL, "zpaqstd_codecs_v1 not exported");
         if (!list) return 1;
         CHECK(list(0) == C, "zpaqstd_codecs_v1(0) is not what zpaqstd_codec_v1 returns");
-        CHECK(list(2) == NULL, "zpaqstd_codecs_v1(2) is not NULL");
+        CHECK(list(4) == NULL, "zpaqstd_codecs_v1(4) is not NULL");
         C = list(pick);
         CHECK(C != NULL, "zpaqstd_codecs_v1(%d) returned NULL", pick);
     }
     if (!C) return 1;
     CHECK(C->abi == 1, "abi %d", C->abi);
-    CHECK(C->name && (strcmp(C->name, "sylz") == 0 || strcmp(C->name, "sylzec") == 0),
-          "name %s", C->name ? C->name : "(null)");
-    is_ec = C->name && strcmp(C->name, "sylzec") == 0;
-    CHECK(C->library && strncmp(C->library, is_ec ? "sylz format v3 " : "sylz format v2 ", 15) == 0,
+    static const char* const names[] = { "sylz", "sylzec", "sylz4", "sylz5" };
+    fmt = 0;
+    for (int i = 0; i < 4; i++)
+        if (C->name && strcmp(C->name, names[i]) == 0) fmt = i + 2;
+    CHECK(fmt != 0, "name %s", C->name ? C->name : "(null)");
+    if (!fmt) return 1;
+    char prefix[16];
+    snprintf(prefix, sizeof prefix, "sylz format v%d ", fmt);
+    CHECK(C->library && strncmp(C->library, prefix, 15) == 0,
           "library %s", C->library ? C->library : "(null)");
     CHECK(C->min_level == 0 && C->max_level == 10, "levels %d..%d", C->min_level, C->max_level);
     CHECK(C->bound && C->compress && C->decompress, "missing function");
     CHECK(C->query == NULL && C->data == NULL, "query/data should be NULL");
     CHECK(C->bound((size_t)1 << 31, 1) == 0, "bound for a 2 GiB block should be 0");
+    if (fmt >= 4)
+        CHECK(C->bound(((size_t)512 << 20) + 1, 1) == 0, "bound past 512 MiB should be 0 (formats v4, v5)");
     printf("plugin: %s, %s, levels %d..%d\n", C->name, C->library, C->min_level, C->max_level);
 
     int nfiles = argc - 2;

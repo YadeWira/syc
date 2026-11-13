@@ -44,7 +44,7 @@
   levels 1 and 9), and leave 8-12% of sequences extended. Exact pairs fit
   fixed 16-byte literal and 32-byte match copies.
 
-  Formats v4 and v5 (SYLZ_V4; provisional until frozen): three streams,
+  Formats v4 and v5 (SYLZ_V4; frozen at syc v0.8.0, the layout of 0.7.0): three streams,
   tokens, offsets and literals, so that a token is one byte and a
   sequence takes two offset bytes only when it needs them; v5 is v4 with
   the literals in chunks like v3's, whose Huffman chunks have eight

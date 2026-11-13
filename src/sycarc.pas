@@ -1242,8 +1242,8 @@ begin
       if SylzDecompressCtx(ctx, @payload[0], payLen, @raw[0], rawLen) <> SizeInt(rawLen) then
       begin
         if (fmt >= 2) and (head[16] = CODEC_SYLZ4) then
-          Corrupt(Format('version %d: corrupt index (or blocks of format v4/v5 from another '
-            + 'version of syc: they are provisional, read only by the syc that wrote them)', [k + 1]));
+          Corrupt(Format('version %d: corrupt index (or blocks of format v4/v5 written by '
+            + 'syc 0.6.0, an earlier layout that later versions do not read)', [k + 1]));
         Corrupt(Format('version %d: corrupt index', [k + 1]));
       end;
     finally

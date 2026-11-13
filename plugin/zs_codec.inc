@@ -9,6 +9,10 @@ const
   { Blocks larger than this are refused (bound returns 0): match finder
     positions are 32-bit, and the block header's control length is a u32. }
   MAX_BLOCK = SizeUInt($7FFF0000);
+  { Formats v4 and v5 (sylz4, sylz5): blocks of at most 512 MiB, the
+    format's limit (a length in a block always fits 30 bits, on 32-bit
+    targets too) }
+  MAX_BLOCK4 = SizeUInt(512 shl 20);
 
 type
   { Mirrors struct zs_codec; the packrecords c directive gives C's layout on every
@@ -38,6 +42,13 @@ type
 function CodecBound(n: SizeUInt; level: LongInt): SizeUInt; cdecl;
 begin
   if n > MAX_BLOCK then
+    Exit(0);
+  Result := SizeUInt(SylzBound(SizeInt(n)));
+end;
+
+function CodecBound4(n: SizeUInt; level: LongInt): SizeUInt; cdecl;
+begin
+  if n > MAX_BLOCK4 then
     Exit(0);
   Result := SizeUInt(SylzBound(SizeInt(n)));
 end;

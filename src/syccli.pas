@@ -321,8 +321,8 @@ begin
   WriteLn('              (format 5 too), 9-10 price literals by');
   WriteLn('              their Huffman codes');
   WriteLn('  -F, --format N   the sylz block format: 2 (default; 3 with -ec), or 4');
-  WriteLn('              (5 with -ec): smaller at every level. Not frozen yet:');
-  WriteLn('              until it is, only this version of syc is sure to read it');
+  WriteLn('              (5 with -ec): smaller and faster to compress and decompress');
+  WriteLn('              at every level; read by syc 0.7.0 and later');
 end;
 
 procedure PasswordUsage(cmd: Char);

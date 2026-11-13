@@ -50,7 +50,7 @@ if [ -z "$WINDOWS" ]; then
   "$PY" tools/syc_ref.py --check "$W/vectors"
 fi
 
-echo '== the zpaq-std plugin, loaded as zpaq-std does (both codecs)'
+echo '== the zpaq-std plugin, loaded as zpaq-std does (its four codecs)'
 # shellcheck disable=SC2086
 pt=$("$FPC" $FPCOPTS -iTO)-$("$FPC" $FPCOPTS -iTP)
 tcc="cc -O2 -pthread"
@@ -69,7 +69,7 @@ plugin/build.sh "$pt" $FPCOPTS >/dev/null
 $tcc plugin/test_plugin.c -o out/test_plugin
 "$PY" -c 'import sys; open(sys.argv[2], "wb").write(open(sys.argv[1], "rb").read()[:1000000])' \
   "$W/sample" "$W/psample"
-for codec in 0 1; do
+for codec in 0 1 2 3; do
   out/test_plugin --codec $codec "out/plugin/$pt/$lib" "$W/psample" src/sylz.pas
 done
 
@@ -78,6 +78,18 @@ out/sylzvectors "$W/blocks" >/dev/null
 for d in sylz sylzec sylz4 sylz5; do
   "$PY" tools/sylz_ref.py --check "$W/blocks/$d"
 done
+echo '== damaged v4/v5 blocks: rejected by syc on every path, as by the reference'
+"$PY" tools/sylz_bad.py "$W/bad"
+for p in auto c pascal; do
+  for f in "$W"/bad/*.blk; do
+    want=0
+    case $f in */bad-*) want=3 ;; esac
+    r=0
+    SYC_PATHS=$p "$SYC" t -q --raw --size "$(cat "${f%.blk}.size")" "$f" >/dev/null 2>&1 || r=$?
+    [ "$r" = "$want" ] || { echo "$p: $(basename "$f"): exit $r, not $want"; exit 1; }
+  done
+done
+echo ok
 
 echo '== the same bytes: streams and raw blocks, sylz formats v2 to v5, every level'
 for fmt in '' '-F 4'; do
