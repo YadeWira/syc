@@ -194,7 +194,7 @@ v5 against v3 (same build), size / compression cycles / decode cycles:
 | 0 | -2.50 / -14.1 / -3.1% | -1.43 / -33.5 / -16.2% |
 | 1 | -2.02 / -14.2 / -6.8% | -1.74 / -16.9 / -17.3% |
 | 2 | -0.49 / -48.1 / -6.9% | -0.21 / -59.0 / -14.4% |
-| 3 | -1.51 / -7.7 / -8.7% | -1.19 / -5.0 / -16.0% |
+| 3 | -1.51 / -7.7 / -8.7% | -1.19 / -3.0 / -16.0% |
 | 4 | -0.72 / -21.8 / -7.9% | -1.01 / -9.7 / -16.2% |
 | 5 | -1.29 / -19.2 / -8.5% | -1.17 / -8.7 / -16.2% |
 | 6 | -1.33 / -34.7 / -6.9% | -1.17 / -25.1 / -16.7% |
@@ -204,9 +204,14 @@ v5 against v3 (same build), size / compression cycles / decode cycles:
 | 10 | -3.15 / -5.8 / -9.4% | -1.64 / -20.1 / -18.6% |
 
 Every cell is negative: v5 is smaller, and takes fewer cycles to
-compress and to decode, at every level of both. The thin ones: silesia
--ec 0 decoding (-3.1%; wall clock 2239 against 2165 MB/s), -ec 3 and
--ec 10 compression (-5 to -8%). Against 0.6.0's v5, the remapped
+compress and to decode, at every level of both. The thin ones: mixed
+-ec 3 compression (-3.0%: a review's nine interleaved rounds, the
+median; v5 took fewer cycles in eight of them, -2.5 to -3.9% by the
+best, wall clock -3 to -4%; a first run here gave -5.0%), silesia -ec 0
+decoding (-3.1%; wall clock 2239 against 2165 MB/s, the review's 2260
+against 2195), silesia -ec 3 and -ec 10 compression (-6 to -8%). On
+mixed.tar -ec 10 came out 0.02% bigger than -ec 9 (79.02 MB against
+79.00), in 28% more cycles. Against 0.6.0's v5, the remapped
 levels are up to 0.8 points bigger (silesia -ec 0 37.83% against
 37.22%; -ec 10 0.1 smaller) and compress in 1.2-3.2x fewer cycles at
 -ec 0..8.
