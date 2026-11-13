@@ -6752,8 +6752,9 @@ begin
       Exit(-1);
     ctrlLen := hdr and HDR_TOKMASK;
     offLen := PUInt32(src + 4)^;
-    if (ctrlLen > n - HEADER4_SIZE) or (offLen > n - HEADER4_SIZE - ctrlLen)
-       or Odd(offLen) then
+    { on a 32-bit target a length of 2^31 or more reads as negative }
+    if (ctrlLen > n - HEADER4_SIZE) or (offLen < 0)
+       or (offLen > n - HEADER4_SIZE - ctrlLen) or Odd(offLen) then
       Exit(-1);
     ctrl := src + HEADER4_SIZE;
     cend := ctrl + ctrlLen + offLen;   { where the literal section starts }
@@ -6775,7 +6776,7 @@ begin
   if send - cend < 4 then
     Exit(-1);
   litCount := PUInt32(cend)^;
-  if (litCount > dstLen) or (litCount = 0) then
+  if (litCount > dstLen) or (litCount <= 0) then   { negative: as offLen above }
     Exit(-1);
   if dctx.litsSize < litCount then
   begin
