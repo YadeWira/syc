@@ -274,6 +274,10 @@ var
       if job.failed = -1 then
         Fail(EXIT_CORRUPT, Format('%s: the block at output offset %d does not authenticate '
           + '(changed, moved or from another stream)', [name, total]));
+      if (hdr[4] >= 4) and (hdr[5] = CODEC_SYLZ4) then
+        Fail(EXIT_CORRUPT, Format('%s: corrupt data or checksum mismatch in the block at output offset %d'
+          + ' (or blocks of format v4/v5 from another version of syc: they are provisional,'
+          + ' read only by the syc that wrote them)', [name, total]));
       Fail(EXIT_CORRUPT, Format('%s: corrupt data or checksum mismatch in the block at output offset %d',
         [name, total]));
     end;

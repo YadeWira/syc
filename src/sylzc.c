@@ -116,6 +116,11 @@ void sylzc_opt_dp(sylzc_node *nodes, int32_t w, const int32_t *cands,
 
 /* SYLZ_TOKENS entries: bits 0..7 literals, 8..15 match length, 16 / 17
    their extension flags */
+/* EXT_LIMIT and EXT_CAPPED in sylz.pas: an extension summing past this
+   is corrupt; only a 32-bit intptr_t can reach it (and wrap). */
+#define EXT_LIMIT (INTPTR_MAX >> 1)
+#define EXT_OVER(v) (sizeof(intptr_t) < 8 && (v) > EXT_LIMIT)
+
 #define TOK_LLEXT 0x10000u
 #define TOK_MLEXT 0x20000u
 
@@ -152,6 +157,8 @@ DECODER_INLINE intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
                     return -1;
                 b = *ctrl++;
                 ll += b;
+                if (EXT_OVER(ll))
+                    return -1;
             } while (b == 255);
         }
         if (e & TOK_MLEXT) {
@@ -161,6 +168,8 @@ DECODER_INLINE intptr_t decode_safe(const uint8_t *ctrl, const uint8_t *cend,
                     return -1;
                 b = *ctrl++;
                 ml += b;
+                if (EXT_OVER(ml))
+                    return -1;
             } while (b == 255);
         }
         if (ll > lend - lit || ll > oend - op)
@@ -224,12 +233,14 @@ DECODER_INLINE intptr_t decode_core(const uint8_t *ctrl, const uint8_t *cend,
                 do {
                     if (m >= cend) { ll = -1; break; }
                     ll += *m++;
+                    if (EXT_OVER(ll)) { ll = -1; break; }
                 } while (m[-1] == 255);
             }
             if ((e & TOK_MLEXT) && ll >= 0) {
                 do {
                     if (m >= cend) { ll = -1; break; }
                     ml += *m++;
+                    if (EXT_OVER(ml)) { ll = -1; break; }
                 } while (m[-1] == 255);
             }
             if (ll < 0 || ll > (intptr_t)(lfast - (uintptr_t)lit)
@@ -506,12 +517,14 @@ escape:
                 do {
                     if (m >= tend) { ll = -1; break; }
                     ll += *m++;
+                    if (EXT_OVER(ll)) { ll = -1; break; }
                 } while (m[-1] == 255);
             }
             if ((e & TOK4_MLEXT) && ll >= 0) {
                 do {
                     if (m >= tend) { ll = -1; break; }
                     ml += *m++;
+                    if (EXT_OVER(ml)) { ll = -1; break; }
                 } while (m[-1] == 255);
             }
             /* room for the wide copies: 16 literal bytes past the run, 128
@@ -962,9 +975,13 @@ static inline __attribute__((always_inline)) void emit_open4(sylzc_emit *e,
         }
         *prec = r;
     }
-    if (__builtin_expect(litLen <= 16 && e->srcEnd - lit >= 16, 1))
+    /* 16-byte steps while the reads stay inside the input (the scratch
+       stream has 16 bytes of slack), as the assembler copies them */
+    if (__builtin_expect(e->srcEnd - lit >= litLen + 16, 1)) {
         copy16(w, lit);
-    else
+        for (intptr_t i = 16; i < litLen; i += 16)
+            copy16(w + i, lit + i);
+    } else
         for (intptr_t i = 0; i < litLen; i++)
             w[i] = lit[i];
     *plit = w + litLen;
@@ -1252,13 +1269,21 @@ typedef struct {
 } sylzc_mid;
 
 /* CompressMidCore in sylz.pas, same output byte for byte; v4 is a
-   constant in each of the two functions made from it. */
-static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st, const int v4)
+   constant in each of the functions made from it, and so are, in v4's
+   made for levels 2 and 3, the level's parameters (a shift by a variable
+   takes three operations on x86 without BMI2, and the fields of st would
+   be read again after each byte stored) */
+/* v4's levels 2-3 inline the match count: a call there makes the loop
+   keep fewer of its variables in registers */
+#define MID_COUNT(a, b, l) (v4 ? count_match_inl(a, b, l) : count_match(a, b, l))
+
+static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st, const int v4,
+    const int hashLog, const intptr_t lazy, const intptr_t skip, const intptr_t lazyEnough,
+    const intptr_t nextBelow)
 {
     const uint8_t *src = st->src;
     intptr_t n = st->n;
     uint16_t *tl = st->tl, *ts = st->ts;
-    int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
     uint16_t *rec = e.rec;   /* v4: emit_open4's pointers */
     uint8_t *tok = e.ctrl, *woff = e.off, *wlit = e.lit;
@@ -1269,19 +1294,21 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
     mflimit = n - 12;
     pos = 0;
     while (pos < mflimit) {
-        if (v4 && rep <= pos + 1 && read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
+        /* (rep <= pos always: 1 at first, then a match's distance, which
+           is at most its position) */
+        if (v4 && read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
             /* the previous offset, one byte on, or the long table's
                candidate here if that match is short and this one longer */
-            len = MINMATCH + count_match(src + pos + 1 + MINMATCH, src + pos + 1 - rep + MINMATCH, src + n);
+            len = MINMATCH + MID_COUNT(src + pos + 1 + MINMATCH, src + pos + 1 - rep + MINMATCH, src + n);
             dist = 0;
-            if (len < st->nextBelow)
+            if (len < nextBelow)
                 dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
             else
                 tl[mid_hash_long(src + pos, hashLog)] = (uint16_t)pos;
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
             len2 = 0;
             if (dist > 0)
-                len2 = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+                len2 = MINMATCH + MID_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
             if (len2 > len + 1)
                 len = len2;
             else {
@@ -1296,14 +1323,14 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
         else {
             dist = mid_cand(ts, mid_hash_short(src + pos, hashLog), src, pos);
             if (dist == 0) {
-                pos += 1 + ((pos - anchor) >> st->skip);
+                pos += 1 + ((pos - anchor) >> skip);
                 continue;
             }
         }
-        len = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
-        if (st->lazy) {
+        len = MINMATCH + MID_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+        if (lazy) {
             /* both tables one byte later, while that finds a longer match */
-            while (len < st->lazyEnough && pos + 1 < mflimit) {
+            while (len < lazyEnough && pos + 1 < mflimit) {
                 k = pos + 1;
                 dist2 = mid_cand(tl, mid_hash_long(src + k, hashLog), src, k);
                 dshort = mid_cand(ts, mid_hash_short(src + k, hashLog), src, k);
@@ -1311,19 +1338,19 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
                     dist2 = dshort;
                 if (dist2 == 0)
                     break;
-                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                len2 = MINMATCH + MID_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
                 if (len2 <= len)
                     break;
                 pos = k;
                 len = len2;
                 dist = dist2;
             }
-        } else if (len < st->nextBelow && pos + 1 < mflimit) {
+        } else if (len < nextBelow && pos + 1 < mflimit) {
             /* a short match: a long one one byte later? */
             k = pos + 1;
             dist2 = mid_cand(tl, mid_hash_long(src + k, hashLog), src, k);
             if (dist2 > 0) {
-                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                len2 = MINMATCH + MID_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
                 if (len2 > len) {
                     pos = k;
                     len = len2;
@@ -1365,12 +1392,31 @@ done:
 
 void sylzc_compress_mid(sylzc_mid *st)
 {
-    compress_mid_core(st, 0);
+    compress_mid_core(st, 0, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
+                      st->nextBelow);
 }
+
+/* MID_MAXLOG, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW in sylz.pas */
+#define MID_MAXLOG 16
+#define MID_SKIP 9
+#define MID_LAZY_ENOUGH 32
+#define MID_NEXT_BELOW 8
 
 void sylzc_compress_mid4(sylzc_mid *st)
 {
-    compress_mid_core(st, 1);
+    if (st->skip == MID_SKIP && st->lazyEnough == MID_LAZY_ENOUGH
+        && st->nextBelow == MID_NEXT_BELOW) {
+        if (!st->lazy && st->hashLog == MID_MAXLOG - 1) {
+            compress_mid_core(st, 1, MID_MAXLOG - 1, 0, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
+            return;
+        }
+        if (st->lazy && st->hashLog == MID_MAXLOG) {
+            compress_mid_core(st, 1, MID_MAXLOG, 1, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
+            return;
+        }
+    }
+    compress_mid_core(st, 1, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
+                      st->nextBelow);
 }
 
 /* ── levels 4-8: the hash-chain search ────────────────────────────────── */

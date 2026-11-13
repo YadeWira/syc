@@ -496,15 +496,6 @@ const
   TAB4_EXT    = 31;
   TAB4_EXT_ML = 63;
   TAB4_REP    = $800;
-  { levels 2..3 count one sequence in this many for a chunk's table
-    (the chunks they record whole: at the block's end); a chunk of fewer
-    than 2 * SAMPLE4_ALL sequences counts them all, and larger ones about
-    SAMPLE4_ALL of them until that step is reached. Counting all of them
-    costs some 40 instructions a sequence: with 8192, 64 KiB pieces of
-    Silesia compressed 8% more instructions than sampled at level 1 (and
-    0.11% smaller) }
-  FAST_SAMPLE4 = 8;
-  SAMPLE4_ALL  = 1024;
   { Levels 0..3 record only a chunk's first FAST_PREFIX4 sequences: the
     table's update for the chunk is made from them, and the sequences
     after them are written as tokens as they are found, until the chunk
@@ -556,7 +547,6 @@ type
     codes: TCodes4;
     cells: TCells4;
     codesGen: SizeInt;
-    sample: SizeInt;  { chunk tables from one sequence in this many }
     ctrl2: SizeInt;   { v4: the last chunk's sequences as format v2's control
                         stream, in bytes; -1: not counted, or not possible }
     whole: Boolean;   { v4: the chunk to write is the whole block }
@@ -611,7 +601,6 @@ begin
   e.roomy := False;
   e.tokRep := 1;
   e.codesGen := 0;
-  e.sample := 1;
   e.ctrl2 := -1;
   e.whole := False;
   e.lay2 := False;
@@ -1396,12 +1385,11 @@ begin
     Exit;
   rend := e.rec;
   e.rec := e.recs;
-  { what the sequences look up: all of them, or one record in sample (the
-    fast levels: the count costs as much as the search saves; a record
-    with its lengths in the next ones is then read as it is, and so are
-    those: a few stray counts) }
+  { the sequences' cells are counted, all of them; the count of an open
+    chunk's first FAST_PREFIX4 stands for the whole chunk (a chunk that
+    ends within them, at the block's end, is counted as it is) }
   open := (e.prefix > 0) and not last;
-  sample := e.sample;
+  sample := 1;
   maxRepl := UPDATE4_MAX;
   i := (rend - e.recs) div 3;
   if open then
@@ -1409,44 +1397,27 @@ begin
     { the chunk goes on after these for about OPEN4_SCALE times as many:
       each one counted stands for that many, so no more update than these
       sequences leave room for under SylzBound (4 bytes each, a byte in
-      255, less the count's byte and the header) }
+      255, less the count's byte and the header). The margin is thin: a
+      long record counts as 3 sequences here, and on x-ray an L0 block
+      reached 82% of the bound's slack. Bytes added per sequence at levels
+      0..3, or rep matches under 4 bytes there, would break the roomy
+      paths of the asm and C, which skip room checks. }
     sample := OPEN4_SCALE;
     maxRepl := (i div 64 - 5) div UPDATE4_BYTES;
     if maxRepl < 0 then
       maxRepl := 0;
-  end
-  else if sample > 1 then
-  begin
-    if i div SAMPLE4_ALL < sample then
-      sample := i div SAMPLE4_ALL;
-    if sample <= 1 then
-      sample := 1
-    else
-      { a sampled count can be wrong: no more update than the sequences
-        leave room for under SylzBound (4 bytes each, a byte in 255) }
-      maxRepl := (i div 64) div UPDATE4_BYTES;
   end;
   FillChar(cnt, SizeOf(cnt), 0);
   r := e.recs;
   prev := e.tokRep;
   if e.counted and not e.whole then
     Move(e.cnt, cnt, SizeOf(cnt))   { counted as recorded; no v2 layout to weigh }
-  else if open or (sample = 1) then
+  else
   begin
     CountAll4(r, rend, prev, e.codes, cnt, sums);
     if not open and (sums.x2 < EXT2_NONE) and (sums.seqs <= EXT2_SEQS) then
       e.ctrl2 := 3 * sums.seqs + SizeInt(sums.x2);
-  end
-  else
-    while r < rend do
-    begin
-      if r > e.recs then
-        prev := SizeInt(r[-1]) + 1;
-      k := Ord(SizeInt(r[2]) + 1 = prev);
-      if PairOf4(e.codes, k, r[0], r[1], row, col) then
-        Inc(cnt[k, row, col]);
-      Inc(r, 3 * sample);
-    end;
+  end;
   if e.counted then
     FillChar(e.cnt, SizeOf(e.cnt), 0);   { for the next chunk }
   nrepl := UpdateTable4(cnt, sample, maxRepl, e.table, e.codes, e.cells, repl, miss);
@@ -6371,8 +6342,19 @@ end;
 
 { ── decoder ──────────────────────────────────────────────────────────────── }
 
+const
+  { The longest length an extension may sum to. No block is that long
+    (MAX_BLOCK in sycstream is 512 MiB); the cap keeps a 32-bit sum of
+    255-runs from wrapping to a small or negative length, which every room
+    check would pass, and keeps the sum of two lengths from wrapping too.
+    With a 64-bit SizeInt no input is long enough to reach it, so the test
+    is only compiled where SizeInt is smaller (not CPU64), and the decoders
+    there reject any longer extension, as the 64-bit ones do (no room for
+    it). }
+  EXT_LIMIT = High(SizeInt) shr 1;
+
 { Reads a 255-run extension at p, not reading at or past pend. Returns
-  false if it runs off the end. }
+  false if it runs off the end or past EXT_LIMIT. }
 function GetExt(var p: PByte; pend: PByte; var v: SizeInt): Boolean; inline;
 var
   b: SizeInt;
@@ -6383,6 +6365,10 @@ begin
     b := p^;
     Inc(p);
     Inc(v, b);
+{$ifndef CPU64}
+    if v > EXT_LIMIT then
+      Exit(False);
+{$endif}
   until b <> 255;
   Result := True;
 end;
@@ -6647,6 +6633,13 @@ begin
           end;
           Inc(ll, m^);
           Inc(m);
+{$ifndef CPU64}
+          if ll > EXT_LIMIT then
+          begin
+            ll := -1;
+            Break;
+          end;
+{$endif}
         until m[-1] <> 255;
       if (e and SYLZ_TOK_MLEXT <> 0) and (ll >= 0) then
         repeat
@@ -6657,6 +6650,13 @@ begin
           end;
           Inc(ml, m^);
           Inc(m);
+{$ifndef CPU64}
+          if ml > EXT_LIMIT then
+          begin
+            ll := -1;
+            Break;
+          end;
+{$endif}
         until m[-1] <> 255;
       if (ll < 0) or (ll > lim.lfast - lit) or (ll + ml > lim.ofast - op + 16) then
       begin

@@ -318,7 +318,7 @@ begin
   WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v3),');
   WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
     ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do');
-  WriteLn('              (format 5: one level lower), 9-10 price literals by');
+  WriteLn('              (format 5 too), 9-10 price literals by');
   WriteLn('              their Huffman codes');
   WriteLn('  -F, --format N   the sylz block format: 2 (default; 3 with -ec), or 4');
   WriteLn('              (5 with -ec): smaller at every level. Not frozen yet:');

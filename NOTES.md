@@ -208,6 +208,32 @@ busy machine) agrees in sign where checked: silesia.tar level 1 v4 560
 against v2 514 MB/s compress, 4545 against 3408 decode (after the
 levels 0-1 merge).
 
+Which v2 and v3: the columns above are this build's. Its v2 path is
+master's (same instructions); its v3 encoder and decoder write and read
+the same bytes as syc 0.6.0's but faster (compress -20% silesia.tar, -35%
+mixed.tar at -ec 0, -7/-12% at -ec 2, about 0 at -ec 9; decode -7 to
+-14%), so v5 is further ahead of 0.6.0's v3 than the tables say.
+
+The tables are the x86-64 assembler's. The C paths (what arm64, i386 and
+win32 run; SYLZ_C=1 on x86-64), after the review (the v4 levels 2-3 core
+specialized per level with the match count inlined, 16-byte literal
+copies as the assembler does): v4 against v2 compress, paired rounds on
+CPU 17, median cycles silesia.tar -1.9 -2.4 -8.2 -6.1% at levels 0-3
+(instructions +9.6 +10.2 +8.4 +2.2%), mixed.tar -8.4 -9.1 -11.4 -8.1%.
+Levels 0-1 on silesia.tar are the thinnest: the previous offset tried at
+each of the first 64 probes costs instructions the C loop does not win
+back as the assembler's does. (Before: +0.2 -1.9 +6.7 +3.3%.) The C v2
+levels 2-3 got the level's parameters in registers too (-2%
+instructions). Decoding in C is faster for v4 at every level (-6 to
+-25%).
+
+Small blocks: totals of 4 KiB, 64 KiB and 1 MiB pieces of the Silesia
+files are 1.4-2.4% smaller in v4/v5 at every level, but single pieces
+can be bigger (up to +3% for a 64 KiB piece of mozilla at levels 0-1, +1%
+for 1 MiB of samba at level 9; 1 MiB of x-ray at level 1 went out stored
+where v2 saved 0.2%): an open chunk at levels 0-3 has no v2-layout
+fallback, and a table update has to pay for itself.
+
 How the branches were reconciled:
 
 - **Decoder + table updates**: the decoder branch built a fast table per
