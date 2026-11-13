@@ -198,8 +198,13 @@ files and on pieces of them (4 KiB, 64 KiB, 1 MiB; 8 of each file):
   formats are bigger than the input).
 - **Speed** against master (silesia.tar, CPU 27, a loaded machine):
   compress and decode MB/s within -6..+6% either way at every level,
-  best of 2 interleaved; perf, user-space instructions per block:
-  compress +0.1..+0.4% (levels 1-9), decode within 0.2%. Small inputs:
+  best of 2 interleaved; perf, user-space instructions per block
+  (checked again in review, one block of silesia.tar): compress v4 +1.0%
+  at levels 0-1, +0.6..+0.7% at 2-3, +0.2..+0.3% at 4-6, v5
+  +0.1..+0.4%; decode v4 -0.6..-0.9% at levels 0-8 and +0.2% at 9-10, v5
+  -0.4..-0.9% at 0-6 and +0.3..+0.5% at 7-10; the cycle counts of 2-3
+  interleaved rounds scatter by +-4% on the shared machine and show no
+  difference beyond that. Small inputs:
   4 KiB pieces compress with 10% fewer instructions than master (no
   512-byte table to build), 64 KiB +0.9%, 1 MiB +0.4%.
 - **Tried and dropped**: at levels 0-1 the same candidate-against-repeat
