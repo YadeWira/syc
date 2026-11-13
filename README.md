@@ -147,56 +147,90 @@ wrote them; the default stays v2). What is new in them:
 - a match can take the previous match's offset again for no offset bytes
   (in structured data a fifth to a half of the matches do);
 - what has no code of its own is written as two or three plain tokens
-  instead of an escape, which the decoder takes without a branch: half
-  the branch misses of v2's decoder;
-- each chunk of 131072 sequences can bring its own token table, made from
-  the pairs it uses most.
+  instead of an escape, which the decoder takes without a branch;
+- the token table starts as a built-in one in each block, and each chunk
+  of tokens can replace entries of it (3 bytes each) with the pairs it
+  uses most; a small block pays no more header than v2's;
+- v5's Huffman chunks have eight interleaved streams.
 
-The same levels and parsers as v2 and v3, one session (2026-11-12, the
-machine busy with other work: speeds vary by ~5%), in MB/s:
+The same levels as v2 and v3 (v5 at v3's `-ec` levels), one block of
+each corpus, one core (CPU 17 of the Xeon E5-2697A v4, shared machine),
+user-space cycles per input byte from `perf stat` (the difference
+between 3 and 1 compressions, 2 and 1 at levels 7-10; 11 and 1 decodes;
+the least of 2 interleaved rounds, 1 at levels 9-10), 2026-11-13:
 
 **silesia.tar, v4 against v2**
 
 | level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
 |---|---|---|---|---|---|---|---|---|
-| 0 | 46.51% | **44.93%** | 508 | 411 | -19% | 3215 | 3437 | +7% |
-| 1 | 44.55% | **43.12%** | 476 | 392 | -18% | 3233 | 3388 | +5% |
-| 2 | 40.89% | **39.41%** | 264 | 222 | -16% | 3081 | 3014 | -2% |
-| 3 | 39.99% | **38.62%** | 199 | 178 | -11% | 3117 | 3069 | -2% |
-| 4 | 38.80% | **37.89%** | 90.7 | 85.9 | -5% | 3098 | 3116 | +1% |
-| 5 | 37.78% | **36.92%** | 63.0 | 63.1 | +0% | 3036 | 3173 | +5% |
-| 6 | 37.13% | **36.30%** | 47.4 | 48.3 | +2% | 3063 | 3339 | +9% |
-| 7 | 36.73% | **35.94%** | 37.5 | 39.8 | +6% | 3190 | 3388 | +6% |
-| 8 | 36.38% | **35.62%** | 23.2 | 25.1 | +8% | 3187 | 3410 | +7% |
-| 9 | 36.04% | **35.06%** | 7.62 | 7.33 | -4% | 3473 | 3445 | -1% |
-| 10 | 36.03% | **35.06%** | 6.56 | 6.16 | -6% | 3382 | 3489 | +3% |
+| 0 | 46.51% | **44.67%** | 6.37 | 5.83 | -8.5% | 1.030 | 0.768 | -25.5% |
+| 1 | 44.55% | **42.82%** | 6.86 | 6.29 | -8.4% | 1.036 | 0.776 | -25.1% |
+| 2 | 40.89% | **39.39%** | 12.42 | 11.45 | -7.8% | 1.102 | 0.902 | -18.2% |
+| 3 | 39.99% | **38.59%** | 16.81 | 15.56 | -7.4% | 1.095 | 0.920 | -15.9% |
+| 4 | 38.80% | **37.48%** | 36.55 | 33.66 | -7.9% | 1.082 | 0.900 | -16.8% |
+| 5 | 37.78% | **36.58%** | 50.03 | 46.87 | -6.3% | 1.064 | 0.856 | -19.5% |
+| 6 | 37.13% | **36.00%** | 66.43 | 63.28 | -4.7% | 1.091 | 0.886 | -18.8% |
+| 7 | 36.73% | **35.65%** | 89.23 | 78.88 | -11.6% | 1.047 | 0.853 | -18.6% |
+| 8 | 36.38% | **35.35%** | 145.05 | 119.63 | -17.5% | 1.053 | 0.844 | -19.8% |
+| 9 | 36.04% | **34.96%** | 414.18 | 386.78 | -6.6% | 0.991 | 0.798 | -19.5% |
+| 10 | 36.03% | **34.94%** | 494.01 | 448.45 | -9.2% | 0.988 | 0.880 | -10.9% |
 
 **silesia.tar, v5 against v3**
 
 | level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
 |---|---|---|---|---|---|---|---|---|
-| 0 | 38.80% | **37.22%** | 200 | 169 | -15% | 2168 | 1962 | -10% |
-| 1 | 37.99% | **36.54%** | 158 | 140 | -12% | 2188 | 1975 | -10% |
-| 2 | 36.72% | **35.81%** | 82.6 | 72.0 | -13% | 2167 | 2021 | -7% |
-| 3 | 35.79% | **34.93%** | 61.3 | 54.3 | -11% | 2211 | 2052 | -7% |
-| 4 | 35.18% | **34.35%** | 47.4 | 42.3 | -11% | 2246 | 2095 | -7% |
-| 5 | 34.80% | **34.01%** | 36.7 | 33.9 | -8% | 2241 | 2104 | -6% |
-| 6 | 34.47% | **33.70%** | 23.3 | 21.9 | -6% | 2183 | 2134 | -2% |
-| 7 | 33.99% | **32.95%** | 8.01 | 6.88 | -14% | 2481 | 2151 | -13% |
-| 8 | 33.98% | **32.95%** | 6.72 | 5.72 | -15% | 2487 | 2143 | -14% |
-| 9 | 33.61% | **32.54%** | 4.03 | 3.48 | -14% | 2240 | 2122 | -5% |
-| 10 | 33.60% | **32.65%** | 3.22 | 2.99 | -7% | 2075 | 2304 | +11% |
+| 0 | 38.80% | **37.22%** | 13.13 | 12.30 | -6.4% | 1.455 | 1.162 | -20.1% |
+| 1 | 37.99% | **36.52%** | 18.38 | 16.35 | -11.0% | 1.422 | 1.171 | -17.7% |
+| 2 | 36.72% | **35.37%** | 37.15 | 35.23 | -5.2% | 1.420 | 1.123 | -21.0% |
+| 3 | 35.79% | **34.55%** | 51.28 | 47.48 | -7.4% | 1.401 | 1.097 | -21.7% |
+| 4 | 35.18% | **34.00%** | 67.31 | 63.75 | -5.3% | 1.426 | 1.092 | -23.4% |
+| 5 | 34.80% | **33.68%** | 91.20 | 81.45 | -10.7% | 1.382 | 1.133 | -18.0% |
+| 6 | 34.47% | **33.39%** | 129.43 | 123.44 | -4.6% | 1.371 | 1.075 | -21.6% |
+| 7 | 33.99% | **32.82%** | 413.29 | 382.99 | -7.3% | 1.330 | 1.028 | -22.7% |
+| 8 | 33.98% | **32.80%** | 487.81 | 450.29 | -7.7% | 1.310 | 1.037 | -20.9% |
+| 9 | 33.61% | **32.40%** | 839.28 | 563.90 | -32.8% | 1.384 | 1.057 | -23.6% |
+| 10 | 33.60% | **32.38%** | 987.67 | 629.47 | -36.3% | 1.468 | 1.064 | -27.6% |
 
-What they are so far: **smaller at every level** (v4 1.0 to 1.6 points
-under v2 on silesia.tar, and under it on every file of Silesia but two
-within 0.11%; v5 about a point under v3), and **not yet faster**. v4
-decodes within a few percent of v2 either way (faster on silesia.tar at
-most levels, up to 9% slower on the mixed corpus at levels 2 to 5); it
-compresses 11-19% slower at levels 0 to 3, where the tokens are written
-in a second pass that builds each chunk's table, and about as fast from
-level 5 up. v5 decodes up to 14% slower than v3 on silesia.tar. Speed is
-what is left to do before they can replace v2 and v3. The mixed corpus:
-[Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).
+**mixed.tar, v4 against v2**
+
+| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 66.31% | **64.83%** | 4.70 | 4.24 | -9.8% | 0.990 | 0.856 | -13.5% |
+| 1 | 65.59% | **64.23%** | 5.00 | 4.55 | -9.0% | 0.965 | 0.838 | -13.1% |
+| 2 | 63.29% | **62.01%** | 12.08 | 9.68 | -19.9% | 1.028 | 0.943 | -8.3% |
+| 3 | 62.89% | **61.73%** | 15.87 | 13.77 | -13.2% | 1.042 | 0.961 | -7.8% |
+| 4 | 61.55% | **60.49%** | 44.17 | 29.44 | -33.4% | 1.046 | 0.943 | -9.8% |
+| 5 | 61.10% | **60.10%** | 65.14 | 40.95 | -37.1% | 1.026 | 0.934 | -8.9% |
+| 6 | 60.83% | **59.87%** | 78.63 | 51.50 | -34.5% | 1.040 | 0.929 | -10.7% |
+| 7 | 60.68% | **59.75%** | 98.12 | 59.95 | -38.9% | 1.012 | 0.919 | -9.2% |
+| 8 | 60.55% | **59.64%** | 122.45 | 88.72 | -27.5% | 1.003 | 0.902 | -10.1% |
+| 9 | 60.42% | **59.40%** | 267.21 | 246.36 | -7.8% | 0.972 | 0.926 | -4.8% |
+| 10 | 60.39% | **59.37%** | 372.89 | 297.37 | -20.3% | 0.934 | 0.859 | -8.1% |
+
+**mixed.tar, v5 against v3**
+
+| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 59.78% | **58.48%** | 14.26 | 13.25 | -7.1% | 1.932 | 1.506 | -22.1% |
+| 1 | 59.46% | **58.27%** | 19.29 | 16.51 | -14.4% | 1.888 | 1.497 | -20.7% |
+| 2 | 58.30% | **57.15%** | 48.67 | 32.05 | -34.1% | 1.881 | 1.474 | -21.6% |
+| 3 | 57.86% | **56.82%** | 68.88 | 45.63 | -33.8% | 1.852 | 1.447 | -21.9% |
+| 4 | 57.62% | **56.61%** | 83.62 | 56.64 | -32.3% | 1.850 | 1.459 | -21.1% |
+| 5 | 57.48% | **56.48%** | 94.72 | 66.79 | -29.5% | 1.870 | 1.466 | -21.6% |
+| 6 | 57.35% | **56.40%** | 132.13 | 94.03 | -28.8% | 1.871 | 1.457 | -22.1% |
+| 7 | 57.19% | **56.16%** | 275.80 | 249.82 | -9.4% | 1.803 | 1.428 | -20.8% |
+| 8 | 57.16% | **56.13%** | 372.58 | 301.26 | -19.1% | 1.958 | 1.431 | -26.9% |
+| 9 | 56.94% | **55.87%** | 543.00 | 402.72 | -25.8% | 1.835 | 1.443 | -21.4% |
+| 10 | 56.91% | **55.85%** | 754.98 | 467.59 | -38.1% | 1.823 | 1.404 | -23.0% |
+
+So at every level, on both corpora: **smaller** (v4 1.0 to 1.8 points
+under v2, v5 1.0 to 1.6 under v3, and smaller on every file of Silesia
+at every level), **faster to compress** (v4 5-18% fewer cycles than v2
+on silesia.tar, 8-39% on the mixed corpus; v5 5-36% and 7-38% fewer
+than v3) and **faster to decompress** (v4 11-26% and 5-14%, v5 18-28%
+and 21-27%). They stay provisional until frozen. More:
+[Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks) and the
+sylz format page.
 
 Competitors measured with lzbench 2.4.1 (GCC 14.2, no `-march=native`) on
 the same core. More, and how: [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks).

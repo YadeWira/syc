@@ -66,349 +66,228 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
-## v4 levels 2-3: tokens written at once (2026-11-13)
+## sylz formats v4 and v5, the branches integrated (2026-11-13, provisional)
 
-Asked for: v4 at least as fast as v2 at levels 2 and 3, both ways, still
-smaller. Before, v4 compressed 8-16% slower and decoded 2-9% slower
-(mixed corpus). The format did not change; the encoder did:
-
-- **Tokens written as the sequences are found** (EmitDirect4, C
-  emit_direct4, CompressMid4X64), with the built-in table, the block's
-  token stream one chunk: the records and the second pass with a table
-  per chunk were 6-8% of these levels' time for 0.1 points (silesia.tar
-  level 2: 39.41% with them, 39.50% without).
-- **Fewer short sequences, which the decoder pays for one by one**: right
-  after a match the short table's candidate must match 5 bytes, and after
-  more than 16 literals a 4-byte match at a new offset is not taken.
-  Without the first, decode cycles +3-7% (perf, cycles per byte: level 2
-  silesia.tar 1.084 against 1.018, mixed 1.040 against 0.972; level 3
-  1.086 / 1.051, 1.020 / 0.955; v2 1.079, 1.001, 1.055, 1.010) and
-  instructions +7%, for 0.13% (level 2) and 0.55% (level 3) smaller on
-  silesia.tar. The second changes the size by under 0.1% either way.
-- **A shorter probe in the assembler**: the tables hold the low 16 bits of
-  pointers (filled with src's), the 8 bytes at ip stay in a register for
-  both hashes and compares, the step is worked out only past 512
-  literals, and the first probe after a match has its own copy. One trap:
-  the look one byte on after a match puts ip+1 in the tables, so when
-  that match is then refused (the 4-byte rule) the probe at ip+1 finds
-  itself, a distance of 65536, before src in the first 64 KiB: MidCand
-  refuses it (dist > pos), the assembler now too (the fuzzer found it).
-- **Level 3 keeps 2^16-entry tables**: with level 2's 2^15 it compressed
-  20% faster (243.8 against 204.5 MB/s, silesia.tar) but 0.28 points
-  bigger (39.25% against 38.97%); with them it is still faster than v2.
-
-CPU 18, both formats from the same binary, interleaved, best of 5 runs of
-2 s; MB/s compress / decompress, ratio:
-
-| | v2 | v4 before | v4 now |
-|---|---|---|---|
-| silesia.tar 2 | 250 / 2890, 40.89% | 223 / 2959, 39.41% | **278 / 3045**, 39.57% |
-| silesia.tar 3 | 187 / 2891, 39.99% | 170 / 2865, 38.62% | **210 / 3013**, 38.97% |
-| mixed.tar 2 | 268 / 3105, 63.29% | 246 / 3029, 61.94% | **361 / 3212**, 62.40% |
-| mixed.tar 3 | 198 / 3009, 62.89% | 183 / 2998, 61.62% | **265 / 3126**, 62.16% |
-
-v5 at `-ec 0` / `-ec 1` (the same parser) against v3: compresses 6-13%
-faster, decodes 1.5-3.5% slower (best of 3; v5's literal chunks, not
-this). What it costs: per file of Silesia, v4 is now bigger than v2 on
-sao (+0.9% level 2, +1.3% level 3), osdb (+0.5, +0.8%), x-ray (+0.1,
-+0.8%), and at level 3 mr, webster and dickens (+0.06-0.6%); the 5-byte
-rule is most of it on sao and osdb, the built-in table the rest.
-
-## sylz formats v4 and v5 (2026-11-12, provisional)
-
-Asked for: formats better than v2 and v3 in everything. What they are
-(the full description: wiki, sylz format; `--format 4`, codec 2 in
-streams and archives):
+Asked for: v4 better than v2 and v5 better than v3 in ratio, compression
+speed and decompression speed at every level 0-10. Six branches worked
+on it in parallel (each reviewed; their history below) and were merged
+into one (branch v4-integrated). The format, as integrated (full
+description: wiki, sylz format; `--format 4`, codec 2):
 
 - three streams: tokens (a byte each), offsets (2 bytes, only for the
-  sequences that need them), literals; v5 = v4 with v3's Huffman chunks;
-- a token can take the previous sequence's offset again, for no offset
-  bytes, from 2 bytes of match;
-- sequences with no code of their own are split into plain tokens (a
-  literal-only token, a token that goes on at the previous offset)
-  instead of taking an escape; only runs over 32 literals and matches
-  over 64 are extended;
-- the token stream comes in chunks of 131072 sequences; a block starts
-  with the built-in table, and each chunk can replace entries of it (3
-  bytes each) with the pairs it uses more, for the chunks after it too;
-- a block of one small chunk has that chunk's header and the offsets'
-  count in its own header; where v2's layout of the same sequences is
-  smaller (small blocks with few repeats), the block is written as v2.
+  sequences that take a new one), literals; v5 = v4 with its literals in
+  Huffman chunks of eight interleaved streams (mode 3);
+- a token's table entry gives literals 0..16 or extended, a match 0..32
+  or extended, new or previous offset; what has no code of its own is
+  split into plain tokens, only runs over 32 and matches over 64 extend;
+- the table is the built-in one at each block's start; a chunk can
+  replace entries (3 bytes each), for itself and the chunks after it;
+- block header u32 (bit 30: v4/v5, bit 31: v5); with bit 29 a block of
+  one small chunk carries that chunk's header and the offsets' count;
+  else the count is a 1-5 byte varint after the tokens; chunk headers
+  of 2 or 4 bytes;
+- an encoder may write a v2/v3 block instead (decoders go by the
+  header), or a block with no tokens (header and literals).
 
-How it got there, each step measured on silesia.tar and the mixed corpus
-(CPU 20 or 26; the machine was shared, speeds +-5%):
+The encoder, level by level:
 
-- **Repeat offset.** A greedy parser that tries the previous offset one
-  byte on (zstd's fast levels do) makes 19-27% of its sequences repeats;
-  priced at a token each: 44.38 -> 42.65% (silesia), 67.0 -> 65.4%
-  (mixed). Repeats of 3 bytes: 42.49 / 64.73%; of 2: 42.45 / 64.21%,
-  with 35% more sequences. The format allows 2; only the optimal parser
-  uses them, where a code exists.
-- **The same sequences in the new layout** (v2's parse, repeats only
-  where two offsets happened to be equal: 4-5%): 0.45-0.7 points
-  smaller, and a C decoder 10% slower than v2's C one.
-- **Escapes.** With the first table (trained on those parses) 16.6% of
-  level 1's sequences took an escape, each a mispredicted branch: 6.7%
-  were pairs inside the exact region without a code, 4.4% matches of
-  33-64, 3.2% runs of 17-32 literals; 1.1% really long. Split into
-  plain tokens they cost the same bytes (+0.03 points) and the decoder
-  takes them in its fast loop: branch misses per decode 2.44 M -> 1.16 M
-  (perf). Split thresholds (literals / match): 16/32 2772 MB/s, 32/32
-  2909, 32/64 3065, 32/96 3065, 32/160 3063 (level 1, assembler): 32/64.
-- **The decoder.** C, a counted inner loop (k sequences fit: no checks):
-  2313 -> 2870 MB/s, where v2's C decoder makes 2600. Assembler, with
-  the escapes handled in it: 3070-3200. perf, cycles per MB decoded, v2
-  / v4: level 1 0.99 / 0.93 M, level 3 1.05 / 1.06, level 6 1.01 / 1.02;
-  instructions +7-16% (more tokens), branch misses -55-65%.
-- **Every level.** Levels 2-3: the previous offset one byte on, before
-  the tables. 4-8: at the previous offset a match is taken unless the
-  chains have one over 2 bytes longer (not searched for past 32 bytes).
-  9-10: a DP of its own (OptDp4Pas, sylzc_opt_dp4): each node carries its
-  path's last distance, tried first at every position.
-- **Per file** the first version won only where repeats are common
-  (mozilla -8.6%, nci -4.3%, ooffice -3.1% at level 1) and lost 0.1-0.7%
-  on text, x-ray, osdb, sao, at every level: a long literal run cost a
-  byte more than in v2 (fixed: escapes "run extended + this match"), and
-  the repeat codes took the place of pairs those files need. A table
-  per chunk of 65536 / 262144 sequences, simulated: -0.3 to -1.1% on
-  every file tried; a table made from the previous chunk (no second
-  pass) keeps most of it but lost 0.7% on xml (its content changes).
-  So: sequences are recorded (6 bytes each) and written as tokens a
-  chunk at a time, with the table made from that chunk. Level 1 / 6 / 9,
-  v4 against v2: dickens -0.14 / +0.07 / 0.00%, mozilla -9.2 / -6.3 /
-  -7.3%, mr +0.11 / +0.10 / +0.05%, nci -6.4 / -2.4 / -5.5%, ooffice
-  -3.8 / -3.5 / -4.2%, osdb -0.4 / -0.5 / -0.5%, reymont -0.5 / -0.2 /
-  -0.4%, samba -1.6 / -0.7 / -3.4%, sao -0.5 / -0.7 / -0.1%, webster
-  -0.4 / -0.2 / -0.2%, xml -2.0 / -0.2 / -0.8%, x-ray -0.03 / -0.02 /
-  -0.03%.
-- **Compression speed** is what is not there yet. The recording and the
-  second pass cost levels 0-1 about 10% (flush 3.5% in C after counting
-  one sequence in 8 for the table at levels 0-3, 6-byte records, the
-  token pass in C); the repeat check costs little (checking only the
-  first probe after a match: +2%). v2's loops are assembler; v4's are C:
-  level 1 346 MB/s against 475 (v2 in C: 419).
-- **Assembler compressors** for levels 0-3 (CompressFast4X64,
-  CompressMid4X64: v2's with the repeat check and records instead of
-  tokens; they return when the records are full and resume at the match
-  they stopped at). Same CPU, v4 / v2: level 0 440 / 542 MB/s, 1 417 /
-  504, 2 256 / 266, 3 198 / 208. Without the repeat check level 1 gains
-  2% and loses 0.9 points. What is left at levels 0-1 is the second
-  pass: the token pass in C 8% of the time, the moves 2%, the count and
-  the table 2%. Chunks of 32768 or 16384 sequences (records in L2): no
-  faster, 0.08-0.17 points bigger. A padded code table (one lookup, no
-  range test): no faster.
-- **Final tables** (wiki, Benchmarks): ratio better at every level of
-  both corpora; speed is not: v4 compresses 11-19% slower at levels
-  0-3 and decodes within -9..+9% of v2; v5 decodes up to 14% slower
-  than v3 on silesia.tar. So "better in everything" is not met yet.
-- **Decoder, second round** (2026-11-13, CPU 24, decode only, best of
-  3 x 1 s, the same blocks for both builds). Once the block has read an
-  offset, the previous distance is the offset before the next one in the
-  stream, so the counted loop reads it from there instead of selecting
-  and keeping it (assembler: 20 instructions a sequence); once the
-  output is SYLZ_MAXDIST long, no distance needs a check. Distances under
-  16 with no loop (the period spread by a multiplication, TShort4),
-  escapes that copy 128 bytes before any length test, the output
-  prefetched 512 bytes ahead. v4 against v2, levels 0-10: assembler
-  silesia.tar +19..+34%, mixed.tar +7..+17% (before: -0..+11%, -3..+4%);
-  C silesia +19..+31%, mixed +8..+15% (before: +2..+11%, -3..+5%). v5
-  shares the loop: against v3 +13..+14% silesia, +3..+5% mixed (levels
-  1, 3, 6, 9; the rest is v3's Huffman decoder). Pascal (SYLZ_NOASM=1):
-  silesia +1..+12%, mixed -6..+3% against v2's Pascal decoder (before:
-  -18..-38%); FPC kept the escape loops' counts on the stack until they
-  moved to a procedure of their own (CopyWide16). Tried and dropped
-  (wall clock, within noise or worse): `rep movsb` for literal runs over
-  256 / 2048 bytes (mixed -2..-4%), 64-byte steps in the long loops,
-  the C escape's 128-byte copies written out (+1-2%), prefetch 256 /
-  1024 / 2048 bytes ahead or with prefetchw, offsets stored complemented
-  (a format change that saves the loop a `not`: -2..+1% cycles). The
-  machine was shared and busy: +-5%. Review: the exact loop now also
-  runs before the block's first offset, byte by byte in C, so a block
-  that opens with 8 MB of zeros (one byte at the first distance) and
-  then xml decoded 4.9x slower with C than on master, 8 MB of random
-  bytes first 2.3x; the Pascal one was already 6x slower than v2 there
-  on master. Both copy in wide steps where there is room past the run
-  or match (cycles per decode, zeros / random: C 43.7 / 13.0 M ->
-  8.7 / 5.7 M, master 8.9 / 5.5 M; Pascal 67.4 / 8.0 M -> 10.5 /
-  8.8 M, v2 11.3 / 9.7 M); silesia.tar and mixed.tar unchanged.
+- **0-3**: a chunk's first 8192 sequences (FAST_PREFIX4) are recorded;
+  the table's update comes from them (each counted as 16, no more
+  replacements than they leave room for under SylzBound), then they are
+  written and the chunk stays open: the next sequences go in as tokens
+  as they are found, with the updated table, up to 131072 token bytes
+  (CloseChunk4 writes the 2- or 4-byte header). Assembler (x86-64), C and
+  Pascal write the same bytes; the assembler writes exact codes and the
+  literal-and-match pairs and calls PutTokens4 for the rest (any split
+  with a code, as the update counted it). Levels 0-1: the search goes on
+  at a match's end, the previous offset tried one byte on in the first
+  64 probes. Levels 2-3: two hash tables, the previous offset one byte
+  on, a short repeat giving way to a longer match one byte before it.
+- **4-8**: hash chains with the previous offset one byte on before each
+  search, literal runs stepped over (every 1 + run shr 7 bytes); chunks
+  of 131072 recorded sequences, each one's update from all of them,
+  counted as recorded in the C parse.
+- **9-10**: the optimal parser with the path's offset in the node; level
+  10's tree 128 deep. v5 takes v3's levels (V5_LEVELS) with v4's
+  parsers; -ec 9/10 price literals by their Huffman codes, the first
+  parse with a shallow tree.
+- every level: a block bigger than its input goes out with no tokens;
+  a block of one chunk goes out in v2's layout where that is smaller;
+  trailing sequences that cost more than their match saves are dropped.
 
-**Table updates, small blocks** (branch v4-ratio-tables, 2026-11-13),
-ratio with no speed cost; sizes from sylzbench on the twelve Silesia
-files and on pieces of them (4 KiB, 64 KiB, 1 MiB; 8 of each file):
+The decoder: per chunk, the counted fast loop (assembler, C or Pascal;
+the previous distance read from the offset stream once the block has
+read an offset, distances under 16 without a loop, escapes copied 128
+bytes at a time), then an escape, a refill of v5's literals, or the
+exact loop. v5's literal chunks are decoded one at a time as the
+sequences reach them, into a buffer that stays in cache. The fast table
+(TFast4) follows the running table entry by entry.
 
-- **Updates instead of whole tables.** A chunk lists the entries it
-  replaces (3 bytes each, UpdateTable4: the least asked-for codes go to
-  the most asked-for cells while each swap pays) instead of 512 bytes or
-  nothing; new cells for literals with an extended match and both
-  extended; the offsets' count as 1-5 bytes after the tokens, chunk
-  headers of 2 bytes under 16384 token bytes. One code array by cell
-  (TCodes4, read the same way by sylzc.c), so the update walks cells and
-  codes by index.
-- **Levels 9-10**: a pair with no code is priced 0.75 byte under its two
-  tokens (OPT4_MISS), or the parse never asks for what the update could
-  give: level 9, twelve files, 74 049 235 -> 73 937 832 bytes.
-- **Splits**: a sequence that is split takes any split that has a code
-  (FindSplit4), not only the first one tried.
-- **Small blocks**: one chunk under 2^14 token bytes keeps its header in
-  the block's (bit 29); trailing sequences that cost more than their
-  match saves are dropped into the tail (DropTail4); a block of one
-  chunk goes out in v2's layout when that is smaller, decided from the
-  counts before any token is written.
-- **Levels 2-3**: a repeat one byte on that is shorter than 8 bytes gives
-  way to the long table's candidate at the byte before it when that one
-  reaches 2 bytes further: -0.11..-0.13% on silesia.tar (64 KiB of
-  mozilla, level 2: 16279 -> 15879 bytes, v2 15784), compress
-  instructions +0.3%, wall clock within noise.
-- **Counting**: counting every sequence of a chunk costs some 40
-  instructions each; under 2048 sequences all are counted (and the v2
-  layout weighed), above that one in up to 8 as before. With all counted
-  up to 16384, 64 KiB pieces compressed 8% more instructions at level 1
-  (10% slower) for 0.11% less.
-- **Result**, against master: whole files -0.11% (levels 0-1), -0.25%
-  (2-3), -0.15..-0.20% (4-8), -0.32% (9-10) for v4; v5 -0.16..-0.41%.
-  v4 is smaller than v2 on every Silesia file at every level (worst
-  -0.010%; master: 16 file-levels larger, worst +0.12%); v5 smaller than
-  v3 everywhere but mr at level 10 (+0.011%; master: 18, worst +0.36%).
-  Pieces, v4 against v2: 4 KiB -1.2..-2.1%, 64 KiB -1.1..-2.0%, 1 MiB
-  -1.3..-2.1% (0.1-0.6 points better than master), but 8-30 of the 96 pieces
-  per level still come out a few bytes bigger (worst +176 bytes on 64
-  KiB, +1646 on an incompressible 1 MiB piece of x-ray where both
-  formats are bigger than the input).
-- **Speed** against master (silesia.tar, CPU 27, a loaded machine):
-  compress and decode MB/s within -6..+6% either way at every level,
-  best of 2 interleaved; perf, user-space instructions per block
-  (checked again in review, one block of silesia.tar): compress v4 +1.0%
-  at levels 0-1, +0.6..+0.7% at 2-3, +0.2..+0.3% at 4-6, v5
-  +0.1..+0.4%; decode v4 -0.6..-0.9% at levels 0-8 and +0.2% at 9-10, v5
-  -0.4..-0.9% at 0-6 and +0.3..+0.5% at 7-10; the cycle counts of 2-3
-  interleaved rounds scatter by +-4% on the shared machine and show no
-  difference beyond that. Small inputs:
-  4 KiB pieces compress with 10% fewer instructions than master (no
-  512-byte table to build), 64 KiB +0.9%, 1 MiB +0.4%.
-- **Tried and dropped**: at levels 0-1 the same candidate-against-repeat
-  check (-0.07% size, +1.7-2.2% compress instructions, 1-4% slower);
-  no OPT4_MISS on blocks up to 64 KiB (+0.07..+0.21%); the count in C
-  (no clear gain in instructions over the Pascal routine).
-- **Levels 4-10** (branch v4-hc-opt-levels, 2026-11-13; perf on one
-  CPU of a loaded machine, the least cycles of 2-3 interleaved runs).
-  4-8: before each chain search the previous offset is tried one byte
-  on and its match taken back to where it starts; a literal run is
-  searched every 1 + run shr 6 bytes, a match found after a step
-  extended backwards; a position with no match yet is searched in one C
-  loop (hc_scan4). 9-10: a match taken as is puts only its last 64
-  positions into the tree; the C DP relaxes each match's lengths in a
-  counted loop and skips the lengths the previous distance has already
-  priced cheaper (same parse, -20% instructions at level 9); level 10
-  walks the tree 128 deep instead of 256 (v4 and v5 only; same bytes
-  within 0.004 points). Compression cycles, v2 -> v4: silesia.tar level
-  4 7.62 -> 7.33 G, 5 10.6 -> 9.8, 6 13.9 -> 12.8, 7 18.1 -> 16.4, 8
-  28.9 -> 26.7, 9 87.2 -> 82.1, 10 103.2 -> 95.8 (v4 before: 8.31,
-  11.1, 14.5, 18.1, 28.9, 94.4, 112.4); the mixed corpus 33-45% fewer
-  at 4-8, -7% at 9, -19% at 10. v3 -> v5 likewise 5-35% fewer at every
-  level. Ratio, v4: silesia.tar 37.56 / 36.66 / 36.07 / 35.73 / 35.44
-  / 35.11 / 35.07% (v2 38.80 / 37.78 / 37.13 / 36.73 / 36.38 / 36.04 /
-  36.03), mixed 0.8-0.9 points under v2 (0.03-0.05 above v4 before at
-  5-10). Decoding did not move: silesia.tar 0-2.5% fewer cycles than
-  v2, the mixed corpus 0.7-2.4% more (v4 runs 12% more instructions
-  there, 25% fewer branch misses); v5 against v3 -1..+2%. Tried and
-  dropped: a branchless relaxation (+5% cycles); per-token penalty 0.8
-  or 1.0 byte at level 9 (no faster decoding, +0.05 points); repeats
-  from 3 or 4 bytes (same); more literal stepping at level 4 (mixed
-  decodes 2% faster, +1 point).
-- **Levels 0-1 compression (2026-11-13).** The second pass is gone
-  there: a chunk's first 8192 sequences (FAST_PREFIX4) are recorded and
-  its table made from them, the rest go into the open chunk as tokens as
-  they are found. The search goes on at a match's end (the previous
-  offset tried one byte past every match: 0.3 points). Assembler: the
-  table holds the low halves of addresses, one byte a probe for the
-  first 64 with the hash shift a constant, the match's first bytes
-  compared at the hit.
-  C: one loop per level, the dense probes in a loop of their own, the
-  distance without a branch. CountPairs4 by tables (9 cycles a record,
-  not 25). CPU 17, interleaved, cycles per compression (perf stat, the
-  minimum of 3), v2 / v4 before / v4 now:
-  silesia.tar assembler level 0 1441 / 1689 / 1287 M, level 1 1505 /
-  1776 / 1377 M; C level 0 1589 / 1825 / 1559 M, level 1 1671 / 1910 /
-  1667 M. mixed.tar assembler level 0 702 / 820 / 596 M, level 1 733 /
-  855 / 639 M; C 825 / 932 / 793 M, 881 / 994 / 857 M. Wall clock,
-  silesia.tar assembler: level 0 470 / 403 / 542 MB/s, level 1 445 /
-  378 / 505. Ratio 44.93 -> 44.75% (level 0), 43.12 -> 42.89% (level
-  1); v2 46.51 / 44.55. Decoding these blocks, cycles per MB, v2 / v4:
-  silesia.tar assembler level 0 1.00-1.07 / 0.94, level 1 1.04-1.07 /
-  0.93-0.98; C 1.17-1.19 / 1.01-1.02, 1.11-1.15 / 1.00-1.03; mixed.tar
-  assembler 0.97 / 0.93, 0.94 / 0.93-0.94.
-  Tried and dropped: a prefix of 2048 / 4096 / 16384 sequences
-  (silesia.tar level 1 +0.29 / +0.16 / -0.05% size; 4096 2% fewer
-  cycles), chunks of 262144 or 524288 token bytes (+0.05 / +0.18% on
-  silesia.tar level 1, samba +0.3%; 262144 1-2% fewer cycles). The move
-  of the offsets and literals behind the tokens at the end (EmitFinish)
-  is 3.5% of level 1; only another stream order would save it.
+Results, one block of each corpus, CPU 17, user-space cycles per byte
+(perf stat: 3 minus 1 compressions, 2 minus 1 at levels 7-10; 11 minus
+1 decodes; the least of 2 interleaved rounds, 1 at levels 9-10, 4 for
+the closest cells); v3 and v5 by -ec level:
+
+**silesia.tar, v4 against v2** (perf cycles:u per byte on CPU 17)
+
+| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 46.51% | **44.67%** | 6.37 | 5.83 | -8.5% | 1.030 | 0.768 | -25.5% |
+| 1 | 44.55% | **42.82%** | 6.86 | 6.29 | -8.4% | 1.036 | 0.776 | -25.1% |
+| 2 | 40.89% | **39.39%** | 12.42 | 11.45 | -7.8% | 1.102 | 0.902 | -18.2% |
+| 3 | 39.99% | **38.59%** | 16.81 | 15.56 | -7.4% | 1.095 | 0.920 | -15.9% |
+| 4 | 38.80% | **37.48%** | 36.55 | 33.66 | -7.9% | 1.082 | 0.900 | -16.8% |
+| 5 | 37.78% | **36.58%** | 50.03 | 46.87 | -6.3% | 1.064 | 0.856 | -19.5% |
+| 6 | 37.13% | **36.00%** | 66.43 | 63.28 | -4.7% | 1.091 | 0.886 | -18.8% |
+| 7 | 36.73% | **35.65%** | 89.23 | 78.88 | -11.6% | 1.047 | 0.853 | -18.6% |
+| 8 | 36.38% | **35.35%** | 145.05 | 119.63 | -17.5% | 1.053 | 0.844 | -19.8% |
+| 9 | 36.04% | **34.96%** | 414.18 | 386.78 | -6.6% | 0.991 | 0.798 | -19.5% |
+| 10 | 36.03% | **34.94%** | 494.01 | 448.45 | -9.2% | 0.988 | 0.880 | -10.9% |
+
+**silesia.tar, v5 against v3** (perf cycles:u per byte on CPU 17)
+
+| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 38.80% | **37.22%** | 13.13 | 12.30 | -6.4% | 1.455 | 1.162 | -20.1% |
+| 1 | 37.99% | **36.52%** | 18.38 | 16.35 | -11.0% | 1.422 | 1.171 | -17.7% |
+| 2 | 36.72% | **35.37%** | 37.15 | 35.23 | -5.2% | 1.420 | 1.123 | -21.0% |
+| 3 | 35.79% | **34.55%** | 51.28 | 47.48 | -7.4% | 1.401 | 1.097 | -21.7% |
+| 4 | 35.18% | **34.00%** | 67.31 | 63.75 | -5.3% | 1.426 | 1.092 | -23.4% |
+| 5 | 34.80% | **33.68%** | 91.20 | 81.45 | -10.7% | 1.382 | 1.133 | -18.0% |
+| 6 | 34.47% | **33.39%** | 129.43 | 123.44 | -4.6% | 1.371 | 1.075 | -21.6% |
+| 7 | 33.99% | **32.82%** | 413.29 | 382.99 | -7.3% | 1.330 | 1.028 | -22.7% |
+| 8 | 33.98% | **32.80%** | 487.81 | 450.29 | -7.7% | 1.310 | 1.037 | -20.9% |
+| 9 | 33.61% | **32.40%** | 839.28 | 563.90 | -32.8% | 1.384 | 1.057 | -23.6% |
+| 10 | 33.60% | **32.38%** | 987.67 | 629.47 | -36.3% | 1.468 | 1.064 | -27.6% |
+
+**mixed.tar, v4 against v2** (perf cycles:u per byte on CPU 17)
+
+| level | ratio v2 | ratio v4 | compress v2 | compress v4 | | decompress v2 | decompress v4 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 66.31% | **64.83%** | 4.70 | 4.24 | -9.8% | 0.990 | 0.856 | -13.5% |
+| 1 | 65.59% | **64.23%** | 5.00 | 4.55 | -9.0% | 0.965 | 0.838 | -13.1% |
+| 2 | 63.29% | **62.01%** | 12.08 | 9.68 | -19.9% | 1.028 | 0.943 | -8.3% |
+| 3 | 62.89% | **61.73%** | 15.87 | 13.77 | -13.2% | 1.042 | 0.961 | -7.8% |
+| 4 | 61.55% | **60.49%** | 44.17 | 29.44 | -33.4% | 1.046 | 0.943 | -9.8% |
+| 5 | 61.10% | **60.10%** | 65.14 | 40.95 | -37.1% | 1.026 | 0.934 | -8.9% |
+| 6 | 60.83% | **59.87%** | 78.63 | 51.50 | -34.5% | 1.040 | 0.929 | -10.7% |
+| 7 | 60.68% | **59.75%** | 98.12 | 59.95 | -38.9% | 1.012 | 0.919 | -9.2% |
+| 8 | 60.55% | **59.64%** | 122.45 | 88.72 | -27.5% | 1.003 | 0.902 | -10.1% |
+| 9 | 60.42% | **59.40%** | 267.21 | 246.36 | -7.8% | 0.972 | 0.926 | -4.8% |
+| 10 | 60.39% | **59.37%** | 372.89 | 297.37 | -20.3% | 0.934 | 0.859 | -8.1% |
+
+**mixed.tar, v5 against v3** (perf cycles:u per byte on CPU 17)
+
+| level | ratio v3 | ratio v5 | compress v3 | compress v5 | | decompress v3 | decompress v5 | |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 59.78% | **58.48%** | 14.26 | 13.25 | -7.1% | 1.932 | 1.506 | -22.1% |
+| 1 | 59.46% | **58.27%** | 19.29 | 16.51 | -14.4% | 1.888 | 1.497 | -20.7% |
+| 2 | 58.30% | **57.15%** | 48.67 | 32.05 | -34.1% | 1.881 | 1.474 | -21.6% |
+| 3 | 57.86% | **56.82%** | 68.88 | 45.63 | -33.8% | 1.852 | 1.447 | -21.9% |
+| 4 | 57.62% | **56.61%** | 83.62 | 56.64 | -32.3% | 1.850 | 1.459 | -21.1% |
+| 5 | 57.48% | **56.48%** | 94.72 | 66.79 | -29.5% | 1.870 | 1.466 | -21.6% |
+| 6 | 57.35% | **56.40%** | 132.13 | 94.03 | -28.8% | 1.871 | 1.457 | -22.1% |
+| 7 | 57.19% | **56.16%** | 275.80 | 249.82 | -9.4% | 1.803 | 1.428 | -20.8% |
+| 8 | 57.16% | **56.13%** | 372.58 | 301.26 | -19.1% | 1.958 | 1.431 | -26.9% |
+| 9 | 56.94% | **55.87%** | 543.00 | 402.72 | -25.8% | 1.835 | 1.443 | -21.4% |
+| 10 | 56.91% | **55.85%** | 754.98 | 467.59 | -38.1% | 1.823 | 1.404 | -23.0% |
+
+Per file (the twelve Silesia files, one block each): v4 is smaller than
+v2 and v5 smaller than v3 on every file at every level 0-10. Totals,
+v4 against v2: -4.02 -3.94 -3.76 -3.55 -3.39 -3.18 -3.05 -2.94 -2.82
+-3.08 -3.13% (levels 0-10); v5 against v3: -4.17 -3.91 -3.66 -3.49
+-3.37 -3.25 -3.12 -3.48 -3.53 -3.65 -3.69%.
+
+Every cell is a win. The thinnest: silesia.tar compression, v4 level 6
+-4.7% (instructions -5.4%), v5 -ec 6 -4.6% (4 more rounds; one of the
+first two gave +1.7% with instructions -10.7%: the hash chain levels
+scatter by up to 10% on the shared machine), v5 -ec 2 -5.2% (its
+instructions +2.2%), v4 level 4 -7.9% with as many instructions as v2;
+mixed.tar decoding at level 9 -4.8%. Wall clock (sylzbench, same block,
+busy machine) agrees in sign where checked: silesia.tar level 1 v4 560
+against v2 514 MB/s compress, 4545 against 3408 decode (after the
+levels 0-1 merge).
+
+How the branches were reconciled:
+
+- **Decoder + table updates**: the decoder branch built a fast table per
+  chunk from its whole table; with updates the fast table starts as
+  SYLZ_TOKENS4's in each block and each replaced entry is rebuilt with
+  it (FastEntry4). offs0 and short are set where the block state is.
+- **Decoder + v5 literals decoded as they go**: one driver for every
+  path (DecodeChunk4): the sequences before the block's first offset
+  exactly (the counted loops want one), then the fast loop, an escape, a
+  literal refill or the exact loop. The C core no longer finishes a
+  chunk itself (it cannot refill literals): its exact loop is gone, the
+  Pascal one has the same wide copies.
+- **Levels 0-1 direct emission + updates**: the branch gave a chunk a
+  whole table from its first 8192 sequences; now an update from them.
+- **Levels 2-3**: the branch wrote every block as one chunk with the
+  built-in table and rejected some 4-byte matches (two 5-byte rules),
+  which made v4 up to 1.3% bigger than v2 on sao, osdb, x-ray, mr,
+  webster and dickens. Now: the levels 0-1 scheme (open chunks with
+  updates), no 5-byte rules, and the assembler records the prefix
+  itself and calls PutTokens4 instead of returning to Pascal (4% fewer
+  instructions than handing each sequence back). Every Silesia file is
+  smaller than v2's, level 2 still 8% fewer cycles than v2.
+- **Levels 4-8**: the branch counted pairs as recorded with master's
+  PairOf4; that count is back with the updates' PairOf4 (count_split4 in
+  C mirrors it), since without it FlushChunk4's pass over the records
+  cost 2.2% of level 4. HC_ACCEL4 is one constant, 7 (with 6, x-ray was
+  130-190 bytes bigger than v2 at levels 6-8).
+- **v5 levels**: one level below v3 (the entropy branch, tuned on
+  master's parsers) left whole files up to 6% bigger than v3 at -ec
+  0..7 (dickens, mr, reymont, webster, sao, osdb, x-ray); now v3's
+  levels, still faster with v4's parsers. -ec 10: the first parse with
+  V5_OPT_STATS, the second with OPT4_LEVEL10 (mr was +0.02% with
+  OPT_LEVEL9 twice).
+- **New, not from a branch**: the block with no tokens for a block that
+  would expand (x-ray at level 0 was 260 bytes bigger than v2's, which
+  expands it too); DropTail4 counts a new offset's 2 bytes; sylzfuzz
+  runs every damaged block through the three decoders, which must
+  agree; a test vector of two token chunks with an update in the second.
+- **Measured and not taken**: the built-in table retrained on the merged
+  parsers (mixed corpus, levels 0-10): silesia.tar and mixed.tar within
+  0.003%, 64 KiB pieces +0.01..+0.02% bigger at levels 0-6; kept. Open
+  chunks: a prefix of 2048 / 4096 or chunks of 262144 token bytes cost
+  0.05-0.15% for 2-5% fewer instructions. OPEN4_SCALE 4..32: the same
+  bytes (the replacement test needs 2 counts more either way); 1: +0.01%.
+
+The branches, in short (each measured on its own; the numbers above
+replace theirs):
+
+- **v4-ratio-tables**: table updates instead of whole 512-byte tables,
+  the one-chunk header, the varint offset count, 2/4-byte chunk
+  headers, v2's layout where smaller, DropTail4, FindSplit4 (any split
+  with a code), OPT4_MISS at levels 9-10, the short repeat at levels
+  2-3; v4 smaller than v2 on every Silesia file.
+- **v4-decoder**: the counted loops (assembler, C, Pascal) reading the
+  previous distance from the offset stream, TShort4 for distances under
+  16, 128-byte escapes; v4 decoded 19-34% faster than v2 on silesia.tar
+  (assembler), 7-17% on mixed. Review fix: the exact loop in wide steps
+  (a block opening with 8 MB of one byte decoded 4.9x slower with C).
+- **v4-v5-entropy**: v5's eight-stream Huffman chunks (BMI2+LZCNT and
+  plain kernels, Pascal bulk loop), a faster v3 Huffman coder (same
+  bytes), literals decoded chunk by chunk as the sequences reach them.
+  Review fix: the BMI2 kernel also needs LZCNT.
+- **v4-hc-opt-levels**: levels 4-8 with the previous offset one byte on
+  and stepped literal runs (mixed corpus 33-45% fewer cycles), 9-10
+  with the path's offset in the DP node, fewer tree insertions, level
+  10's tree 128 deep.
+- **v4-fast-compress**: levels 0-1 without the second pass (tokens as
+  found after a prefix), the search on at a match's end, the assembler
+  probe with the shift a constant; 8-15% faster than v2. Review fix: on
+  32-bit targets a u32 length of 2^31 or more read as negative (kept:
+  v3/v5 literal counts; the offset count is now checked unsigned).
+- **v4-mid-levels**: levels 2-3 with tokens written at once and a
+  shorter assembler probe (low 16 bits of pointers in the tables, one
+  register for the 8 bytes at ip). Review fix: room checks count an
+  extension byte per 255, not 256 (16 MiB of zeros wrote 244 bytes past
+  cap at every level of v4/v5; sylzedge has the regression).
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its
 API and CLI).
-
-## Format v5: eight Huffman streams, its own levels (2026-11-13)
-
-Asked for: v5 better than v3 in ratio, compression and decompression
-speed at every -ec level. Measured on CPU 25 (shared machine): sizes,
-user cycles per MB (perf, the difference between runs of 0 and N
-compressions, 1 and 7 decodes; three rounds of the decodes, the best),
-v5 against v3 of the same build:
-
-- **Huffman decoding** (shared with v3, the same bytes; the previous
-  commit): each stream's buffer shifted by the code just read, the table
-  built by doubling, the encoder storing its accumulator every five
-  codes. v3 decodes in 7-13% fewer cycles than at 0.6.0, and compresses
-  in up to 35% fewer at -ec 0 (the encoder took 28 cycles a literal).
-- **Eight streams** (v5's chunk mode 3, symbol i in stream i mod 8):
-  four streams are bound by the chain from one symbol to the next (a
-  table load, a shift: 7 cycles), 1.75 cycles a literal at best. A C
-  prototype on silesia.tar's literals: 1.93 cycles a literal with four
-  streams, 1.39 with eight interleaved (output in consecutive bytes, a
-  sentinel bit instead of a bit count). In the decoder: -ec 0 1.486 ->
-  1.404, -ec 1 1.474 -> 1.353 M cycles per MB (silesia.tar). 8 more
-  header bytes a chunk: +0.005%.
-- **Levels.** v5 at level + 2, like v3, compressed 5-17% slower than v3
-  at most levels (v4's parsers are slower than v2's: the repeat checks,
-  the recorded sequences). v4's parse at a level is smaller than v2's
-  at the next one, so v5 parses one level lower (V5_LEVELS); with eight
-  streams even the fast parse (-ec 0) decodes faster than v3's -ec 0.
-  -ec 3 with level 4's 2 chain attempts came out 0.05% bigger than v3
-  on silesia.tar: 3 attempts. -ec 9: the first of CompressOptEC's two
-  parses only counts literals, and a shallow tree (btCut 2) counts
-  nearly the same ones: 69.22 MB against 68.98, 632 M cycles per MB
-  against 895 (v3: 839). -ec 10: level 9's parameters twice (level 10's
-  came out bigger in v5, 69.21 MB).
-
-v5 against v3 (same build), size / compression cycles / decode cycles:
-
-| -ec | silesia.tar | mixed.tar |
-|---|---|---|
-| 0 | -2.50 / -14.1 / -3.1% | -1.43 / -33.5 / -16.2% |
-| 1 | -2.02 / -14.2 / -6.8% | -1.74 / -16.9 / -17.3% |
-| 2 | -0.49 / -48.1 / -6.9% | -0.21 / -59.0 / -14.4% |
-| 3 | -1.51 / -7.7 / -8.7% | -1.19 / -3.0 / -16.0% |
-| 4 | -0.72 / -21.8 / -7.9% | -1.01 / -9.7 / -16.2% |
-| 5 | -1.29 / -19.2 / -8.5% | -1.17 / -8.7 / -16.2% |
-| 6 | -1.33 / -34.7 / -6.9% | -1.17 / -25.1 / -16.7% |
-| 7 | -0.84 / -67.0 / -5.7% | -1.09 / -51.0 / -15.3% |
-| 8 | -3.03 / -7.8 / -7.7% | -1.55 / -20.6 / -17.3% |
-| 9 | -2.83 / -24.6 / -9.7% | -1.70 / -15.1 / -16.2% |
-| 10 | -3.15 / -5.8 / -9.4% | -1.64 / -20.1 / -18.6% |
-
-Every cell is negative: v5 is smaller, and takes fewer cycles to
-compress and to decode, at every level of both. The thin ones: mixed
--ec 3 compression (-3.0%: a review's nine interleaved rounds, the
-median; v5 took fewer cycles in eight of them, -2.5 to -3.9% by the
-best, wall clock -3 to -4%; a first run here gave -5.0%), silesia -ec 0
-decoding (-3.1%; wall clock 2239 against 2165 MB/s, the review's 2260
-against 2195), silesia -ec 3 and -ec 10 compression (-6 to -8%). On
-mixed.tar -ec 10 came out 0.02% bigger than -ec 9 (79.02 MB against
-79.00), in 28% more cycles. Against 0.6.0's v5, the remapped
-levels are up to 0.8 points bigger (silesia -ec 0 37.83% against
-37.22%; -ec 10 0.1 smaller) and compress in 1.2-3.2x fewer cycles at
--ec 0..8.
 
 ## Commands for developing and reporting (2026-11-12)
 
