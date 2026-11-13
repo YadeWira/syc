@@ -318,6 +318,7 @@ uses
 
 const
   HEADER_SIZE  = 4;
+  SMALL_BLOCK4 = 65536;   { SylzCompressEx: v4/v5 blocks this small are also tried as v2/v3 }
   HEADER4_SIZE = 8;                   { SylzBound's share for a header; v4's
                                         is HEADER_SIZE, and the offset count
                                         (OFFCOUNT_MAX bytes) after the tokens }
@@ -5037,6 +5038,8 @@ const
   OPT_MAXCAND = 64;
   OPT_NOSKIP  = High(Int32);
   OPT_FORCED_KEEP4 = 64;   { see CompressOptCore }
+  OPT_FORCED_STEP4 = 4;
+
 
 type
   TSylzOptParams = record
@@ -6044,13 +6047,24 @@ begin
         lastDist := forcedDist;
         anchor := pos + forcedLen;
         start := anchor;
-        { format v4: of a match taken as is, only the last positions go
-          into the tree. Each one inside it costs a walk and a long
-          compare, and what they would find later the match's source
-          mostly has too (level 9: silesia.tar -6% cycles for +0.05
-          points, the mixed corpus -11% for +0.01) }
+        { format v4: of a match taken as is, only every
+          OPT_FORCED_STEP4-th position and the last ones go into the tree.
+          Each one costs a walk and a long compare, and what they would
+          find later the match's source mostly has too. With none of
+          them (level 9: silesia.tar -7% cycles), a 1 MiB piece of samba
+          came out 7% bigger than with all of them: later matches into
+          the long match's bytes went unfound. Every 4th: silesia.tar -4%
+          cycles, mixed corpus -8%, that piece within 0.6% }
         if e.v4 and (anchor - OPT_FORCED_KEEP4 > b.nextToInsert) then
+        begin
+          k := b.nextToInsert;
+          while k < anchor - OPT_FORCED_KEEP4 do
+          begin
+            BtInsert(b, k, nil);
+            Inc(k, OPT_FORCED_STEP4);
+          end;
           b.nextToInsert := anchor - OPT_FORCED_KEEP4;
+        end;
       end
       else
         start := start + w;
@@ -6313,8 +6327,30 @@ end;
 
 function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+var
+  alt: PByte;
+  r: SizeInt;
 begin
   Result := CompressAny(ctx, src, n, dst, cap, level, flags);
+  { formats v4 and v5, a small block: the format below's block too (v2,
+    or v3 for v5), and the smaller of the two. On a few KiB of text, with
+    few matches at the previous offset, v4's table and parse can lose a
+    few bytes to v2's; on large blocks v4 is always the smaller, and the
+    second compression would cost time for nothing }
+  if (flags and SYLZ_V4 <> 0) and (n <= SMALL_BLOCK4) and (n > 0) then
+  begin
+    alt := GetMem(SylzBound(n));
+    try
+      r := CompressAny(ctx, src, n, alt, SylzBound(n), level, flags and not SYLZ_V4);
+      if (r >= 0) and (r <= cap) and ((Result < 0) or (r < Result)) then
+      begin
+        Move(alt^, dst^, r);
+        Result := r;
+      end;
+    finally
+      FreeMem(alt);
+    end;
+  end;
   { formats v4 and v5: a block bigger than its input, or one that did not
     fit cap, goes out as a block with no sequences: its header and the
     input as the tail literals }
