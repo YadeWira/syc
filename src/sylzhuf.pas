@@ -84,7 +84,7 @@ procedure HufLengths(freq: PUInt32; len: PByte);
 
 var
   { x86-64: decode with the assembler bulk loop, and in it BMI2's shrx
-    (set at startup from cpuid). Both can be cleared (tests, benchmarks);
+    and LZCNT (set at startup from cpuid). Both can be cleared (tests, benchmarks);
     unused on other targets. }
   HufUseAsm: Boolean = True;
   HufUseBmi2: Boolean = False;
@@ -1118,7 +1118,6 @@ asm
   pop rbx
 end;
 
-{ BMI2 (cpuid leaf 7, ebx bit 8) }
 type
   { In/out state of the mode 3 bulk decoder; fixed field order. }
   THufBulk8 = record
@@ -1148,8 +1147,8 @@ type
   memory: FPC reads [rbp + n] as a frame access), edx the symbols left
   in the round; rax, rcx scratch. The bit positions live on the stack.
   HufBulk8Bmi2 uses bzhi, shrx and lzcnt (written as bytes, FPC 3.2's
-  assembler lacks them; every CPU with BMI2 has lzcnt), HufBulk8X64 and,
-  shr cl and bsr. }
+  assembler lacks them; HufUseBmi2 is only set with LZCNT too),
+  HufBulk8X64 and, shr cl and bsr. }
 procedure HufBulk8Bmi2(st: PHufBulk8); assembler; nostackframe;
 asm
   push rbx
@@ -1637,6 +1636,11 @@ asm
   pop rbx
 end;
 
+{ BMI2 (cpuid leaf 7, ebx bit 8) and LZCNT (leaf $80000001, ecx bit 5).
+  HufBulk8Bmi2 needs both: without LZCNT its lzcnt runs as bsr, which
+  gives 63 minus the bits a round took, so the bit positions would run
+  past the rounds the caller allowed for. Every BMI2 CPU has LZCNT, but
+  a virtual machine may report one without the other. }
 function CpuHasBmi2: Boolean; assembler; nostackframe;
 asm
   push rbx
@@ -1647,8 +1651,16 @@ asm
   mov eax, 7
   xor ecx, ecx
   cpuid
-  mov eax, ebx
-  shr eax, 8
+  bt ebx, 8
+  jnc @no
+  mov eax, $80000000
+  cpuid
+  cmp eax, $80000001
+  jb @no
+  mov eax, $80000001
+  cpuid
+  mov eax, ecx
+  shr eax, 5
   and eax, 1
   pop rbx
   ret
