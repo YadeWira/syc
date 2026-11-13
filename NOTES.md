@@ -80,8 +80,12 @@ streams and archives):
   literal-only token, a token that goes on at the previous offset)
   instead of taking an escape; only runs over 32 literals and matches
   over 64 are extended;
-- the token stream comes in chunks of 131072 sequences, each with the
-  built-in table or its own (512 bytes), made from the pairs it uses.
+- the token stream comes in chunks of 131072 sequences; a block starts
+  with the built-in table, and each chunk can replace entries of it (3
+  bytes each) with the pairs it uses more, for the chunks after it too;
+- a block of one small chunk has that chunk's header and the offsets'
+  count in its own header; where v2's layout of the same sequences is
+  smaller (small blocks with few repeats), the block is written as v2.
 
 How it got there, each step measured on silesia.tar and the mixed corpus
 (CPU 20 or 26; the machine was shared, speeds +-5%):
@@ -149,6 +153,59 @@ How it got there, each step measured on silesia.tar and the mixed corpus
   both corpora; speed is not: v4 compresses 11-19% slower at levels
   0-3 and decodes within -9..+9% of v2; v5 decodes up to 14% slower
   than v3 on silesia.tar. So "better in everything" is not met yet.
+
+**Table updates, small blocks** (branch v4-ratio-tables, 2026-11-13),
+ratio with no speed cost; sizes from sylzbench on the twelve Silesia
+files and on pieces of them (4 KiB, 64 KiB, 1 MiB; 8 of each file):
+
+- **Updates instead of whole tables.** A chunk lists the entries it
+  replaces (3 bytes each, UpdateTable4: the least asked-for codes go to
+  the most asked-for cells while each swap pays) instead of 512 bytes or
+  nothing; new cells for literals with an extended match and both
+  extended; the offsets' count as 1-5 bytes after the tokens, chunk
+  headers of 2 bytes under 16384 token bytes. One code array by cell
+  (TCodes4, read the same way by sylzc.c), so the update walks cells and
+  codes by index.
+- **Levels 9-10**: a pair with no code is priced 0.75 byte under its two
+  tokens (OPT4_MISS), or the parse never asks for what the update could
+  give: level 9, twelve files, 74 049 235 -> 73 937 832 bytes.
+- **Splits**: a sequence that is split takes any split that has a code
+  (FindSplit4), not only the first one tried.
+- **Small blocks**: one chunk under 2^14 token bytes keeps its header in
+  the block's (bit 29); trailing sequences that cost more than their
+  match saves are dropped into the tail (DropTail4); a block of one
+  chunk goes out in v2's layout when that is smaller, decided from the
+  counts before any token is written.
+- **Levels 2-3**: a repeat one byte on that is shorter than 8 bytes gives
+  way to the long table's candidate at the byte before it when that one
+  reaches 2 bytes further: -0.11..-0.13% on silesia.tar (64 KiB of
+  mozilla, level 2: 16279 -> 15879 bytes, v2 15784), compress
+  instructions +0.3%, wall clock within noise.
+- **Counting**: counting every sequence of a chunk costs some 40
+  instructions each; under 2048 sequences all are counted (and the v2
+  layout weighed), above that one in up to 8 as before. With all counted
+  up to 16384, 64 KiB pieces compressed 8% more instructions at level 1
+  (10% slower) for 0.11% less.
+- **Result**, against master: whole files -0.11% (levels 0-1), -0.25%
+  (2-3), -0.15..-0.20% (4-8), -0.32% (9-10) for v4; v5 -0.16..-0.41%.
+  v4 is smaller than v2 on every Silesia file at every level (worst
+  -0.010%; master: 16 file-levels larger, worst +0.12%); v5 smaller than
+  v3 everywhere but mr at level 10 (+0.011%; master: 18, worst +0.36%).
+  Pieces, v4 against v2: 4 KiB -1.2..-2.1%, 64 KiB -1.1..-2.0%, 1 MiB
+  -1.3..-2.1% (0.1-0.6 points better than master), but 8-30 of the 96 pieces
+  per level still come out a few bytes bigger (worst +176 bytes on 64
+  KiB, +1646 on an incompressible 1 MiB piece of x-ray where both
+  formats are bigger than the input).
+- **Speed** against master (silesia.tar, CPU 27, a loaded machine):
+  compress and decode MB/s within -6..+6% either way at every level,
+  best of 2 interleaved; perf, user-space instructions per block:
+  compress +0.1..+0.4% (levels 1-9), decode within 0.2%. Small inputs:
+  4 KiB pieces compress with 10% fewer instructions than master (no
+  512-byte table to build), 64 KiB +0.9%, 1 MiB +0.4%.
+- **Tried and dropped**: at levels 0-1 the same candidate-against-repeat
+  check (-0.07% size, +1.7-2.2% compress instructions, 1-4% slower);
+  no OPT4_MISS on blocks up to 64 KiB (+0.07..+0.21%); the count in C
+  (no clear gain in instructions over the Pascal routine).
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its

@@ -50,11 +50,15 @@
   the literals in v3's chunks. Bit 30 of the first u32 tells them from v2
   and v3:
 
-    block    := hdr:u32le  tokens[tokLen]  [offCount  offsets[2 * offCount]]
+    block    := hdr:u32le  tokens[tokLen]  [offCount]  offsets[2 * offCount]
                 litsection
-    hdr      := tokLen | (bit 30) | (bit 31: literals entropy-coded, v5)
+    hdr      := tokLen (bits 0..28) | (bit 30) | (bit 31: literals
+                entropy-coded, v5); or, with bit 29 set, a block of one
+                chunk: tokLen (bits 0..13), offCount (bits 14..27), the
+                chunk header's bit 0 (bit 28); that chunk has no header
+                then, and no offCount follows the tokens
     offCount := 1 to 5 bytes, 7 bits each, low bits first, bit 7 set on
-                all but the last; it and the offsets only when tokLen > 0
+                all but the last; none when tokLen = 0 (no offsets)
     tokens   := chunk*
     chunk    := chdr  [update]  token-bytes[n]
     chdr     := 2 bytes (u16le, n = bits 2..15) when bit 1 is clear,
@@ -70,7 +74,10 @@
                 from 4 at a new offset, from 2 at the previous one
 
   The table is SYLZ_TOKENS4 when a block starts; a chunk's update replaces
-  the entries it lists, for that chunk and the ones after it.
+  the entries it lists, for that chunk and the ones after it. A block
+  that a v4 or v5 encoder writes may also be a v2 or v3 block, where
+  that layout is smaller (a small block with few matches at the previous
+  offset): decoders take each block by its header.
 
   A match at the previous sequence's offset costs a token and no offset
   bytes: in structured data a fifth to a half of the matches are such.
