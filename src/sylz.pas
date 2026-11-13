@@ -192,7 +192,8 @@ const
     literals that, Huffman-coded, they decode slower than level 2's parse
     and compress worse: silesia.tar 40.11% / 1655 MB/s, 39.21% / 1795,
     against 38.80% / 2209); 9 and 10 run the optimal parser with each
-    literal priced by its Huffman code (CompressOptEC). }
+    literal priced by its Huffman code (CompressOptEC). Format v5 (with
+    SYLZ_V4) parses its levels 0..8 one level lower (V5_LEVELS). }
   SYLZ_EC_SHIFT = 2;
   SYLZ_EC_MAXLEVEL = SYLZ_MAXLEVEL;   { 9 and 10: entropy-aware prices }
   SYLZ_V4 = 2;        { format v4; with SYLZ_ENTROPY, v5 }
@@ -3570,7 +3571,7 @@ const
   HCW_OPTIMAL_ML = 18;
 
 function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
-  level: Integer): SizeInt;
+  attempts: Integer): SizeInt;
 var
   iend: PByte;
   mfl, pos, anchor, ml, ref, ml0, ref0, start0, ml2, ref2, start2,
@@ -3594,7 +3595,7 @@ begin
     s.src := src;
     s.iend := iend;
     s.nextToInsert := 0;
-    s.attempts := HC_ATTEMPTS[level];
+    s.attempts := attempts;
     mfl := n - SEARCH_TAIL;
     pos := 0;
     ml := 0; ref := 0; ml0 := 0; ref0 := 0; start0 := 0;
@@ -3766,7 +3767,7 @@ procedure sylzc_compress_hc4(st: Pointer); cdecl; external name 'sylzc_compress_
 {$endif}
 
 function CompressHC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
-  cap: SizeInt; level: Integer): SizeInt;
+  cap: SizeInt; attempts: Integer): SizeInt;
 var
   e: TEmit;
   s: THcState;
@@ -3793,7 +3794,7 @@ begin
     s.src := src;
     s.iend := src + n;
     s.nextToInsert := 0;
-    s.attempts := HC_ATTEMPTS[level];
+    s.attempts := attempts;
     sc.s := @s;
     sc.search := @sylzc_hc_search;
 {$ifdef SYLZ_ASM_X64}
@@ -3809,7 +3810,7 @@ begin
     Exit(EmitFinish(e, src + sc.anchor, n - sc.anchor));
   end;
 {$endif}
-  Result := CompressHCCore(src, n, e, s, level);
+  Result := CompressHCCore(src, n, e, s, attempts);
 end;
 
 { ── optimal parser ──────────────────────────────────────────────────────── }
@@ -4886,9 +4887,11 @@ end;
   33.98 -> 33.61% (-ec 9) / 33.60% (-ec 10), mixed 57.15 -> 56.94 /
   56.91%, at about half the speed (two parses) and ~5% slower decode (more
   literals). A third parse, priced from the second's literals, gained
-  0.02 points (33.58%). }
+  0.02 points (33.58%). The first parse runs with stats, the second with
+  p (format v3: the same; format v5's -ec 9: a first parse with a
+  shallow tree, V5_OPT_STATS). }
 function CompressOptEC(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
-  cap: SizeInt; const p: TSylzOptParams): SizeInt;
+  cap: SizeInt; const stats, p: TSylzOptParams): SizeInt;
 var
   e: TEmit;
   b: TBtState;
@@ -4896,7 +4899,7 @@ var
   hist: PUInt32;
   prices: PInt32;
 
-  procedure ResetTree;
+  procedure ResetTree(const q: TSylzOptParams);
   begin
     FillChar(ctx.bt^, SizeOf(UInt32) shl BT_HASHLOG, 0);
     b.src := src;
@@ -4904,8 +4907,8 @@ var
     b.head := ctx.bt;
     b.son := ctx.bt + (1 shl BT_HASHLOG);
     b.nextToInsert := 0;
-    b.cut := p.btCut;
-    b.maxLen := p.btMaxLen;
+    b.cut := q.btCut;
+    b.maxLen := q.btMaxLen;
   end;
 
 begin
@@ -4918,13 +4921,13 @@ begin
   prices := GetMem(regions * 256 * SizeOf(Int32));
   try
     FillChar(hist^, regions * 256 * SizeOf(UInt32), 0);
-    ResetTree;
+    ResetTree(stats);
     { nothing is emitted in this pass, but the parse depends on the format }
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
     e.roomy := cap >= SylzBound(n);
-    CompressOptCore(src, n, e, b, ctx.opt, p, nil, hist);
+    CompressOptCore(src, n, e, b, ctx.opt, stats, nil, hist);
     LiteralPrices(hist, regions, prices);
-    ResetTree;
+    ResetTree(p);
     EmitInit(e, dst, cap, ctx.scratch, src + n, ctx.flags, ctx.offs, ctx.recs);
     e.roomy := cap >= SylzBound(n);
     Result := CompressOptCore(src, n, e, b, ctx.opt, p, prices, nil);
@@ -4958,10 +4961,43 @@ begin
   Result := SylzCompressEx(ctx, src, n, dst, cap, level, 0);
 end;
 
+type
+  TV5Level = record
+    parse, attempts: Integer;
+  end;
+
+const
+  { Format v5's levels 0..8: the parse (format v4's level) and, at the
+    hash chain levels, the chain attempts; one level below v3's (v2's
+    level + SYLZ_EC_SHIFT). v4's parse at a level is smaller than v2's at
+    the next one, and with eight Huffman streams the literals decode fast
+    enough to take the fast parse at -ec 0 (v4's level 1: silesia.tar 1.36
+    M cycles per MB decoded, v3's -ec 0 1.50). -ec 3 takes 3 attempts,
+    where level 4 has 2: with 2 silesia.tar came out 0.05% bigger than
+    v3's -ec 3, with 3 1.5% smaller and still 5% fewer cycles. Against v3
+    at each of -ec 0..8 (2026-11-13, silesia.tar and mixed.tar): 0.2-3.0%
+    smaller, 3-65% fewer cycles to compress. As level + 2, like v3, v5
+    took 5-17% more than v3 at most of them. }
+  V5_LEVELS: array[0..8] of TV5Level = (
+    (parse: 1; attempts: 0), (parse: 2; attempts: 0), (parse: 3; attempts: 0),
+    (parse: 4; attempts: 3), (parse: 5; attempts: 4), (parse: 6; attempts: 8),
+    (parse: 7; attempts: 16), (parse: 8; attempts: 64), (parse: 9; attempts: 0));
+
+  { Format v5's -ec 9: the first parse of CompressOptEC only counts the
+    literals, and a shallow tree counts nearly the same ones: silesia.tar
+    69.22 MB against 68.98 with OPT_LEVEL9's, in 629 M cycles per MB
+    instead of 895 (v3's -ec 9: 71.23 MB, 823). -ec 10 is OPT_LEVEL9 in
+    both parses: level 10's deeper tree came out bigger in v5 (69.21 MB). }
+  V5_OPT_STATS: TSylzOptParams = (btCut: 2; btMaxLen: 256; sufficient: 16;
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+
 function SylzCompressEx(var ctx: TSylzCtx; src: PByte; n: SizeInt; dst: PByte;
   cap: SizeInt; level: Integer; flags: Integer): SizeInt;
+var
+  attempts: Integer;
 begin
   ctx.flags := flags;
+  attempts := 0;   { HC_ATTEMPTS[level] }
   if cap < HEADER4_SIZE then
     Exit(-1);
   { v4's offsets: 2 bytes for each match at a new offset, of 4 bytes or more }
@@ -4987,12 +5023,25 @@ begin
         ctx.scratchSize := n + SCRATCH_SLACK;
         ctx.scratch := GetMem(ctx.scratchSize);
       end;
+      if flags and SYLZ_V4 <> 0 then
+      begin
+        if level = SYLZ_MAXLEVEL - 1 then
+          Exit(CompressOptEC(ctx, src, n, dst, cap, V5_OPT_STATS, OPT_LEVEL9))
+        else
+          Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9));
+      end;
       if level = SYLZ_MAXLEVEL - 1 then
-        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9))
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9))
       else
-        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10));
+        Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL10, OPT_LEVEL10));
     end;
-    Inc(level, SYLZ_EC_SHIFT);
+    if flags and SYLZ_V4 <> 0 then
+    begin
+      attempts := V5_LEVELS[level].attempts;
+      level := V5_LEVELS[level].parse;
+    end
+    else
+      Inc(level, SYLZ_EC_SHIFT);
   end;
   if level > SYLZ_MAXLEVEL then
     level := SYLZ_MAXLEVEL;
@@ -5011,7 +5060,11 @@ begin
   else if level = 10 then
     Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL10)
   else
-    Result := CompressHC(ctx, src, n, dst, cap, level);
+  begin
+    if attempts = 0 then
+      attempts := HC_ATTEMPTS[level];
+    Result := CompressHC(ctx, src, n, dst, cap, attempts);
+  end;
 end;
 
 function SylzCompress(src: PByte; n: SizeInt; dst: PByte; cap: SizeInt;
