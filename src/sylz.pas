@@ -1684,26 +1684,42 @@ end;
 procedure DropTail4(var e: TEmit; var lit: PByte; var litLen: SizeInt);
 var
   r, last: PUInt16;
-  ll, ml, dist: SizeInt;
+  ll, ml, dist, prev, k: SizeInt;
+
+  { whether a long record may end at q: only from the first one on can
+    that be told }
+  function LongBefore(q: PUInt16): Boolean;
+  begin
+    Result := (q - e.recs >= 3 * REC4_LONG) and ((q - 3 * REC4_LONG)^ = REC4_ESC);
+  end;
+
 begin
   while e.rec > e.recs do
   begin
+    { the last record, and the distance before it }
     last := e.rec - 3;
-    if (e.rec - e.recs >= 3 * REC4_LONG) and ((e.rec - 3 * REC4_LONG)^ = REC4_ESC) then
+    prev := e.tokRep;
+    if LongBefore(e.rec) or ((last > e.recs) and LongBefore(last)) then
     begin
-      { a long record may end here: only from the first one on can that
-        be told }
       r := e.recs;
       while r < e.rec do
       begin
+        if r > e.recs then
+          prev := dist;
         last := r;
         GetRec4(r, ll, ml, dist);
       end;
-    end;
+    end
+    else if last > e.recs then
+      prev := SizeInt(last[-1]) + 1;
     r := last;
     GetRec4(r, ll, ml, dist);
-    { at the least one token and the run's extension }
-    if (ll <= LIT_SPLIT4) or (ll div 255 + 2 < ml) then
+    { at the least one token and the run's extension, and the offset at a
+      new distance }
+    k := 2;
+    if dist = prev then
+      k := 0;
+    if (ll <= LIT_SPLIT4) or (ll div 255 + 2 + k < ml) then
       Break;
     e.rec := last;
     Dec(e.lit, ll);
