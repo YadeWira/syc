@@ -7,7 +7,8 @@
   faults immediately instead of going unnoticed. Cases alternate between
   the assembler (or C: SylzPreferC) and the Pascal code paths (SylzUseAsm; for the Huffman
   decoder, HufUseAsm and HufUseBmi2 in turn), and every
-  compressed block is also produced by the other path and compared. }
+  compressed block is also produced by the other path and compared.
+  Damaged blocks go through every decoder, which must agree. }
 program sylzfuzz;
 
 {$mode objfpc}{$H+}
@@ -170,6 +171,41 @@ begin
   Halt(1);
 end;
 
+{ A damaged block decoded by every decoder: assembler, C and Pascal (with
+  the Huffman decoder's assembler and Pascal along), each into an output
+  of exactly n bytes against a guard page. They must agree on the result,
+  and on the bytes when it decodes. }
+procedure DecodeAll(src: PByte; csize, n: SizeInt);
+const
+  PATHS = 3;
+var
+  keepAsm, keepC, keepHuf: Boolean;
+  outs: array[0..PATHS - 1] of TGuarded;
+  rs: array[0..PATHS - 1] of SizeInt;
+  j: Integer;
+begin
+  keepAsm := SylzUseAsm;
+  keepC := SylzPreferC;
+  keepHuf := HufUseAsm;
+  for j := 0 to PATHS - 1 do
+  begin
+    SylzUseAsm := j < 2;
+    SylzPreferC := j = 1;
+    HufUseAsm := j = 0;
+    outs[j] := GuardedAlloc(n);
+    rs[j] := SylzDecompress(src, csize, outs[j].p, n);
+  end;
+  SylzUseAsm := keepAsm;
+  SylzPreferC := keepC;
+  HufUseAsm := keepHuf;
+  for j := 1 to PATHS - 1 do
+    if (rs[j] <> rs[0])
+       or ((rs[0] = n) and (n > 0) and (CompareByte(outs[0].p^, outs[j].p^, n) <> 0)) then
+      Fail('decoders disagree on a damaged block', n, -1);
+  for j := 0 to PATHS - 1 do
+    GuardedFree(outs[j]);
+end;
+
 procedure OneCase;
 var
   n, level, csize, r, i, flips, cut: SizeInt;
@@ -221,8 +257,8 @@ begin
       bad.p[RandBelow(csize)] := Byte(Rand);
       Dec(flips);
     end;
-    SylzDecompress(bad.p, csize, outp.p, n);
-    Inc(corrupt);
+    DecodeAll(bad.p, csize, n);
+    Inc(corrupt, 3);
   end;
   GuardedFree(bad);
 

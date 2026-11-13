@@ -157,6 +157,34 @@ begin
   Move(s[1], Result[0], n);
 end;
 
+{ binary records: 24 bytes, of them 3 random and the rest a few fields
+  that repeat (other pairs of literals and match than text's) }
+function Records(n: SizeInt): TBytes;
+var
+  i, j: SizeInt;
+begin
+  SetLength(Result, n);
+  for i := 0 to n - 1 do
+  begin
+    j := i mod 24;
+    if j < 3 then
+      Result[i] := Byte(Rnd)
+    else if j < 12 then
+      Result[i] := Byte((i div 24) mod 7 + j)
+    else
+      Result[i] := Byte(j * 5 + (i div 960) mod 3);
+  end;
+end;
+
+function Concat(const a, b: TBytes): TBytes;
+begin
+  SetLength(Result, Length(a) + Length(b));
+  if Length(a) > 0 then
+    Move(a[0], Result[0], Length(a));
+  if Length(b) > 0 then
+    Move(b[0], Result[Length(a)], Length(b));
+end;
+
 function Slice(const b: TBytes; n: SizeInt): TBytes;
 begin
   if n > Length(b) then
@@ -197,5 +225,9 @@ begin
   Emit('max-length-codes', SteepLiterals(150000));     { codes up to 11 bits }
   Emit('generated-text', GeneratedText(300000));
   Emit('tiny-text', Slice(textSample, 300));           { under 256 literals: a raw chunk }
+  { v4/v5: more than one token chunk (over CHUNK4_TOKENS token bytes at
+    levels 0-3, CHUNK4_SEQS sequences above), and table updates after the
+    first chunk's }
+  Emit('many-chunks', Concat(GeneratedText(900000), Records(1500000)));
   WriteLn('vectors written to ', outDir);
 end.
