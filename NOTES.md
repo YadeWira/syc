@@ -66,6 +66,54 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## v4 levels 2-3: tokens written at once (2026-11-13)
+
+Asked for: v4 at least as fast as v2 at levels 2 and 3, both ways, still
+smaller. Before, v4 compressed 8-16% slower and decoded 2-9% slower
+(mixed corpus). The format did not change; the encoder did:
+
+- **Tokens written as the sequences are found** (EmitDirect4, C
+  emit_direct4, CompressMid4X64), with the built-in table, the block's
+  token stream one chunk: the records and the second pass with a table
+  per chunk were 6-8% of these levels' time for 0.1 points (silesia.tar
+  level 2: 39.41% with them, 39.50% without).
+- **Fewer short sequences, which the decoder pays for one by one**: right
+  after a match the short table's candidate must match 5 bytes, and after
+  more than 16 literals a 4-byte match at a new offset is not taken.
+  Without the first, decode cycles +3-7% (perf, cycles per byte: level 2
+  silesia.tar 1.084 against 1.018, mixed 1.040 against 0.972; level 3
+  1.086 / 1.051, 1.020 / 0.955; v2 1.079, 1.001, 1.055, 1.010) and
+  instructions +7%, for 0.13% (level 2) and 0.55% (level 3) smaller on
+  silesia.tar. The second changes the size by under 0.1% either way.
+- **A shorter probe in the assembler**: the tables hold the low 16 bits of
+  pointers (filled with src's), the 8 bytes at ip stay in a register for
+  both hashes and compares, the step is worked out only past 512
+  literals, and the first probe after a match has its own copy. One trap:
+  the look one byte on after a match puts ip+1 in the tables, so when
+  that match is then refused (the 4-byte rule) the probe at ip+1 finds
+  itself, a distance of 65536, before src in the first 64 KiB: MidCand
+  refuses it (dist > pos), the assembler now too (the fuzzer found it).
+- **Level 3 keeps 2^16-entry tables**: with level 2's 2^15 it compressed
+  20% faster (243.8 against 204.5 MB/s, silesia.tar) but 0.28 points
+  bigger (39.25% against 38.97%); with them it is still faster than v2.
+
+CPU 18, both formats from the same binary, interleaved, best of 5 runs of
+2 s; MB/s compress / decompress, ratio:
+
+| | v2 | v4 before | v4 now |
+|---|---|---|---|
+| silesia.tar 2 | 250 / 2890, 40.89% | 223 / 2959, 39.41% | **278 / 3045**, 39.57% |
+| silesia.tar 3 | 187 / 2891, 39.99% | 170 / 2865, 38.62% | **210 / 3013**, 38.97% |
+| mixed.tar 2 | 268 / 3105, 63.29% | 246 / 3029, 61.94% | **361 / 3212**, 62.40% |
+| mixed.tar 3 | 198 / 3009, 62.89% | 183 / 2998, 61.62% | **265 / 3126**, 62.16% |
+
+v5 at `-ec 0` / `-ec 1` (the same parser) against v3: compresses 6-13%
+faster, decodes 1.5-3.5% slower (best of 3; v5's literal chunks, not
+this). What it costs: per file of Silesia, v4 is now bigger than v2 on
+sao (+0.9% level 2, +1.3% level 3), osdb (+0.5, +0.8%), x-ray (+0.1,
++0.8%), and at level 3 mr, webster and dickens (+0.06-0.6%); the 5-byte
+rule is most of it on sao and osdb, the built-in table the rest.
+
 ## sylz formats v4 and v5 (2026-11-12, provisional)
 
 Asked for: formats better than v2 and v3 in everything. What they are
