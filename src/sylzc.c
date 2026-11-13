@@ -633,6 +633,8 @@ static intptr_t fast_dist(intptr_t pos, uint16_t stored)
     return d ? d : 65536;
 }
 
+struct sylzc_codes4;
+
 /* The encoder's output streams (TEmit's write pointers). */
 typedef struct {
     uint8_t *ctrl, *lit;          /* control and literal write pointers */
@@ -640,8 +642,14 @@ typedef struct {
     const uint8_t *exact;         /* ExactCode[0..EXACT_LL][0..EXACT_M] */
     intptr_t rep;                 /* format v4: the previous sequence's distance */
     uint16_t *rec, *recEnd;       /* v4: where the next sequence is recorded */
-    void (*flush)(void *);        /* v4: called with this struct when rec == recEnd */
+    void (*flush)(void *);        /* v4: called with this struct when rec == recEnd,
+                                     or (direct) when ctrl has reached tokEnd */
     void *owner;                  /* v4: sylz.pas's TEmit */
+    /* v4, levels 0-1: a chunk is open and the sequences go into it as
+       tokens at ctrl (up to tokEnd), by its codes; their offsets at off */
+    intptr_t direct;
+    uint8_t *tokEnd, *off;
+    const struct sylzc_codes4 *codes;
 } sylzc_emit;
 
 /* TCodes4 in sylz.pas: the codes of a format v4 token table (the
@@ -838,6 +846,69 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
     return p;
 }
 
+/* emit_fast4 for levels 0-1, where only a chunk's first sequences are
+   recorded and the ones after them go into it as tokens (e->direct), as
+   EmitDirect4 in sylz.pas writes them: tok and off are the loop's token
+   and offset write pointers. prev: the distance before this sequence. */
+static inline __attribute__((always_inline)) void emit_open4(sylzc_emit *e,
+    uint16_t **prec, uint8_t **ptok, uint8_t **poff, uint8_t **plit,
+    const uint8_t *lit, intptr_t litLen, intptr_t dist, intptr_t matchLen,
+    intptr_t prev)
+{
+    uint8_t *w = *plit;
+    /* a full chunk is closed and full records are flushed, which may
+       leave their chunk open, until one of them takes the sequence */
+    while (__builtin_expect(e->direct ? *ptok >= e->tokEnd : *prec >= e->recEnd, 0)) {
+        e->rec = *prec;
+        e->ctrl = *ptok;
+        e->off = *poff;
+        e->lit = w;
+        e->rep = prev;
+        e->flush(e);
+        *prec = e->rec;
+        *ptok = e->ctrl;
+        *poff = e->off;
+    }
+    if (e->direct) {
+        uint8_t *p = *ptok, *o = *poff;
+        int k = dist == prev, code = 255;
+        if (litLen <= MAX_LL4 && matchLen <= MAX_ML4)
+            code = e->codes->exact[k][litLen][matchLen];
+        if (__builtin_expect(code != 255, 1))
+            *p++ = (uint8_t)code;
+        else
+            p = put_tokens4(e->codes, p, k, litLen, matchLen);
+        *ptok = p;
+        o[0] = (uint8_t)(dist - 1);
+        o[1] = (uint8_t)((dist - 1) >> 8);
+        *poff = o + 2 - 2 * k;
+    } else {
+        uint16_t *r = *prec;
+        r[2] = (uint16_t)(dist - 1);
+        if (__builtin_expect(litLen < 0xFFFF && matchLen <= 0xFFFF, 1)) {
+            r[0] = (uint16_t)litLen;
+            r[1] = (uint16_t)matchLen;
+            r += 3;
+        } else {
+            uint32_t v;
+            r[0] = 0xFFFF;
+            r[1] = 0;
+            v = (uint32_t)litLen;
+            __builtin_memcpy(r + 3, &v, 4);
+            v = (uint32_t)matchLen;
+            __builtin_memcpy(r + 5, &v, 4);
+            r += 9;
+        }
+        *prec = r;
+    }
+    if (__builtin_expect(litLen <= 16 && e->srcEnd - lit >= 16, 1))
+        copy16(w, lit);
+    else
+        for (intptr_t i = 0; i < litLen; i++)
+            w[i] = lit[i];
+    *plit = w + litLen;
+}
+
 /* TPut4C in sylz.pas */
 typedef struct {
     const uint16_t *rec, *rend;
@@ -977,7 +1048,7 @@ void sylzc_compress_fast4(sylzc_fast *st)
     int hashLog = (int)st->hashLog;
     sylzc_emit e = st->e;
     uint16_t *rec = e.rec;
-    uint8_t *wlit = e.lit;
+    uint8_t *wlit = e.lit, *tok = e.ctrl, *off = e.off;
     intptr_t anchor = 0, ip, fwd, ref = 0, d, len, probes, mflimit, rep = 1;
     uint32_t h, fwdH;
 
@@ -999,8 +1070,10 @@ void sylzc_compress_fast4(sylzc_fast *st)
             d = fast_dist(ip, table[h]);
             fwdH = hash_fast(src + fwd, hashLog);
             table[h] = (uint16_t)ip;
-            /* the previous offset, one byte on */
-            if (rep <= ip + 1 && read32(src + ip + 1 - rep) == read32(src + ip + 1)) {
+            /* the previous offset, one byte on, while the probes step
+               one byte */
+            if (probes <= (2 << SKIP_STRENGTH)
+                && read32(src + ip + 1 - rep) == read32(src + ip + 1)) {
                 ip++;
                 ref = ip - rep;
                 break;
@@ -1015,7 +1088,8 @@ void sylzc_compress_fast4(sylzc_fast *st)
         }
         for (;;) {
             len = MINMATCH + count_match_inl(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
-            emit_fast4(&e, &rec, &wlit, src + anchor, ip - anchor, ip - ref, len);
+            emit_open4(&e, &rec, &tok, &off, &wlit, src + anchor, ip - anchor, ip - ref,
+                       len, rep);
             rep = ip - ref;
             ip += len;
             anchor = ip;
@@ -1034,6 +1108,8 @@ void sylzc_compress_fast4(sylzc_fast *st)
     }
 done:
     e.rec = rec;
+    e.ctrl = tok;
+    e.off = off;
     e.lit = wlit;
     e.rep = rep;
     st->anchor = anchor;
