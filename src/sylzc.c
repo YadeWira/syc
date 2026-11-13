@@ -2007,15 +2007,31 @@ typedef struct {
     } while (0)
 
 /* The j-th symbol of every stream: the four chains interleaved, each
-   symbol waiting for its own stream's previous one only. Written out
-   five times rather than as a loop: gcc -O2 kept the loop (a counter and
-   a branch per four symbols). */
+   symbol waiting for its own stream's previous one only. On 64-bit
+   targets the five rows are written out: gcc -O2 kept the loop (a counter
+   and a branch per four symbols). On 32-bit x86 the loop was 4-7% faster
+   (its eight halves of buffers do not fit the registers either way, and
+   the loop is smaller). */
 #define HUF4_ROW(j) do {                              \
         HUF4_SYM(b0, c0, o0, j);                      \
         HUF4_SYM(b1, c1, o1, j);                      \
         HUF4_SYM(b2, c2, o2, j);                      \
         HUF4_SYM(b3, c3, o3, j);                      \
     } while (0)
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define HUF4_ROWS() do {                              \
+        HUF4_ROW(0);                                  \
+        HUF4_ROW(1);                                  \
+        HUF4_ROW(2);                                  \
+        HUF4_ROW(3);                                  \
+        HUF4_ROW(4);                                  \
+    } while (0)
+#else
+#define HUF4_ROWS() do {                              \
+        for (int j_ = 0; j_ < 5; j_++)                \
+            HUF4_ROW(j_);                             \
+    } while (0)
+#endif
 
 /* Rounds of a refill and five symbols per stream until out0 reaches
    outEnd (at least one round). A round reads 8 bytes at each p and moves
@@ -2038,11 +2054,7 @@ void sylzc_huf_bulk4(sylzc_hufbulk *st)
         HUF4_REFILL(b1, c1, p1);
         HUF4_REFILL(b2, c2, p2);
         HUF4_REFILL(b3, c3, p3);
-        HUF4_ROW(0);
-        HUF4_ROW(1);
-        HUF4_ROW(2);
-        HUF4_ROW(3);
-        HUF4_ROW(4);
+        HUF4_ROWS();
         o0 += 5;
         o1 += 5;
         o2 += 5;
@@ -2103,9 +2115,8 @@ typedef struct {
 
 /* The j-th symbol of every stream, in stream order: the eight chains
    interleaved (a chain is a table load and a shift, ~6-7 cycles; eight of
-   them hide it where four cannot). Written out five times rather than as
-   a loop: gcc -O2 kept the loop (a counter and a branch per eight
-   symbols). */
+   them hide it where four cannot). The five rows written out on 64-bit
+   targets, the loop on 32-bit ones, as for HUF4_ROWS. */
 #define HUF8_ROW(j) do {                              \
         HUF8_SYM(b0, c0, 0, j);                       \
         HUF8_SYM(b1, c1, 1, j);                       \
@@ -2116,6 +2127,20 @@ typedef struct {
         HUF8_SYM(b6, c6, 6, j);                       \
         HUF8_SYM(b7, c7, 7, j);                       \
     } while (0)
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define HUF8_ROWS() do {                              \
+        HUF8_ROW(0);                                  \
+        HUF8_ROW(1);                                  \
+        HUF8_ROW(2);                                  \
+        HUF8_ROW(3);                                  \
+        HUF8_ROW(4);                                  \
+    } while (0)
+#else
+#define HUF8_ROWS() do {                              \
+        for (int j_ = 0; j_ < 5; j_++)                \
+            HUF8_ROW(j_);                             \
+    } while (0)
+#endif
 
 /* Rounds of five symbols from each of the eight streams (40 output
    bytes: symbol j of stream k at out0 + 8j + k) until out0 reaches outEnd
@@ -2152,11 +2177,7 @@ void sylzc_huf_bulk8(sylzc_hufbulk8 *st)
         HUF8_LOAD(b5, r5);
         HUF8_LOAD(b6, r6);
         HUF8_LOAD(b7, r7);
-        HUF8_ROW(0);
-        HUF8_ROW(1);
-        HUF8_ROW(2);
-        HUF8_ROW(3);
-        HUF8_ROW(4);
+        HUF8_ROWS();
         r0 += HUF8_TAKEN(b0, c0);
         r1 += HUF8_TAKEN(b1, c1);
         r2 += HUF8_TAKEN(b2, c2);
