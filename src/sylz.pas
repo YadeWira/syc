@@ -8078,6 +8078,9 @@ begin
     begin
       { one chunk; its header's flag and the offsets' count are in hdr }
       one := Ord(hdr and HDR4_UPDATE <> 0) * CHUNK4_UPDATE;
+      { an update needs bytes to be in: with no tokens, the flag is wrong }
+      if (one <> 0) and (ctrlLen = 0) then
+        Exit(-1);
       count := (hdr shr HDR4_BITS) and (1 shl HDR4_BITS - 1);
       if count > UInt32((send - cend) shr 1) then
         Exit(-1);

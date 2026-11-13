@@ -313,6 +313,8 @@ def decode_block4(b, n):
     off_count = 0
     if one:
         off_count = (hdr >> 14) & 0x3FFF
+        if hdr & 0x10000000 and tok_len == 0:
+            raise SylzError("an update flag with no token bytes")
         if off_count > (len(b) - i) // 2:
             raise SylzError("offsets past the block")
     elif tok_len:

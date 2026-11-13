@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""sylz_bad.py - damaged sylz blocks of formats v4 and v5, for decoders.
+"""sylz_cases.py - hand-made sylz blocks of formats v4 and v5, for decoders.
 
-Each case is a block that a decoder must reject, built from a valid block
-by one change, so it fails for exactly the reason its name gives. The
-valid block is checked first (tools/sylz_ref.py must decode it), then the
-damaged one (sylz_ref.py must reject it).
+Each case covers one rule of the format (wiki: sylz format): good-* blocks
+must decode to the size given, bad-* blocks must be rejected, each for
+exactly the reason its description gives (a bad block is a good one with
+one change). tools/sylz_ref.py checks every case as it is written.
 
-    python3 sylz_bad.py DIR    write DIR/NAME.blk and DIR/NAME.size (the
-                               decoded size to pass), one pair per case
-    python3 sylz_bad.py --list the cases and why each must be rejected
+    python3 sylz_cases.py DIR    write DIR/NAME.blk, DIR/NAME.size (the
+                                 decoded size, which the container gives)
+                                 and DIR/MANIFEST.txt (what each covers)
+    python3 sylz_cases.py --list the cases
 
-A decoder is right on these if it returns an error for every one: syc
-does (`syc t --raw --size N NAME.blk` exits with 3), and CI checks it.
+A decoder is right on these if it decodes every good block to the bytes
+sylz_ref.py gives and rejects every bad one: syc does (`syc t --raw
+--size N NAME.blk` exits with 0 or 3), and CI checks it on every path.
 """
 import os
 import struct
@@ -138,7 +140,7 @@ def case(name, why):
     return deco
 
 
-@case('ok-base', 'not damaged: must decode (a control)')
+@case('base', 'not damaged: one chunk, a match at a new offset then one at the previous offset, then the tail (most bad cases change this block)')
 def _ok():
     ch, offs, lits, n = valid_base()
     return block4(ch, offs, lits), n, False
@@ -301,6 +303,11 @@ def _v():
     return bytes(b), 14, True
 
 
+@case('one-chunk-update-no-tokens', 'a block of one chunk with the update flag (bit 28) and no token bytes')
+def _v2():
+    return struct.pack('<I', 0x70000000) + b'abc', 3, True
+
+
 @case('one-chunk-ok', 'not damaged: a block of one chunk (a control)')
 def _w():
     toks = bytes([code(4, 4, 'new'), code(0, 4, 'prev')])
@@ -384,6 +391,158 @@ def _ai():
     return struct.pack('<I', 0x80000000) + sec, len(lits), True
 
 
+# ── more good blocks: one rule of the format each ──────────────────────────
+
+def upd(*pairs):
+    """an update: (code, entry) pairs, in order"""
+    return bytes([len(pairs) - 1]) + b''.join(bytes([c]) + struct.pack('<H', e) for c, e in pairs)
+
+
+@case('chunk-header-4-bytes', 'not damaged: a 4-byte chunk header (bit 1) for a small chunk')
+def _g1():
+    toks = bytes([code(4, 4, 'new'), code(0, 4, 'prev')])
+    return block4([chdr(len(toks), long=True) + toks], [4], b'abcdxy'), 14, False
+
+
+@case('chunk-n0-update', 'not damaged: a chunk of 0 token bytes with an update; the next chunk uses it')
+def _g2():
+    return block4([chdr(0, update=True) + upd((60, entry(4, 4, False))), chdr(1) + bytes([60])],
+                  [4], b'abcd'), 8, False
+
+
+@case('update-code-twice', 'not damaged: an update that lists one code twice: the later entry wins')
+def _g3():
+    u = upd((60, entry(2, 4, False)), (60, entry(4, 4, False)))
+    return block4([chdr(1, update=True) + u + bytes([60])], [4], b'abcd'), 8, False
+
+
+@case('update-256', 'not damaged: an update of 256 entries (count byte 255), every code replaced')
+def _g4():
+    # every code becomes (4, 4, new) but code 0, which becomes (0, 4, prev)
+    pairs = [(c, entry(4, 4, False)) for c in range(1, 256)] + [(0, entry(0, 4, True))]
+    # (300 more matches, so that the block is no longer than SylzBound(n))
+    toks = bytes([7] + [0] * 300)
+    return block4([chdr(len(toks), update=True) + upd(*pairs) + toks], [4], b'abcd'), 8 + 4 * 300, False
+
+
+@case('extensions-both', 'not damaged: one token with its literal and match lengths both extended (literals first, base 0 and 4)')
+def _g5():
+    u = upd((60, entry(31, 63, False)))
+    toks = bytes([60, 20, 40])           # 20 literals, a match of 4 + 40
+    lits = bytes(range(65, 85))
+    return block4([chdr(len(toks), update=True) + u + toks], [20], lits), 64, False
+
+
+@case('extension-255-run', 'not damaged: a literal extension of 255 then 45 (300 literals)')
+def _g5b():
+    toks = bytes([code('ext', 0, 'prev'), 255, 45])
+    return block4([chdr(len(toks)) + toks], [], bytes(300)), 300, False
+
+
+@case('extension-byte-0', 'not damaged: a literal extension of one byte 0 (no literals), then a match')
+def _g6():
+    u = upd((60, entry(31, 4, True)))
+    toks = bytes([code(1, 0, 'prev'), 60, 0])   # 1 literal; then 0 literals and 4 at distance 1
+    return block4([chdr(len(toks), update=True) + u + toks], [], b'a'), 5, False
+
+
+@case('offcount-2-bytes', 'not damaged: 200 offsets, so a 2-byte offset count')
+def _g7():
+    toks = bytes([code(4, 4, 'new')] + [code(0, 4, 'new')] * 199)
+    return block4([chdr(len(toks)) + toks], [4] * 200, b'abcd'), 4 + 4 * 200, False
+
+
+@case('overlapping-match', 'not damaged: a match longer than its distance (distance 1, 100 bytes)')
+def _g8():
+    u = upd((60, entry(1, 63, False)))
+    toks = bytes([60, 96])
+    return block4([chdr(len(toks), update=True) + u + toks], [1], b'z'), 101, False
+
+
+@case('prev-offset-at-start', 'not damaged: the previous offset at the start of a block is 1')
+def _g9():
+    toks = bytes([code(1, 4, 'prev')])
+    return block4([chdr(1) + toks], [], b'q'), 5, False
+
+
+@case('new-offset-match-0', 'not damaged: a new offset with a match of 0 consumes its 2 bytes and becomes the previous offset')
+def _g10():
+    u = upd((60, entry(2, 0, False)))
+    toks = bytes([60, code(0, 4, 'prev')])
+    return block4([chdr(len(toks), update=True) + u + toks], [2], b'ab'), 6, False
+
+
+@case('short-matches', 'not damaged: entries with matches of 1, 2 and 3 bytes (new and previous offsets)')
+def _g11():
+    u = upd((60, entry(2, 1, False)), (61, entry(0, 2, False)), (62, entry(1, 3, True)), (63, entry(0, 1, True)))
+    toks = bytes([60, 61, 62, 63])
+    return block4([chdr(len(toks), update=True) + u + toks], [1, 2], b'abc'), 2 + 1 + 2 + 1 + 3 + 1, False
+
+
+@case('v4-no-tokens', 'not damaged: a v4 block with no tokens (tokLen 0): the literals are the tail')
+def _g12():
+    return struct.pack('<I', 0x40000000) + b'hello', 5, False
+
+
+@case('v4-empty', 'not damaged: the block of 0 bytes, 00 00 00 40')
+def _g13():
+    return struct.pack('<I', 0x40000000), 0, False
+
+
+@case('v5-no-tokens-raw', 'not damaged: a v5 block with no tokens and a raw literal chunk')
+def _g14():
+    return struct.pack('<I', 0xC0000000) + raw_section(b'hello'), 5, False
+
+
+@case('v5-chunks-mixed', 'not damaged: v5 literal chunks of mode 3, then mode 0, then a last chunk of 100 (raw: under 256)')
+def _g15():
+    a = zero_lits(65536)
+    h = huff_section(a)[4:]                     # the chunk without the count
+    b = bytes((i * 7) & 255 for i in range(65536))
+    c = bytes(range(100))
+    sec = struct.pack('<I', 65536 * 2 + 100) + h + b'\x00' + b + b'\x00' + c
+    return struct.pack('<I', 0xC0000000) + sec, 65536 * 2 + 100, False
+
+
+@case('v5-huffman-padding', 'not damaged: a stream whose padding bits are not 0 (they are ignored)')
+def _g16():
+    lits = zero_lits(900)
+    sec = bytearray(huff_section(lits))
+    base = 4 + 1 + 128
+    size0 = struct.unpack_from('<H', sec, base)[0]
+    sec[base + 16 + size0 - 1] |= 0x80
+    return block4([], [], bytes(sec), v5=True), 900, False
+
+
+@case('v5-huffman-stream-slack', 'not damaged: a stream with a byte after its last code (its size counts it)')
+def _g17():
+    lits = zero_lits(900)
+    sec = bytearray(huff_section(lits))
+    base = 4 + 1 + 128
+    size0 = struct.unpack_from('<H', sec, base)[0]
+    s0 = base + 16
+    sec = sec[:s0 + size0] + b'\x00' + sec[s0 + size0:]
+    struct.pack_into('<H', sec, base, size0 + 1)
+    return block4([], [], bytes(sec), v5=True), 900, False
+
+
+@case('v2-block', 'not damaged: a v2 block, as sylz4 and sylz5 may write (v2 token 98: 4 literals, match 4)')
+def _g18():
+    ctrl = bytes([98]) + struct.pack('<H', 3)
+    return struct.pack('<I', len(ctrl)) + ctrl + b'abcdxy', 10, False
+
+
+@case('v3-block', 'not damaged: a v3 block (a raw literal chunk), as sylz5 may write')
+def _g19():
+    ctrl = bytes([98]) + struct.pack('<H', 3)
+    return struct.pack('<I', 0x80000000 | len(ctrl)) + ctrl + struct.pack('<I', 6) + b'\x00abcdxy', 10, False
+
+
+@case('v5-empty-header', 'a v5 header (C0 00 00 00) with nothing after it: a v5 block has literals (the empty block is v4)')
+def _b20():
+    return struct.pack('<I', 0xC0000000), 0, True
+
+
 def build():
     out = []
     for name, why, f in CASES:
@@ -404,7 +563,7 @@ def build():
 def main(argv):
     if len(argv) == 2 and argv[1] == '--list':
         for name, why, _ in CASES:
-            print('%-28s %s' % (name, why))
+            print('%-30s %s' % (name, why))
         return 0
     if len(argv) != 2:
         print(__doc__)
@@ -412,10 +571,15 @@ def main(argv):
     d = argv[1]
     os.makedirs(d, exist_ok=True)
     cases = build()
+    man = ['# sylz v4/v5 decoder cases: NAME  decoded-size  blk-bytes  what it covers',
+           '# good-*: must decode to decoded-size bytes (tools/sylz_ref.py gives them);',
+           '# bad-*: must be rejected. Written by tools/sylz_cases.py.']
     for name, why, blk, n, bad in cases:
         prefix = 'bad-' if bad else 'good-'
         open(os.path.join(d, prefix + name + '.blk'), 'wb').write(blk)
         open(os.path.join(d, prefix + name + '.size'), 'w').write('%d\n' % n)
+        man.append('%-36s %8d %8d  %s' % (prefix + name, n, len(blk), why))
+    open(os.path.join(d, 'MANIFEST.txt'), 'w').write('\n'.join(man) + '\n')
     print('%d cases (%d damaged), all as sylz_ref.py expects' % (len(cases), sum(c[4] for c in cases)))
     return 0
 

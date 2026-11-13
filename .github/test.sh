@@ -78,8 +78,8 @@ out/sylzvectors "$W/blocks" >/dev/null
 for d in sylz sylzec sylz4 sylz5; do
   "$PY" tools/sylz_ref.py --check "$W/blocks/$d"
 done
-echo '== damaged v4/v5 blocks: rejected by syc on every path, as by the reference'
-"$PY" tools/sylz_bad.py "$W/bad"
+echo '== hand-made v4/v5 blocks: syc decodes the good ones and rejects the bad ones on every path'
+"$PY" tools/sylz_cases.py "$W/bad"
 for p in auto c pascal; do
   for f in "$W"/bad/*.blk; do
     want=0
