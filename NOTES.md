@@ -241,6 +241,32 @@ files and on pieces of them (4 KiB, 64 KiB, 1 MiB; 8 of each file):
   check (-0.07% size, +1.7-2.2% compress instructions, 1-4% slower);
   no OPT4_MISS on blocks up to 64 KiB (+0.07..+0.21%); the count in C
   (no clear gain in instructions over the Pascal routine).
+- **Levels 4-10** (branch v4-hc-opt-levels, 2026-11-13; perf on one
+  CPU of a loaded machine, the least cycles of 2-3 interleaved runs).
+  4-8: before each chain search the previous offset is tried one byte
+  on and its match taken back to where it starts; a literal run is
+  searched every 1 + run shr 6 bytes, a match found after a step
+  extended backwards; a position with no match yet is searched in one C
+  loop (hc_scan4). 9-10: a match taken as is puts only its last 64
+  positions into the tree; the C DP relaxes each match's lengths in a
+  counted loop and skips the lengths the previous distance has already
+  priced cheaper (same parse, -20% instructions at level 9); level 10
+  walks the tree 128 deep instead of 256 (v4 and v5 only; same bytes
+  within 0.004 points). Compression cycles, v2 -> v4: silesia.tar level
+  4 7.62 -> 7.33 G, 5 10.6 -> 9.8, 6 13.9 -> 12.8, 7 18.1 -> 16.4, 8
+  28.9 -> 26.7, 9 87.2 -> 82.1, 10 103.2 -> 95.8 (v4 before: 8.31,
+  11.1, 14.5, 18.1, 28.9, 94.4, 112.4); the mixed corpus 33-45% fewer
+  at 4-8, -7% at 9, -19% at 10. v3 -> v5 likewise 5-35% fewer at every
+  level. Ratio, v4: silesia.tar 37.56 / 36.66 / 36.07 / 35.73 / 35.44
+  / 35.11 / 35.07% (v2 38.80 / 37.78 / 37.13 / 36.73 / 36.38 / 36.04 /
+  36.03), mixed 0.8-0.9 points under v2 (0.03-0.05 above v4 before at
+  5-10). Decoding did not move: silesia.tar 0-2.5% fewer cycles than
+  v2, the mixed corpus 0.7-2.4% more (v4 runs 12% more instructions
+  there, 25% fewer branch misses); v5 against v3 -1..+2%. Tried and
+  dropped: a branchless relaxation (+5% cycles); per-token penalty 0.8
+  or 1.0 byte at level 9 (no faster decoding, +0.05 points); repeats
+  from 3 or 4 bytes (same); more literal stepping at level 4 (mixed
+  decodes 2% faster, +1 point).
 
 lz4 1.11 and zxc 1.0 (2026-11) were read for ideas: neither changes its
 format (lz4: multithreading in the library; zxc: format v9 frozen, its

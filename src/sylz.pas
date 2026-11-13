@@ -343,8 +343,12 @@ const
   HC_CHAINMASK = HC_CHAINSIZE - 1;
   { hash chain depth of levels 4..8 }
   HC_ATTEMPTS: array[4..8] of Integer = (2, 4, 8, 16, 64);
-  HC_REP_ENOUGH = 16;   { format v4, levels 4..8: see CompressHCCore }
+  { format v4, levels 4..8: see CompressHCCore }
+  HC_REP_ENOUGH = 8;
   HC_REP_GAIN  = 2;
+  { format v4, levels 4..8: a literal run is searched every
+    1 + run shr HC_ACCEL4 bytes (see CompressHCCore) }
+  HC_ACCEL4 = 6;
   { levels 2-3: two hash tables, one keyed on 6 bytes (long matches), one
     on 4; 2^15 entries each at level 2, 2^16 at level 3 }
   MID_MAXLOG   = 16;
@@ -4108,7 +4112,7 @@ function CompressHCCore(src: PByte; n: SizeInt; var e: TEmit; var s: THcState;
 var
   iend: PByte;
   mfl, pos, anchor, ml, ref, ml0, ref0, start0, ml2, ref2, start2,
-    ml3, ref3, start3, newMl, corr, rl: SizeInt;
+    ml3, ref3, start3, newMl, corr, rl, rs, run: SizeInt;
   state: Integer;   { 0 search at pos, 2 / 3 lz4hc's _Search2 / _Search3 }
 
   function Emit(p, len, r: SizeInt): Boolean;
@@ -4138,33 +4142,69 @@ begin
     begin
       if state = 0 then
       begin
-        if e.v4 and (pos > anchor) and (e.rep <= pos)
-           and (Read32(src + pos - e.rep) = Read32(src + pos)) then
+        if e.v4 then
         begin
-          { format v4: a match at the previous offset costs a token and no
-            offset: taken unless the chains have one over HC_REP_GAIN bytes
-            longer (not searched for past HC_REP_ENOUGH) }
-          rl := SYLZ_MINMATCH + CountMatch(src + pos + SYLZ_MINMATCH,
-            src + pos - e.rep + SYLZ_MINMATCH, iend);
-          ml := 0;
-          if rl < HC_REP_ENOUGH then
-            ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
-          if rl + HC_REP_GAIN >= ml then
+          { format v4. A match at the previous offset costs a token and no
+            offset bytes: before each search, that offset is tried one
+            byte on (as levels 2-3 do: the byte in between is often what
+            changed), and its match is taken, back to where it starts,
+            unless the chains have one over HC_REP_GAIN bytes longer at
+            pos (not searched for from HC_REP_ENOUGH bytes on).
+            silesia.tar, level 4: 37.89 -> 37.57%, the searches it saves
+            paying for the tests.
+            A run of literals is searched every 1 + run shr HC_ACCEL4
+            bytes, as the fast levels do: data with nothing to find costs
+            a fraction of the time (mixed corpus, level 4: -40% cycles
+            for +0.2 points; silesia.tar -5% for +0.03), and a match
+            found after a step is extended back over what was stepped
+            over. }
+          run := pos - anchor;
+          if (e.rep <= pos) and (Read32(src + pos + 1 - e.rep) = Read32(src + pos + 1)) then
           begin
-            if not Emit(pos, rl, pos - e.rep) then
-              Exit(-1);
-            pos := pos + rl;
+            rs := pos + 1;
+            rl := SYLZ_MINMATCH + CountMatch(src + rs + SYLZ_MINMATCH,
+              src + rs - e.rep + SYLZ_MINMATCH, iend);
+            ml := 0;
+            if rl < HC_REP_ENOUGH then
+              ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+            if rl + HC_REP_GAIN >= ml then
+            begin
+              while (rs > anchor) and (rs > e.rep) and (src[rs - 1] = src[rs - 1 - e.rep]) do
+              begin
+                Dec(rs);
+                Inc(rl);
+              end;
+              if not Emit(rs, rl, rs - e.rep) then
+                Exit(-1);
+              pos := rs + rl;
+              Continue;
+            end;
+          end
+          else
+            ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+          if ml < SYLZ_MINMATCH then
+          begin
+            pos := pos + 1 + run shr HC_ACCEL4;
             Continue;
+          end;
+          ref := s.mpos;
+          while (pos > anchor) and (ref > 0) and (src[pos - 1] = src[ref - 1]) do
+          begin
+            Dec(pos);
+            Dec(ref);
+            Inc(ml);
           end;
         end
         else
-          ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
-        if ml < SYLZ_MINMATCH then
         begin
-          Inc(pos);
-          Continue;
+          ml := HcSearch(s, pos, pos, SYLZ_MINMATCH - 1);
+          if ml < SYLZ_MINMATCH then
+          begin
+            Inc(pos);
+            Continue;
+          end;
+          ref := s.mpos;
         end;
-        ref := s.mpos;
         start0 := pos; ref0 := ref; ml0 := ml;
         state := 2;
       end;
@@ -4293,6 +4333,7 @@ type
     search: Pointer;           { HcSearchX64 or sylzc_hc_search }
     anchor: SizeInt;           { out }
     e: TEmitC;
+    accel: SizeInt;            { v4: HC_ACCEL4 }
   end;
 
 procedure sylzc_compress_hc(st: Pointer); cdecl; external name 'sylzc_compress_hc';
@@ -4336,7 +4377,10 @@ begin
 {$endif}
     EmitToC(e, sc.e, src + n);
     if e.v4 then
-      sylzc_compress_hc4(@sc)
+    begin
+      sc.accel := HC_ACCEL4;
+      sylzc_compress_hc4(@sc);
+    end
     else
       sylzc_compress_hc(@sc);
     EmitFromC(e, sc.e);
@@ -4361,6 +4405,7 @@ const
   OPT_WINDOW  = 4096;
   OPT_MAXCAND = 64;
   OPT_NOSKIP  = High(Int32);
+  OPT_FORCED_KEEP4 = 64;   { see CompressOptCore }
 
 type
   TSylzOptParams = record
@@ -4370,7 +4415,9 @@ type
     pSeq, pEsc, pShort: Single; { decode-time penalties, in bytes: per
                                   sequence, per escape token, per offset < 16 }
     subLen: Integer;            { every match length up to this is tried; past
-                                  it, only each candidate's full length }
+                                  it, only each candidate's full length (format
+                                  v4: under OPT4_COLS, sylzc_opt_dp4 prices
+                                  them from the table without a test) }
     skipLen: Integer;           { after a match this long, the positions it
                                   covers start no transitions of their own }
     minRep: Integer;            { format v4: the shortest match tried at the
@@ -4391,13 +4438,28 @@ const
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
   OPT_LEVEL10: TSylzOptParams = (btCut: 256; btMaxLen: 1024; sufficient: 512;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+  { Formats v4 and v5 at level 10: depth 128 finds what 256 does
+    (silesia.tar, the mixed corpus, nci, xml: within 0.004 points) in
+    3-4% fewer cycles, a margin over v2's speed at this level. }
+  OPT4_LEVEL10: TSylzOptParams = (btCut: 128; btMaxLen: 1024; sufficient: 512;
+    pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
+
+{ Level 10's parameters for the format flags asks for. }
+function OptLevel10(flags: Integer): TSylzOptParams;
+begin
+  if flags and SYLZ_V4 <> 0 then
+    Result := OPT4_LEVEL10
+  else
+    Result := OPT_LEVEL10;
+end;
 
 type
   TOptNode = record
     cost: Int32;    { in bits, relative to the window's start }
     ll: Int32;      { pending literals at this node }
     ml: Int32;      { 0: reached by a literal, else by a match of ml bytes }
-    dist: Int32;
+    dist: Int32;    { the match's distance; format v4: of the path's last
+                      match, whatever reached the node }
   end;
   POptNode = ^TOptNode;
 
@@ -4408,7 +4470,7 @@ const
   OPT_PATH_BYTES  = (OPT_WINDOW + 1) * 3 * SizeOf(Int32);
   OPT_INDEX_BYTES = (OPT_WINDOW + 1) * SizeOf(Int32);   { off, cnt }
   OPT_WORK_BYTES  = OPT_NODES_BYTES + OPT_CANDS_BYTES + OPT_PATH_BYTES
-                    + 3 * OPT_INDEX_BYTES;   { off, cnt; format v4: each node's offset }
+                    + 2 * OPT_INDEX_BYTES;   { off, cnt }
 
 { The optimal parser's match finder: a binary tree (LZMA's bt4 without
   its 2- and 3-byte hashes). Every position is inserted into a binary
@@ -4898,7 +4960,6 @@ type
     before: SizeInt;            { input bytes before the window }
     mtab: PInt32;               { mtab4 }
     codes: Pointer;             { Codes4 }
-    reps: PInt32;               { each node's previous distance; reps[0] set }
   end;
   POptDp4Args = ^TOptDp4Args;
 
@@ -4979,10 +5040,11 @@ begin
     Result := OPT4_NEVER;   { an extended run and 2 or 3 bytes: SylzBound }
 end;
 
-{ OptDpPas for format v4. Each node also carries the distance of the last
-  match on its path (a.reps), which a match can take again for a token
-  and no offset bytes: tried first at every position, every length from
-  a.minRep. }
+{ OptDpPas for format v4. Each node carries the distance of the last
+  match on its path (its dist, nodes[0]'s set by the caller), which a
+  match can take again for a token and no offset bytes: tried first at
+  every position, every length from a.minRep. Its first bytes are
+  compared before the match is counted: most positions have none. }
 procedure OptDp4Pas(nodes: POptNode; w: SizeInt; cands, off, cnt: PInt32;
   const a: TOptDp4Args);
 var
@@ -4997,20 +5059,22 @@ begin
       Continue;
     cost := nodes[i].cost;
     ll := nodes[i].ll;
-    r := a.reps[i];
+    r := nodes[i].dist;
     tc := cost + a.litPrice[a.wsrc[i]] + LitStep4(ll, a);
     if tc < nodes[i + 1].cost then
     begin
       nodes[i + 1].cost := tc;
       nodes[i + 1].ll := Int32(ll + 1);
       nodes[i + 1].ml := 0;
-      a.reps[i + 1] := Int32(r);
+      nodes[i + 1].dist := Int32(r);
     end;
     row := Opt4Row(ll);
     rowN := a.mtab + row * OPT4_COLS;
     rowR := rowN + OPT4_ROWS * OPT4_COLS;
     { the previous distance }
-    if r <= a.before + i then
+    if (r <= a.before + i)
+       and (((a.minRep >= 4) and (Read32(a.wsrc + i) = Read32(a.wsrc + i - r)))
+            or ((a.minRep < 4) and (PUInt16(a.wsrc + i)^ = PUInt16(a.wsrc + i - r)^))) then
     begin
       rl := CountMatch(a.wsrc + i, a.wsrc + i - r, a.wsrc + w);
       if rl >= a.minRep then
@@ -5036,7 +5100,6 @@ begin
             nodes[j].ll := 0;
             nodes[j].ml := Int32(ml);
             nodes[j].dist := Int32(r);
-            a.reps[j] := Int32(r);
           end;
         end;
       end;
@@ -5077,7 +5140,6 @@ begin
           nodes[j].ll := 0;
           nodes[j].ml := Int32(ml);
           nodes[j].dist := Int32(dist);
-          a.reps[j] := Int32(dist);
         end;
       end;
       prevLen := len;
@@ -5189,7 +5251,6 @@ begin
     a4.codes := @e.codes;
     mtabGen := 0;
     a4.mtab := @mtab4[0, 0, 0];
-    a4.reps := cnt + (OPT_WINDOW + 1);
     for k := 0 to 1 do
       for i := 0 to OPT4_ROWS - 1 do
         for j := 0 to OPT4_COLS - 1 do
@@ -5302,7 +5363,7 @@ begin
         a4.wsrc := a.wsrc;
         a4.litPrice := a.litPrice;
         a4.before := start;
-        a4.reps[0] := Int32(lastDist);
+        nodes[0].dist := Int32(lastDist);
 {$ifdef SYLZ_C}
         if SylzUseAsm then
           sylzc_opt_dp4(nodes, Int32(w), cands, off, cnt, @a4)
@@ -5352,6 +5413,13 @@ begin
         lastDist := forcedDist;
         anchor := pos + forcedLen;
         start := anchor;
+        { format v4: of a match taken as is, only the last positions go
+          into the tree. Each one inside it costs a walk and a long
+          compare, and what they would find later the match's source
+          mostly has too (level 9: silesia.tar -6% cycles for +0.05
+          points, the mixed corpus -11% for +0.01) }
+        if e.v4 and (anchor - OPT_FORCED_KEEP4 > b.nextToInsert) then
+          b.nextToInsert := anchor - OPT_FORCED_KEEP4;
       end
       else
         start := start + w;
@@ -5603,7 +5671,7 @@ begin
   else if level = 9 then
     Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL9)
   else if level = 10 then
-    Result := CompressOpt(ctx, src, n, dst, cap, OPT_LEVEL10)
+    Result := CompressOpt(ctx, src, n, dst, cap, OptLevel10(flags))
   else
   begin
     if attempts = 0 then

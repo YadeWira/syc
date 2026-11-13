@@ -1406,7 +1406,7 @@ void sylzc_bt_insert(sylzc_bt *b)
 /* ── levels 4-8: lz4hc's parse ────────────────────────────────────────── */
 
 #define HCW_OPTIMAL_ML 18
-#define HC_REP_ENOUGH 16   /* format v4: see CompressHCCore in sylz.pas */
+#define HC_REP_ENOUGH 8    /* format v4: see CompressHCCore in sylz.pas */
 #define HC_REP_GAIN 2
 
 /* In/out of sylzc_compress_hc (THcCState in sylz.pas). search is the
@@ -1417,6 +1417,7 @@ typedef struct {
     void (*search)(sylzc_hc *);
     intptr_t anchor;              /* out */
     sylzc_emit e;
+    intptr_t accel;               /* v4: HC_ACCEL4 */
 } sylzc_hcparse;
 
 static intptr_t hc_find(sylzc_hcparse *st, intptr_t pos, intptr_t lowLimit, intptr_t longest)
@@ -1441,6 +1442,77 @@ static inline __attribute__((always_inline)) void hc_emit(sylzc_hcparse *st, int
     st->anchor = p + len;
 }
 
+/* Format v4's search at a position with no match yet (state 0 of
+   CompressHCCore in sylz.pas), for as long as it finds nothing: each
+   position's test of the previous offset one byte on, then
+   sylzc_hc_search with lowLimit = pos (same candidates, same result),
+   here so that a run of literals stays in one loop with its values in
+   registers. Returns 0 at scanEnd, 1 with a chain match at s->pos
+   (s->longest, s->mpos), 2 when the previous offset matches at s->pos + 1. */
+static inline __attribute__((always_inline)) int hc_scan4(sylzc_hc *s, intptr_t rep,
+    intptr_t anchor, intptr_t scanEnd, intptr_t accel)
+{
+    const uint8_t *src = s->src, *iend = s->iend;
+    uint16_t *head = s->head, *chain = s->chain;
+    intptr_t pos = s->pos, next = s->nextToInsert;
+    const intptr_t attempts = s->attempts;
+    int kind = 0;
+    do {
+        const uint8_t *ip = src + pos;
+        uint32_t first = read32(ip), h, d;
+        if (rep <= pos && read32(ip + 1 - rep) == read32(ip + 1)) {
+            kind = 2;
+            break;
+        }
+        for (; next < pos; next++) {
+            h = hash4(read32(src + next), HC_HASHLOG);
+            d = (uint32_t)(next - head[h]) & 0xFFFF;
+            if (d > next)
+                d = 0;                 /* 0 terminates the chain */
+            chain[next & 0xFFFF] = (uint16_t)d;
+            head[h] = (uint16_t)next;
+        }
+        /* pos goes in now: the next search would insert it the same */
+        h = hash4(first, HC_HASHLOG);
+        d = (uint32_t)(pos - head[h]) & 0xFFFF;
+        if (d > pos)
+            d = 0;
+        chain[pos & 0xFFFF] = (uint16_t)d;
+        head[h] = (uint16_t)pos;
+        next = pos + 1;
+        if (d) {
+            intptr_t cand = pos - d, tries = attempts, longest = MINMATCH - 1;
+            for (;;) {
+                if (read32(src + cand) == first) {
+                    intptr_t fwd = MINMATCH + count_match_inl(ip + MINMATCH,
+                        src + cand + MINMATCH, iend);
+                    if (fwd > longest) {
+                        longest = fwd;
+                        s->mpos = cand;
+                    }
+                }
+                if (--tries == 0)
+                    break;
+                d = chain[cand & 0xFFFF];
+                if (d == 0)
+                    break;
+                cand -= d;
+                if (cand < 0 || pos - cand > HC_MAXDIST)
+                    break;
+            }
+            if (longest >= MINMATCH) {
+                s->longest = longest;
+                kind = 1;
+                break;
+            }
+        }
+        pos += 1 + ((pos - anchor) >> accel);
+    } while (pos < scanEnd);
+    s->pos = pos;
+    s->nextToInsert = next;
+    return kind;
+}
+
 /* CompressHCCore in sylz.pas (LZ4HC_compress_hashChain), same output; the
    state machine as there: 0 search at pos, 2 / 3 lz4hc's _Search2 /
    _Search3. The caller set s's src, iend, nextToInsert and attempts. */
@@ -1459,28 +1531,50 @@ static inline __attribute__((always_inline)) void compress_hc_core(sylzc_hcparse
     mfl = n - 12;
     while (pos < mfl) {
         if (state == 0) {
-            intptr_t rp = st->e.rep;
-            if (v4 && pos > st->anchor && rp <= pos
-                && read32(s->src + pos - rp) == read32(s->src + pos)) {
-                /* a match at the previous offset: taken unless the chains
-                   have one over HC_REP_GAIN bytes longer */
-                intptr_t rl = MINMATCH + count_match(s->src + pos + MINMATCH,
-                    s->src + pos - rp + MINMATCH, s->iend);
-                ml = 0;
-                if (rl < HC_REP_ENOUGH)
-                    ml = hc_find(st, pos, pos, MINMATCH - 1);
-                if (rl + HC_REP_GAIN >= ml) {
-                    hc_emit(st, pos, rl, pos - rp, v4);
-                    pos += rl;
+            if (v4) {
+                const uint8_t *src = s->src;
+                intptr_t rp = st->e.rep, kind;
+                s->pos = pos;
+                kind = hc_scan4(s, rp, st->anchor, mfl, st->accel);
+                pos = s->pos;
+                if (kind == 0)
+                    break;
+                ml = s->longest;
+                if (kind == 2) {
+                    /* the previous offset matches one byte on: taken, back
+                       to where it starts, unless the chains have a match
+                       over HC_REP_GAIN bytes longer here */
+                    intptr_t rs = pos + 1;
+                    intptr_t rl = MINMATCH + count_match(src + rs + MINMATCH,
+                        src + rs - rp + MINMATCH, s->iend);
+                    ml = 0;
+                    if (rl < HC_REP_ENOUGH)
+                        ml = hc_find(st, pos, pos, MINMATCH - 1);
+                    if (rl + HC_REP_GAIN >= ml) {
+                        while (rs > st->anchor && rs > rp && src[rs - 1] == src[rs - 1 - rp]) {
+                            rs--;
+                            rl++;
+                        }
+                        hc_emit(st, rs, rl, rs - rp, v4);
+                        pos = rs + rl;
+                        continue;
+                    }
+                }
+                ref = s->mpos;
+                /* the scan may have stepped over the match's first bytes */
+                while (pos > st->anchor && ref > 0 && src[pos - 1] == src[ref - 1]) {
+                    pos--;
+                    ref--;
+                    ml++;
+                }
+            } else {
+                ml = hc_find(st, pos, pos, MINMATCH - 1);
+                if (ml < MINMATCH) {
+                    pos++;
                     continue;
                 }
-            } else
-                ml = hc_find(st, pos, pos, MINMATCH - 1);
-            if (ml < MINMATCH) {
-                pos++;
-                continue;
+                ref = s->mpos;
             }
-            ref = s->mpos;
             start0 = pos; ref0 = ref; ml0 = ml;
             state = 2;
         }
@@ -2202,7 +2296,6 @@ typedef struct {
     intptr_t before;              /* input bytes before the window */
     const int32_t *mtab;          /* [kind][row][length] */
     const struct sylzc_codes4 *codes;
-    int32_t *reps;                /* each node's previous distance */
 } sylzc_dp4args;
 
 /* LitStep4 in sylz.pas */
@@ -2246,88 +2339,93 @@ static int32_t match_cost4(int32_t row, int32_t ml, int kind, const sylzc_dp4arg
     return r;
 }
 
-/* OptDp4Pas in sylz.pas, same nodes */
+/* OptDp4Pas in sylz.pas, same nodes. Each match is relaxed in two
+   parts: every length up to subLen (a counted loop over the row: no
+   bounds or table tests), then its full length. */
+static inline void relax4(sylzc_node *nd, int32_t tc, int32_t ml, int32_t dist)
+{
+    if (tc < nd->cost) {
+        nd->cost = tc;
+        nd->ll = 0;
+        nd->ml = ml;
+        nd->dist = dist;
+    }
+}
+
 void sylzc_opt_dp4(sylzc_node *nodes, int32_t w, const int32_t *cands,
                    const int32_t *off, const int32_t *cnt, const sylzc_dp4args *a)
 {
-    int32_t *reps = a->reps;
     const uint8_t *wsrc = a->wsrc;
+    const int32_t minRep = a->minRep, subLen = a->subLen;
+    /* repDom[row]: in that row a match at the previous distance never
+       costs more than another of the same length, even with the short
+       offset penalty against none (past the table too: one extension
+       byte more at most, against two offset bytes). There, once the
+       previous distance has priced the lengths up to some top, no
+       candidate can do better at those: they are not tried (same parse,
+       2% fewer instructions at level 9). */
+    uint8_t repDom[OPT4_ROWS];
+    for (int32_t row = 0; row < OPT4_ROWS; row++) {
+        const int32_t *rn = a->mtab + row * OPT4_COLS, *rr = rn + OPT4_ROWS * OPT4_COLS;
+        int dom = minRep <= MINMATCH;
+        for (int32_t ml = MINMATCH; ml < OPT4_COLS; ml++)
+            dom &= rr[ml] + a->shortOff <= rn[ml];
+        repDom[row] = (uint8_t)dom;
+    }
     for (int32_t i = 0; i < w; i++) {
         int32_t k = cnt[i];
         if (k < 0)
             continue;
-        int32_t cost = nodes[i].cost;
-        int32_t ll = nodes[i].ll;
-        int32_t r = reps[i];
+        sylzc_node *nd = nodes + i;
+        int32_t cost = nd->cost;
+        int32_t ll = nd->ll;
+        int32_t r = nd->dist;
         int32_t tc = cost + a->litPrice[wsrc[i]] + lit_step4(ll, a);
-        if (tc < nodes[i + 1].cost) {
-            nodes[i + 1].cost = tc;
-            nodes[i + 1].ll = ll + 1;
-            nodes[i + 1].ml = 0;
-            reps[i + 1] = r;
+        if (tc < nd[1].cost) {
+            nd[1].cost = tc;
+            nd[1].ll = ll + 1;
+            nd[1].ml = 0;
+            nd[1].dist = r;
         }
         int32_t row = ll <= LIT_SPLIT4 ? ll : OPT4_ROW_LONG;
         const int32_t *rowN = a->mtab + row * OPT4_COLS;
         const int32_t *rowR = rowN + OPT4_ROWS * OPT4_COLS;
-        /* the previous distance */
-        if (r <= a->before + i) {
-            int32_t rl = (int32_t)count_match(wsrc + i, wsrc + i - r, wsrc + w);
-            if (rl >= a->minRep) {
-                int32_t base = cost + (r < 16 ? a->shortOff : 0);
-                int32_t ml = a->minRep - 1;
-                while (ml < rl) {
-                    if (ml < a->subLen)
-                        ml++;
-                    else
-                        ml = rl;
-                    int32_t j = i + ml;
-                    if (ml < OPT4_COLS)
-                        tc = base + rowR[ml];
-                    else
-                        tc = base + match_cost4(row, ml, 1, a);
-                    if (tc < nodes[j].cost) {
-                        nodes[j].cost = tc;
-                        nodes[j].ll = 0;
-                        nodes[j].ml = ml;
-                        nodes[j].dist = r;
-                        reps[j] = r;
-                    }
-                }
-            }
+        int32_t prevLen = MINMATCH - 1;
+        /* the previous distance: its first bytes, then the count */
+        if (r <= a->before + i
+            && (minRep >= 4 ? read32(wsrc + i) == read32(wsrc + i - r)
+                            : read16(wsrc + i) == read16(wsrc + i - r))) {
+            int32_t rl = (int32_t)count_match_inl(wsrc + i, wsrc + i - r, wsrc + w);
+            int32_t base = cost + (r < 16 ? a->shortOff : 0);
+            int32_t top = rl < subLen ? rl : subLen;
+            for (int32_t ml = minRep; ml <= top; ml++)
+                relax4(nd + ml, base + rowR[ml], ml, r);
+            if (rl > top && rl >= minRep)
+                relax4(nd + rl, base + (rl < OPT4_COLS ? rowR[rl] : match_cost4(row, rl, 1, a)), rl, r);
+            if (repDom[row] && top > prevLen)
+                prevLen = top;
         }
         if (k == 0)
             continue;
         const int32_t *cp = cands + 2 * off[i];
-        int32_t prevLen = MINMATCH - 1;
+        const int32_t room = w - i;
         for (int32_t c = 0; c < k; c++) {
             int32_t len = cp[2 * c], dist = cp[2 * c + 1];
             if (dist == r) {
-                prevLen = len;   /* priced above, at least as long */
+                if (len > prevLen)
+                    prevLen = len;   /* priced above, at least as long */
                 continue;
             }
             int32_t base = cost + (dist < 16 ? a->shortOff : 0);
-            int32_t ml = prevLen;
-            while (ml < len) {
-                if (ml < a->subLen)
-                    ml++;
-                else
-                    ml = len;
-                int32_t j = i + ml;
-                if (j > w)
-                    break;
-                if (ml < OPT4_COLS)
-                    tc = base + rowN[ml];
-                else
-                    tc = base + match_cost4(row, ml, 0, a);
-                if (tc < nodes[j].cost) {
-                    nodes[j].cost = tc;
-                    nodes[j].ll = 0;
-                    nodes[j].ml = ml;
-                    nodes[j].dist = dist;
-                    reps[j] = dist;
-                }
-            }
-            prevLen = len;
+            int32_t top = len < subLen ? len : subLen;
+            if (top > room)
+                top = room;
+            for (int32_t ml = prevLen + 1; ml <= top; ml++)
+                relax4(nd + ml, base + rowN[ml], ml, dist);
+            if (len > subLen && len > prevLen && len <= room)
+                relax4(nd + len, base + (len < OPT4_COLS ? rowN[len] : match_cost4(row, len, 0, a)), len, dist);
+            if (len > prevLen)
+                prevLen = len;
         }
     }
 }
