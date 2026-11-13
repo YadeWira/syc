@@ -6214,8 +6214,10 @@ const
   { Format v5's -ec 9: the first parse of CompressOptEC only counts the
     literals, and a shallow tree counts nearly the same ones: silesia.tar
     69.22 MB against 68.98 with OPT_LEVEL9's, in 629 M cycles per MB
-    instead of 895 (v3's -ec 9: 71.23 MB, 823). -ec 10 is OPT_LEVEL9 in
-    both parses: level 10's deeper tree came out bigger in v5 (69.21 MB). }
+    instead of 895 (v3's -ec 9: 71.23 MB, 823). -ec 10 counts them the
+    same way and parses with OPT4_LEVEL10 (since the integration: with
+    OPT_LEVEL9 in both parses, mr came out 0.02% bigger than v3's -ec
+    10; silesia.tar 68.63 MB against 68.69). }
   V5_OPT_STATS: TSylzOptParams = (btCut: 2; btMaxLen: 256; sufficient: 16;
     pSeq: 0.5; pEsc: 1.0; pShort: 0.5; subLen: 36; skipLen: OPT_NOSKIP; minRep: 2);
 
@@ -6256,7 +6258,7 @@ begin
         if level = SYLZ_MAXLEVEL - 1 then
           Exit(CompressOptEC(ctx, src, n, dst, cap, V5_OPT_STATS, OPT_LEVEL9))
         else
-          Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9));
+          Exit(CompressOptEC(ctx, src, n, dst, cap, V5_OPT_STATS, OPT4_LEVEL10));
       end;
       if level = SYLZ_MAXLEVEL - 1 then
         Exit(CompressOptEC(ctx, src, n, dst, cap, OPT_LEVEL9, OPT_LEVEL9))
