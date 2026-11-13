@@ -55,7 +55,8 @@ has no sylz counterpart.
   `tests/arctest.sh` — the archiver end to end, with damage
 - `bench/sylzbench.pas` — in-memory benchmark, lzbench-style output;
   `SYLZ_DUMP=prefix` writes each compressed block to `prefix.LEVEL`,
-  `SYLZ_NOASM=1` uses the Pascal paths only
+  `SYLZ_NOASM=1` uses the Pascal paths only, `SYLZ_C=1` C instead of
+  assembler, `SYLZ_NOHUFASM=1` the Pascal Huffman loops alone
 - `bench/sylzstats.pas` — literal/match/offset histograms of a block
 - `bench/sylztable.pas` — derives SYLZ_TOKENS from sample blocks
 - `tests/sylzfuzz.pas` — roundtrip + corrupt/truncated input, guard-page buffers
@@ -65,6 +66,120 @@ has no sylz counterpart.
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## Huffman bulk loops in C (2026-11-13)
+
+GitHub's machines (bench.yml) showed v5 decoding 11-14% faster than v3
+on x86-64 but 4-12% slower on arm64 (Linux and macOS) at every -ec
+level. arm64 has no assembler: the LZ part runs in C, the literals in
+the Pascal bulk loops of sylzhuf.pas, and FPC's aarch64 code for them
+keeps the streams' state in memory (on x86-64, with C LZ and the Pascal
+loops forced, v5 and v3 decoded about the same). Now sylzc.c has the
+two kernels, sylzc_huf_bulk4 (v3's four streams) and sylzc_huf_bulk8
+(v5's eight), with the assembler kernels' contracts: the THufBulk /
+THufBulk8 records, the caller's count of the rounds the input allows,
+the Pascal tails after them. They run wherever there is no x86-64
+assembler (arm64, i386, win32, macOS), unless -dSYLZ_PUREPASCAL;
+HufPreferC takes them on x86-64 too (--paths c, SYLZ_C=1), so the
+self-test's C path, sylzfuzz and sylzedge exercise them there. sylzfuzz
+also decodes each damaged Huffman chunk with the Pascal loops and wants
+the same result.
+
+- bulk4: Giesen's refill and five symbols a stream per round, as
+  HufBulkX64 (the count kept in a byte, the whole entry subtracted).
+- bulk8: each stream's 8 bytes loaded at its bit position per round;
+  on 64-bit targets bit 63 set as a mark, so the round's bits are one
+  clz (as HufBulk8X64), on 32-bit ones the entries added up. Positions
+  as bit offsets from the lowest stream (32-bit targets keep them in a
+  register, not the record's address times 8). Nothing is read after
+  the last round (the assembler reloads there).
+- gcc -O2 kept the inner loop over the five rows (a counter and branch
+  per row) and in its first form SLP-vectorized the eight bit counts
+  and positions into NEON registers (fmov/ins on the chain): the rows
+  written out and the clz mark fixed both. On i386 the loop is 4-7%
+  faster than the rows written out, so 32-bit targets keep it.
+- A shift by the whole table entry & 63 is a shift by the length (the
+  symbol sits at bit 8), free on arm64 and x86.
+
+x86-64 here (CPU 21, decode only, sylzbench with SYLZ_LOAD, MB/s, best
+of 3 interleaved rounds), C LZ (SYLZ_C=1) with the Pascal loops
+(SYLZ_NOHUFASM=1) against the C kernels:
+
+| file | level | v3 Pascal | v3 C | | v5 Pascal | v5 C | | v5/v3 Pascal | v5/v3 C |
+|---|---|---|---|---|---|---|---|---|---|
+| silesia | 1 | 1544 | 1938 | +25.6% | 1468 | 2197 | +49.7% | -4.9% | +13.4% |
+| silesia | 6 | 1642 | 2076 | +26.4% | 1628 | 2373 | +45.7% | -0.8% | +14.3% |
+| silesia | 9 | 1529 | 2071 | +35.4% | 1506 | 2394 | +59.0% | -1.5% | +15.6% |
+| mixed | 1 | 977 | 1445 | +47.9% | 923 | 1700 | +84.1% | -5.5% | +17.6% |
+| mixed | 6 | 990 | 1527 | +54.2% | 981 | 1804 | +83.8% | -0.9% | +18.2% |
+| mixed | 9 | 994 | 1510 | +51.9% | 957 | 1836 | +91.9% | -3.8% | +21.6% |
+
+(The assembler, same rounds: silesia v3 2391 / 2376 / 2393, v5 2898 /
+3147 / 3190; mixed v3 1886 / 1914 / 1934, v5 2195 / 2342 / 2368.)
+
+i386 (gcc -m32 build, same machine and blocks), Pascal loops against C:
+
+| file | level | v3 Pascal | v3 C | | v5 Pascal | v5 C | | v5/v3 Pascal | v5/v3 C |
+|---|---|---|---|---|---|---|---|---|---|
+| silesia | 1 | 951 | 1155 | +21.4% | 966 | 1360 | +40.9% | +1.5% | +17.8% |
+| silesia | 6 | 1018 | 1226 | +20.5% | 1018 | 1435 | +40.9% | +0.0% | +17.0% |
+| silesia | 9 | 964 | 1174 | +21.8% | 906 | 1371 | +51.4% | -6.0% | +16.8% |
+| mixed | 1 | 579 | 792 | +36.8% | 543 | 896 | +65.0% | -6.1% | +13.2% |
+| mixed | 6 | 609 | 813 | +33.7% | 581 | 980 | +68.7% | -4.6% | +20.5% |
+| mixed | 9 | 582 | 770 | +32.3% | 553 | 917 | +66.0% | -5.1% | +19.1% |
+
+GitHub's arm64 machines, silesia.tar, decode only, this branch against
+its base (4f49f27) in the same job (bench.yml changed on a temporary
+branch: blocks dumped once, three interleaved rounds, the best), MB/s.
+The last two columns: this branch with the Pascal loops (SYLZ_NOHUFASM).
+
+linux-arm64 (ubuntu-24.04-arm):
+
+| level | v3 base | v3 C | | v5 base | v5 C | | v5/v3 base | v5/v3 C | v3 Pascal | v5 Pascal |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 2376 | 2650 | +11.6% | 2134 | 3232 | +51.5% | -10.2% | +22.0% | 2201 | 2138 |
+| 1 | 2389 | 2659 | +11.3% | 2177 | 3281 | +50.7% | -8.9% | +23.4% | 2222 | 2179 |
+| 2 | 2426 | 2722 | +12.2% | 2198 | 3335 | +51.7% | -9.4% | +22.5% | 2252 | 2197 |
+| 3 | 2445 | 2727 | +11.6% | 2245 | 3411 | +51.9% | -8.1% | +25.1% | 2258 | 2249 |
+| 4 | 2438 | 2704 | +10.9% | 2283 | 3464 | +51.7% | -6.4% | +28.1% | 2262 | 2286 |
+| 5 | 2424 | 2694 | +11.1% | 2299 | 3502 | +52.4% | -5.2% | +30.0% | 2258 | 2299 |
+| 6 | 2430 | 2691 | +10.7% | 2318 | 3544 | +52.9% | -4.6% | +31.7% | 2261 | 2322 |
+| 7 | 2515 | 2824 | +12.3% | 2321 | 3680 | +58.5% | -7.7% | +30.3% | 2327 | 2323 |
+| 8 | 2525 | 2827 | +12.0% | 2325 | 3689 | +58.6% | -7.9% | +30.5% | 2330 | 2329 |
+| 9 | 2424 | 2777 | +14.6% | 2146 | 3632 | +69.2% | -11.5% | +30.8% | 2217 | 2142 |
+| 10 | 2425 | 2784 | +14.8% | 2144 | 3656 | +70.5% | -11.6% | +31.3% | 2216 | 2152 |
+
+macos-arm64 (macos-latest, a VM: noisier):
+
+| level | v3 base | v3 C | | v5 base | v5 C | | v5/v3 base | v5/v3 C | v3 Pascal | v5 Pascal |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 3138 | 3484 | +11.0% | 3064 | 4446 | +45.1% | -2.3% | +27.6% | 3058 | 2947 |
+| 1 | 3180 | 3467 | +9.0% | 3194 | 4765 | +49.2% | +0.4% | +37.5% | 3232 | 3017 |
+| 2 | 3189 | 3479 | +9.1% | 3191 | 4919 | +54.1% | +0.1% | +41.4% | 3111 | 2989 |
+| 3 | 3225 | 3715 | +15.2% | 3152 | 4978 | +57.9% | -2.3% | +34.0% | 3124 | 3089 |
+| 4 | 3276 | 3637 | +11.0% | 3368 | 5049 | +49.9% | +2.8% | +38.8% | 3249 | 3146 |
+| 5 | 3308 | 3648 | +10.3% | 3306 | 4891 | +47.9% | -0.1% | +34.1% | 3308 | 3182 |
+| 6 | 3329 | 3777 | +13.4% | 3260 | 5228 | +60.3% | -2.1% | +38.4% | 3308 | 3226 |
+| 7 | 3529 | 3999 | +13.3% | 3442 | 5151 | +49.7% | -2.5% | +28.8% | 3644 | 3236 |
+| 8 | 3553 | 4017 | +13.1% | 3429 | 5163 | +50.6% | -3.5% | +28.5% | 3594 | 3264 |
+| 9 | 3354 | 3825 | +14.1% | 2975 | 4965 | +66.9% | -11.3% | +29.8% | 3454 | 2990 |
+| 10 | 3388 | 3854 | +13.8% | 2998 | 4930 | +64.5% | -11.5% | +27.9% | 3542 | 2984 |
+
+v5 now decodes 22-31% faster than v3 on linux-arm64 and 28-41% on
+macOS, and v3 itself 9-15% faster than before. x86-64 runs the
+assembler as before (bench.yml's windows-x64, same runner type both
+times: within 1%). Across separate runs the cloud machines differ by up
+to 50% (linux-x64) or 20% (macOS), so only same-job comparisons count;
+silesia.tar is built by tar on each runner (member order, headers), so
+compressed sizes differ by a few bytes between runs.
+
+Left as is: on linux-arm64 the Pascal loops in this build run ~7%
+slower than the base's for v3 (2201 against 2376 at level 0; macOS the
+same within noise). HufDecodeChunk now always has the bulk record and
+the kernel calls besides the Pascal loop; probably FPC's aarch64
+register allocation of the whole function suffers (not looked into).
+Only --paths pascal and
+SYLZ_NOHUFASM run that loop there.
 
 ## sylz formats v4 and v5, the branches integrated (2026-11-13, provisional)
 
