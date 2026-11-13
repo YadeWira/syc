@@ -472,9 +472,12 @@ const
   TAB4_REP    = $800;
   { levels 0..3 count one sequence in this many for a chunk's table; a
     chunk of fewer than 2 * SAMPLE4_ALL sequences counts them all, and
-    larger ones about SAMPLE4_ALL of them until that step is reached }
+    larger ones about SAMPLE4_ALL of them until that step is reached.
+    Counting all of them costs some 40 instructions a sequence: with
+    8192, 64 KiB pieces of Silesia compressed 8% more instructions than
+    sampled at level 1 (and 0.11% smaller) }
   FAST_SAMPLE4 = 8;
-  SAMPLE4_ALL  = 8192;
+  SAMPLE4_ALL  = 1024;
   { A recorded sequence: three u16, literals, match length, distance - 1;
     literals = REC4_ESC: the lengths follow as two u32 (and 4 unused
     bytes), REC4_LONG records in all. }
@@ -1183,6 +1186,58 @@ begin
   end;
 end;
 
+type
+  { what CountAll4 adds up besides the counts }
+  TSums4 = record
+    seqs, reps, x4: SizeInt;   { sequences, those at the previous offset, Extra4 }
+    x2: UInt32;                { format v2's extension bytes (EXT2_NONE: no v2) }
+  end;
+
+{ The cells that the records r..rend look up, counted in cnt, and what
+  the same sequences take in format v2 (3 bytes each and x2; a match
+  under SYLZ_MINMATCH, which v2 does not have, adds EXT2_NONE) and in this
+  one (a token each, Extra4, the offsets of the matches not at the
+  previous offset). Its own routine, so that the loop's variables can
+  live in registers. }
+procedure CountAll4(r, rend: PUInt16; prev: SizeInt; const codes: TCodes4;
+  var cnt: TPairCounts4; out sums: TSums4);
+var
+  ll, ml, dist, k, row, col, seqs, reps, x4: SizeInt;
+  x2: UInt32;
+begin
+  seqs := 0;
+  reps := 0;
+  x4 := 0;
+  x2 := 0;
+  while r < rend do
+  begin
+    GetRec4(r, ll, ml, dist);
+    k := Ord(dist = prev);
+    if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
+    begin
+      Inc(cnt[k, ll, ml]);
+      Inc(x2, Ext2[ll, ml]);
+    end
+    else
+    begin
+      if PairOf4(codes, k, ll, ml, row, col) then
+        Inc(cnt[k, row, col]);
+      Inc(x4, Extra4(k, ll, ml));
+      if ml < SYLZ_MINMATCH then
+        Inc(x2, EXT2_NONE)
+      else if x2 < EXT2_NONE then
+        Inc(x2, UInt32(Ctrl2Ext(ll, ml)));
+    end;
+    Inc(seqs);
+    Inc(reps, k);
+    prev := dist;
+  end;
+  sums.seqs := seqs;
+  sums.reps := reps;
+  sums.x4 := x4;
+  sums.x2 := x2;
+end;
+
 {$ifdef SYLZ_C}
 type
   { sylzc_put4 in sylzc.c: fixed field order }
@@ -1205,9 +1260,9 @@ var
   repl: TUpdate4;
   r, rend: PUInt16;
   head, p, limit, off, body: PByte;
-  prev, k, row, col, ll, ml, dist, i, code, sample, nrepl, maxRepl: SizeInt;
-  seqs, reps, x4, miss: SizeInt;
-  w, x2: UInt32;
+  prev, k, row, col, ll, ml, dist, i, code, sample, nrepl, maxRepl, miss: SizeInt;
+  sums: TSums4;
+  w: UInt32;
 {$ifdef SYLZ_C}
   pc: TPut4C;
 {$endif}
@@ -1241,39 +1296,9 @@ begin
   prev := e.tokRep;
   if sample = 1 then
   begin
-    { and what format v2 would take for them: 3 bytes each and x2 (a
-      match under SYLZ_MINMATCH, which v2 does not have, adds EXT2_NONE);
-      for this format's bytes, the matches at the previous offset and
-      Extra4 }
-    seqs := 0;
-    reps := 0;
-    x4 := 0;
-    x2 := 0;
-    while r < rend do
-    begin
-      GetRec4(r, ll, ml, dist);
-      k := Ord(dist = prev);
-      if (ll <= MAX_LL4) and (ml <= MAX_ML4) then
-      begin
-        Inc(cnt[k, ll, ml]);
-        Inc(x2, Ext2[ll, ml]);
-      end
-      else
-      begin
-        if PairOf4(e.codes, k, ll, ml, row, col) then
-          Inc(cnt[k, row, col]);
-        Inc(x4, Extra4(k, ll, ml));
-        if ml < SYLZ_MINMATCH then
-          Inc(x2, EXT2_NONE)
-        else if x2 < EXT2_NONE then
-          Inc(x2, UInt32(Ctrl2Ext(ll, ml)));
-      end;
-      Inc(seqs);
-      Inc(reps, k);
-      prev := dist;
-    end;
-    if (x2 < EXT2_NONE) and (seqs <= EXT2_SEQS) then
-      e.ctrl2 := 3 * seqs + SizeInt(x2);
+    CountAll4(r, rend, prev, e.codes, cnt, sums);
+    if (sums.x2 < EXT2_NONE) and (sums.seqs <= EXT2_SEQS) then
+      e.ctrl2 := 3 * sums.seqs + SizeInt(sums.x2);
   end
   else
     while r < rend do
@@ -1294,7 +1319,7 @@ begin
       bytes for each match not at the previous offset, the update. Where
       v2's is smaller the block goes out in v2's layout (EmitFinish) and
       the tokens are not written. }
-    i := seqs + x4 + miss + 2 * (seqs - reps);
+    i := sums.seqs + sums.x4 + miss + 2 * (sums.seqs - sums.reps);
     if nrepl > 0 then
       Inc(i, 1 + UPDATE4_BYTES * nrepl);
     if e.ctrl2 < i then
