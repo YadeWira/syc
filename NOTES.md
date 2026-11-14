@@ -67,6 +67,159 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## v4/v5 compression on arm64: the C paths of levels 0-3 (2026-11-13)
+
+GitHub's arm64 machines (bench.yml, silesia.tar) had v4 compressing
+slower than v2 at levels 0-3 and v5 slower than v3 at -ec 0-1, where the
+x86-64 assembler had it faster everywhere: linux-arm64 -2.9 -2.9 -6.7
+-5.5% (v4 against v2, levels 0-3), -6.6 -5.0% (v5 against v3, -ec 0-1);
+macOS -3.9% and -2.7% at levels 2-3. arm64 runs the C compressors
+(sylzc.c: gcc on Linux, clang on macOS) and FPC's aarch64 code for the
+rest. The encoder's choices are frozen with the format: every change
+below writes the same bytes (blocks dumped and compared with the base's
+at every level, v2 to v5, assembler, C and Pascal paths, silesia.tar,
+mixed.tar and small files; arm64 and i386 builds on mixed.tar; CI's
+hashes unchanged).
+
+How it was measured: a temporary branch (bench/arm64-compress, deleted
+since) whose bench.yml built the base commit (b1f563e) and up to six
+variants of this branch in one job and compressed silesia.tar with them
+interleaved (sylzbench -t 0.5, best of 5 rounds on Linux, 10-15 on
+macOS); on linux-arm64 also perf, which works on ubuntu-24.04-arm
+(linux-tools for the runner's kernel, paranoid -1): `perf stat` of a
+compress-only harness (cycles, instructions, branch misses per input
+byte, 4 compressions less 1) and `perf record`/`annotate` on cycles
+(instruction sampling there has the same skid and told nothing more).
+linux-arm64 repeats within 0.3% between identical binaries in a job and
+about 1% between jobs; macOS (a VM) moved identical binaries by up to
+10% in some jobs, even as the best of 12 rounds, and within 1% in
+others.
+
+What it was, and what changed:
+
+- FPC 3.2.2 has no Move of its own for aarch64: the generic one copies a
+  byte at a time unless source and destination share their alignment
+  mod 8, so EmitFinish's copies of the offsets and literals into the
+  block were chance: the same build's v4 level 0 ran 723 MB/s on one
+  runner's silesia.tar and 676 on another's (Move 0.8% against 4.8% of
+  the samples); v2 level 0 had it at 7% of its compression. CopyOut
+  (Pascal: 8-byte moves on aarch64, Move elsewhere) makes those copies.
+  It speeds v2 as much as v4 (v2 level 0 +5.5%).
+- levels 2-3, gcc's register allocation of compress_mid4_core (now v4's
+  own function; compress_mid_core is v2's): with the emitter's state,
+  the values kept across its calls and the inlined counts in the one
+  loop, it made the hash multipliers again at every position (mov/movk,
+  five instructions), kept mflimit and the candidate's distance on the
+  stack and computed fast_dist with a select. The multipliers are
+  locals hidden from gcc by an empty asm on arm64 (`__asm__("" :
+  "+r"(kl), "+r"(ks))`, which keeps them in registers: +2.5% at level 2,
+  +3% at level 3); the candidate test works on the candidate's position
+  (r = pos - 1 - ((pos - 1 - entry) & 0xFFFF); r < 0: before src), +4%;
+  a position's 8 bytes are loaded once for both hashes, both candidates'
+  tests and (64-bit) the previous offset's test against a pointer kept
+  per match (+1%). x86 multiplies by immediates: there the asm only
+  takes registers (+1-8% instructions on x86-64 and i386), so it is
+  arm64's alone; the pointer costs i386 registers and is 64-bit only.
+- levels 0-1, the probes: the first 64 after a match test the previous
+  offset (v4's encoder). For gcc, the 8 bytes loaded for a probe's hash
+  give the next probe's 4 to compare (64-bit; on i386 one register more
+  was 9% slower, it reads them again), the candidate is ip less the
+  branchless distance, and those probes run on one counter bounded by
+  both 64 and mflimit: +4.5% on linux-arm64. clang compiled the first
+  form better (with the new one macOS levels 0-1 were 5-6% slower:
+  bisected on GitHub) and keeps it.
+- every level 0-3, the tokens of the sequences with no code: 16% of the
+  sequences at level 0 on silesia.tar, 7% at level 2, each a call of
+  put_tokens4 and find_split4's search of the table. An open chunk's
+  codes do not change: a memo per chunk keeps them (a u32 per kind,
+  literals up to LIT_SPLIT4 and match length up to ML_SPLIT4, the tokens
+  in its low bytes, 0xFF in the others; 17 KiB in the record buffer 8
+  words past the levels 0-3 records, which sylz.pas checks it holds),
+  filled as asked for and written with one 4-byte store. A field for it
+  in sylzc_emit made the struct the v2 loops copy bigger and i386's v2
+  level 0 4% slower; it is at recEnd + 8 words instead.
+- the flush: FPC's CountAll4 took 1% of level 0. FlushChunk4 counts an
+  open chunk in C (sylzc_count_chunk4: the count without the sums only a
+  closed chunk weighs), and sylzc_put_chunk4 clears the memo and writes
+  the records' split tokens through it, so the open chunk after it
+  starts with them. The x86-64 assembler's flush is the same code (1%
+  fewer instructions there).
+- the emitter's write state in a local (open4_state) instead of the
+  escaped sylzc_emit: neutral on linux-arm64 (+0.6% level 0, -0.5% level
+  2); with its fields used once a sequence in memory, 1-2% slower.
+
+Measured and not kept: the searches between matches in functions of
+their own (no change at levels 2-3, level 0 4% slower: the calls' spills
+cost what the loops gained); both tables' entries and candidates loaded
+before the previous offset's test (6% slower); the level 2 lookahead's
+table entry read before the count (2% slower); the match count not
+inlined (2% slower); as a diagnostic, v4 level 2 without the previous
+offset's test (a different parse) was no faster, which pointed at the
+per-match code and the register allocation rather than the test.
+
+GitHub, one job each, base (b1f563e) against this branch, compress MB/s
+(best of 5 rounds on Linux, 15 on macOS):
+
+linux-arm64 (ubuntu-24.04-arm):
+
+| format | level | base | branch | | new against old: base | branch |
+|---|---|---|---|---|---|---|
+| v2 | 0 | 694.2 | 734.9 | +5.9% | | |
+| v4 | 0 | 676.3 | 788.8 | +16.6% | -2.6% | **+7.3%** |
+| v2 | 1 | 633.6 | 659.6 | +4.1% | | |
+| v4 | 1 | 615.1 | 696.6 | +13.3% | -2.9% | **+5.6%** |
+| v2 | 2 | 366.7 | 370.9 | +1.1% | | |
+| v4 | 2 | 342.5 | 382.9 | +11.8% | -6.6% | **+3.2%** |
+| v2 | 3 | 312.8 | 310.4 | -0.8% | | |
+| v4 | 3 | 296.6 | 333.6 | +12.5% | -5.2% | **+7.5%** |
+| v3 | -ec 0 | 340.0 | 338.4 | -0.5% | | |
+| v5 | -ec 0 | 317.9 | 348.1 | +9.5% | -6.5% | **+2.9%** |
+| v3 | -ec 1 | 293.4 | 288.1 | -1.8% | | |
+| v5 | -ec 1 | 278.1 | 306.4 | +10.2% | -5.2% | **+6.4%** |
+
+perf stat there (compress only, cycles per byte, base -> branch): v2
+4.84 -> 4.61, 5.31 -> 5.11, 9.01 -> 8.92, 10.58 -> 10.64; v4 5.03 ->
+4.29, 5.45 -> 4.84, 9.51 -> 8.48, 11.06 -> 9.78 (levels 0-3); v3 9.74
+-> 9.78, 11.28 -> 11.52; v5 10.26 -> 9.37, 11.79 -> 10.65 (-ec 0-1).
+Instructions per byte, v4 against v2 now: 11.85/12.35, 11.66/11.93,
+18.03/19.47, 20.04/23.09.
+
+macos-arm64 (macos-latest; in this job identical v2 code moved by up to
+4.5%, so read the margins within a column):
+
+| format | level | base | branch | | new against old: base | branch |
+|---|---|---|---|---|---|---|
+| v2 | 0 | 694.7 | 686.7 | -1.2% | | |
+| v4 | 0 | 756.9 | 765.3 | +1.1% | +9.0% | **+11.4%** |
+| v2 | 1 | 677.3 | 667.0 | -1.5% | | |
+| v4 | 1 | 729.8 | 691.1 | -5.3% | +7.8% | **+3.6%** |
+| v2 | 2 | 380.1 | 363.2 | -4.5% | | |
+| v4 | 2 | 361.7 | 384.8 | +6.4% | -4.8% | **+6.0%** |
+| v2 | 3 | 335.9 | 323.6 | -3.6% | | |
+| v4 | 3 | 331.3 | 336.8 | +1.7% | -1.4% | **+4.1%** |
+| v3 | -ec 0 | 338.1 | 347.9 | +2.9% | | |
+| v5 | -ec 0 | 339.3 | 366.9 | +8.2% | +0.3% | **+5.5%** |
+| v3 | -ec 1 | 308.7 | 304.0 | -1.5% | | |
+| v5 | -ec 1 | 299.1 | 325.1 | +8.7% | -3.1% | **+6.9%** |
+
+In a quieter macOS job (v2 within 0.4% across six builds) the levels 2-3
+and -ec 0-1 changes gave v4 +5.1% / +6.5% and v5 +4.8% / +5.6% over the
+base; the memo cost clang's level 1 about 1.5% (bisect job).
+
+x86 (CPU 28 here, perf stat cycles:u per byte, base -> branch): the
+x86-64 assembler runs the same code apart from the flush (instructions
+-0.1 per byte at levels 0-3, cycles within noise: v4 5.84 -> 5.76, 6.23
+-> 6.39, 11.51 -> 10.93, 15.74 -> 15.82). The x86-64 C path (SYLZ_C=1):
+v4 7.15 -> 6.55, 7.57 -> 6.95, 13.34 -> 12.11, 18.05 -> 15.98, v2 the
+same within noise (its level 3 C code compiles 2% bigger now that
+compress_mid_core is v2's alone). i386 (gcc -m32 build, C): v4 9.51 ->
+9.45, 10.00 -> 10.17, 18.21 -> 17.56, 24.54 -> 24.33 with 3-10% fewer
+instructions; v2 unchanged (single runs here move by 2-4%).
+
+Left: -ec 0 on linux-arm64 at +2.9%, the thinnest; macOS level 1 below
+the base by a few percent (the memo's cost under clang) while above v2;
+the i386 v4 level 1 within noise of the base.
+
 ## Huffman bulk loops in C (2026-11-13)
 
 GitHub's machines (bench.yml) showed v5 decoding 11-14% faster than v3

@@ -790,45 +790,6 @@ static void emit_sequence4(sylzc_emit *e, const uint8_t *lit, intptr_t litLen,
     e->lit += litLen;
 }
 
-/* emit_sequence4 for a loop that keeps the record and literal write
-   pointers in registers (rec, lit: its locals; e's copies are current
-   only around a flush). The caller keeps the previous distance itself. */
-static inline __attribute__((always_inline)) void emit_fast4(sylzc_emit *e,
-    uint16_t **prec, uint8_t **plit, const uint8_t *lit, intptr_t litLen,
-    intptr_t dist, intptr_t matchLen)
-{
-    uint16_t *r = *prec;
-    uint8_t *w = *plit;
-    if (__builtin_expect(r >= e->recEnd, 0)) {
-        e->rec = r;
-        e->lit = w;
-        e->flush(e);
-        r = e->rec;
-    }
-    r[2] = (uint16_t)(dist - 1);
-    if (__builtin_expect(litLen < 0xFFFF && matchLen <= 0xFFFF, 1)) {
-        r[0] = (uint16_t)litLen;
-        r[1] = (uint16_t)matchLen;
-        r += 3;
-    } else {
-        uint32_t v;
-        r[0] = 0xFFFF;
-        r[1] = 0;
-        v = (uint32_t)litLen;
-        __builtin_memcpy(r + 3, &v, 4);
-        v = (uint32_t)matchLen;
-        __builtin_memcpy(r + 5, &v, 4);
-        r += 9;
-    }
-    *prec = r;
-    if (__builtin_expect(litLen <= 16 && e->srcEnd - lit >= 16, 1))
-        copy16(w, lit);
-    else
-        for (intptr_t i = 0; i < litLen; i++)
-            w[i] = lit[i];
-    *plit = w + litLen;
-}
-
 /* FindSplit4 in sylz.pas: the split of ll literals (up to LIT_SPLIT4)
    and a match of ml (up to ML_SPLIT4) that has a code, *b literals with
    the first *m bytes of the match; 0: none (the first one tried) */
@@ -920,44 +881,153 @@ static __attribute__((noinline)) uint8_t *put_tokens4(const struct sylzc_codes4 
     return p;
 }
 
-/* emit_fast4 for levels 0-1, where only a chunk's first sequences are
-   recorded and the ones after them go into it as tokens (e->direct), as
-   EmitDirect4 in sylz.pas writes them: tok and off are the loop's token
-   and offset write pointers. prev: the distance before this sequence. */
+/* The write state of a loop that emits as EmitDirect4 / EmitSequence4 do
+   (levels 0-3), kept in one local of the loop: only inline code takes its
+   address, so its fields can stay in registers. The emitter (sylzc_emit)
+   is passed by address to the Pascal flush, and after that every byte the
+   loop stores could change it as far as the compiler knows: with the
+   fields read from it, gcc for arm64 loaded direct, tokEnd, codes and
+   srcEnd from the stack again for each sequence. (About the same speed on
+   linux-arm64; with the fields used once a sequence in memory, levels 1-2
+   were 1-2% slower.) */
+typedef struct {
+    uint16_t *rec;                /* the next record (not direct) */
+    uint8_t *tok, *off, *lit;     /* token (direct), offset and literal write pointers */
+    intptr_t direct;
+    const uint8_t *tokEnd;        /* direct: the open chunk's end */
+    const uint16_t *recEnd;       /* the records' end */
+    const uint8_t *codes;         /* sylzc_codes4, as bytes: [kind][row][column] */
+    const uint8_t *srcEnd;
+    uint8_t *memo;                /* direct: the split tokens (split4_memo) */
+} open4_state;
+
+#define CELLS4_KIND ((ROW4_EXT + 1) * (COL4_EXT + 1))   /* a kind's cells in sylzc_codes4 */
+
+/* The tokens put_tokens4 writes for a sequence of up to LIT_SPLIT4
+   literals and a match of up to ML_SPLIT4 (16% of the sequences at level
+   0 on silesia.tar, 7% at level 2: a call each, and find_split4's search
+   of the table), remembered per open chunk, whose codes do not change: a
+   u32 by kind, literals and match length, the tokens in its low bytes
+   (at most 4 of them) and 0xFF in the others (no code is 255), all 0xFF
+   for one not asked for yet. Kept in the record buffer after the records
+   of levels 0-3: 8 words after recEnd, past a long record that starts
+   before it (sylz.pas checks the buffer holds it; a field of its own in
+   sylzc_emit made the struct the v2 loops copy bigger, and the 32-bit v2
+   level 0 4% slower). */
+#define SPLIT4_MEMO_N ((LIT_SPLIT4 + 1) * (ML_SPLIT4 + 1))   /* a kind's entries */
+#define SPLIT4_MEMO_BYTES (2 * SPLIT4_MEMO_N * 4)
+
+/* every entry not asked for: by sylzc_put_chunk4, which each flush that
+   leaves a chunk open calls with its table (in FlushChunk4) */
+static void split4_clear(uint8_t *memo)
+{
+    for (intptr_t i = 0; i < SPLIT4_MEMO_BYTES; i += 8) {
+        uint64_t v = ~(uint64_t)0;
+        __builtin_memcpy(memo + i, &v, 8);
+    }
+}
+
+/* the entry for k, ll, ml, from put_tokens4 */
+static __attribute__((noinline)) uint32_t split4_fill(uint8_t *at, const uint8_t *codes,
+    int k, intptr_t ll, intptr_t ml)
+{
+    uint8_t b[16], *end;
+    uint32_t v = 0;
+    end = put_tokens4((const struct sylzc_codes4 *)codes, b, k, ll, ml);
+    for (intptr_t i = 3; i >= 0; i--)
+        v = (v << 8) | (b + i < end ? b[i] : 255);
+    __builtin_memcpy(at, &v, 4);
+    return v;
+}
+
+static void open4_load(open4_state *w, const sylzc_emit *e)
+{
+    w->rec = e->rec;
+    w->tok = e->ctrl;
+    w->off = e->off;
+    w->lit = e->lit;
+    w->direct = e->direct;
+    w->tokEnd = e->tokEnd;
+    w->recEnd = e->recEnd;
+    w->codes = &e->codes->cell[0][0][0];
+    w->srcEnd = e->srcEnd;
+    w->memo = (uint8_t *)(e->recEnd + 8);
+}
+
+static void open4_store(sylzc_emit *e, const open4_state *w, intptr_t rep)
+{
+    e->rec = w->rec;
+    e->ctrl = w->tok;
+    e->off = w->off;
+    e->lit = w->lit;
+    e->rep = rep;
+}
+
+/* emit_open4's way out, out of the loop's code: a full chunk is closed and
+   full records are flushed, which may leave their chunk open, until one of
+   them takes the sequence (the flush changes rec, tok, off, direct and
+   tokEnd) */
+static __attribute__((noinline)) void open4_turn(sylzc_emit *e, open4_state *w, intptr_t prev)
+{
+    do {
+        open4_store(e, w, prev);
+        e->flush(e);
+        open4_load(w, e);
+    } while (w->direct ? w->tok >= w->tokEnd : w->rec >= w->recEnd);
+}
+
+/* The tokens of a sequence that has no code of its own at p (by the
+   memo when it is one of up to LIT_SPLIT4 literals and a match of up to
+   ML_SPLIT4); returns where they end. All 4 bytes of a memo entry are
+   stored, the tokens kept: the token stream stays far below dst's end
+   (SylzBound counts each input byte as a literal, and these tokens cover
+   2 bytes or more each). */
+static inline __attribute__((always_inline)) uint8_t *put_split4(uint8_t *p,
+    const uint8_t *codes, uint8_t *memo, int k, intptr_t ll, intptr_t ml)
+{
+    if (ll <= LIT_SPLIT4 && ml <= ML_SPLIT4) {
+        uint8_t *at = memo + 4 * ((k ? SPLIT4_MEMO_N : 0) + ll * (ML_SPLIT4 + 1) + ml);
+        uint32_t v;
+        __builtin_memcpy(&v, at, 4);
+        if (__builtin_expect(v == ~(uint32_t)0, 0))
+            v = split4_fill(at, codes, k, ll, ml);
+        __builtin_memcpy(p, &v, 4);
+        return p + ((39 - __builtin_clz(~v)) >> 3);
+    }
+    return put_tokens4((const struct sylzc_codes4 *)codes, p, k, ll, ml);
+}
+
+/* emit_sequence4 for levels 0-3, where only a chunk's first sequences are
+   recorded and the ones after them go into it as tokens (w->direct), as
+   EmitDirect4 in sylz.pas writes them. prev: the distance before this
+   sequence. */
 static inline __attribute__((always_inline)) void emit_open4(sylzc_emit *e,
-    uint16_t **prec, uint8_t **ptok, uint8_t **poff, uint8_t **plit,
-    const uint8_t *lit, intptr_t litLen, intptr_t dist, intptr_t matchLen,
+    open4_state *w, const uint8_t *lit, intptr_t litLen, intptr_t dist, intptr_t matchLen,
     intptr_t prev)
 {
-    uint8_t *w = *plit;
-    /* a full chunk is closed and full records are flushed, which may
-       leave their chunk open, until one of them takes the sequence */
-    while (__builtin_expect(e->direct ? *ptok >= e->tokEnd : *prec >= e->recEnd, 0)) {
-        e->rec = *prec;
-        e->ctrl = *ptok;
-        e->off = *poff;
-        e->lit = w;
-        e->rep = prev;
-        e->flush(e);
-        *prec = e->rec;
-        *ptok = e->ctrl;
-        *poff = e->off;
+    uint8_t *d;
+    if (__builtin_expect(w->direct ? w->tok >= w->tokEnd : w->rec >= w->recEnd, 0)) {
+        /* (the loop's copy of w goes through memory only here) */
+        open4_state t = *w;
+        open4_turn(e, &t, prev);
+        *w = t;
     }
-    if (e->direct) {
-        uint8_t *p = *ptok, *o = *poff;
+    if (__builtin_expect(w->direct, 1)) {
+        uint8_t *p = w->tok;
         int k = dist == prev, code = 255;
+        uint16_t o = (uint16_t)(dist - 1);
         if (litLen <= MAX_LL4 && matchLen <= MAX_ML4)
-            code = e->codes->cell[k][litLen][matchLen];
+            code = w->codes[(k ? CELLS4_KIND : 0) + litLen * (COL4_EXT + 1) + matchLen];
         if (__builtin_expect(code != 255, 1))
             *p++ = (uint8_t)code;
         else
-            p = put_tokens4(e->codes, p, k, litLen, matchLen);
-        *ptok = p;
-        o[0] = (uint8_t)(dist - 1);
-        o[1] = (uint8_t)((dist - 1) >> 8);
-        *poff = o + 2 - 2 * k;
+            p = put_split4(p, w->codes, w->memo, k, litLen, matchLen);
+        w->tok = p;
+        /* little-endian, as the offset stream (every target sylz has) */
+        __builtin_memcpy(w->off, &o, 2);
+        w->off += 2 - 2 * k;
     } else {
-        uint16_t *r = *prec;
+        uint16_t *r = w->rec;
         r[2] = (uint16_t)(dist - 1);
         if (__builtin_expect(litLen < 0xFFFF && matchLen <= 0xFFFF, 1)) {
             r[0] = (uint16_t)litLen;
@@ -973,19 +1043,23 @@ static inline __attribute__((always_inline)) void emit_open4(sylzc_emit *e,
             __builtin_memcpy(r + 5, &v, 4);
             r += 9;
         }
-        *prec = r;
+        w->rec = r;
     }
     /* 16-byte steps while the reads stay inside the input (the scratch
        stream has 16 bytes of slack), as the assembler copies them */
-    if (__builtin_expect(e->srcEnd - lit >= litLen + 16, 1)) {
-        copy16(w, lit);
+    d = w->lit;
+    if (__builtin_expect(w->srcEnd - lit >= litLen + 16, 1)) {
+        copy16(d, lit);
         for (intptr_t i = 16; i < litLen; i += 16)
-            copy16(w + i, lit + i);
+            copy16(d + i, lit + i);
     } else
         for (intptr_t i = 0; i < litLen; i++)
-            w[i] = lit[i];
-    *plit = w + litLen;
+            d[i] = lit[i];
+    w->lit = d + litLen;
 }
+
+static void count_split4(const struct sylzc_codes4 *t, uint32_t *cnt, int k, intptr_t ll,
+                         intptr_t ml);
 
 /* TPut4C in sylz.pas */
 typedef struct {
@@ -993,6 +1067,7 @@ typedef struct {
     uint8_t *p, *off;             /* in/out: token and offset write pointers */
     intptr_t prev;                /* in/out: the distance before the records */
     const struct sylzc_codes4 *codes;
+    uint8_t *memo;                /* levels 0-3: the split tokens' memo (cleared here), or 0 */
 } sylzc_put4;
 
 /* FlushChunk4's last loop in sylz.pas, without its room checks (the
@@ -1002,11 +1077,14 @@ void sylzc_put_chunk4(sylzc_put4 *st)
 {
     const uint16_t *r = st->rec, *rend = st->rend;
     const struct sylzc_codes4 *t = st->codes;
-    uint8_t *p = st->p, *off = st->off;
+    uint8_t *p = st->p, *off = st->off, *memo = st->memo;
     intptr_t prev = st->prev;
+    if (memo)
+        split4_clear(memo);
     while (r < rend) {
         intptr_t ll = r[0], ml = r[1], dist = (intptr_t)r[2] + 1;
         int k, code = 255;
+        uint16_t o = (uint16_t)(dist - 1);
         r += 3;
         if (__builtin_expect(ll == 0xFFFF, 0)) {
             uint32_t v;
@@ -1022,15 +1100,52 @@ void sylzc_put_chunk4(sylzc_put4 *st)
             code = t->cell[k][ll][ml];
         if (__builtin_expect(code != 255, 1))
             *p++ = (uint8_t)code;
+        else if (memo)
+            p = put_split4(p, &t->cell[0][0][0], memo, k, ll, ml);
         else
             p = put_tokens4(t, p, k, ll, ml);
-        off[0] = (uint8_t)(dist - 1);
-        off[1] = (uint8_t)((dist - 1) >> 8);
+        __builtin_memcpy(off, &o, 2);
         off += 2 - 2 * k;
     }
     st->p = p;
     st->off = off;
     st->prev = prev;
+}
+
+/* TCount4C in sylz.pas */
+typedef struct {
+    const uint16_t *rec, *rend;
+    intptr_t prev;                /* the distance before the records */
+    const struct sylzc_codes4 *codes;
+    uint32_t *cnt;                /* TPairCounts4 */
+} sylzc_count4;
+
+/* CountAll4's count in sylz.pas, without its sums (FlushChunk4 wants only
+   the count for a chunk it leaves open): the cell each record looks up */
+void sylzc_count_chunk4(sylzc_count4 *st)
+{
+    const uint16_t *r = st->rec, *rend = st->rend;
+    uint32_t *cnt = st->cnt;
+    intptr_t prev = st->prev;
+    while (r < rend) {
+        intptr_t ll = r[0], ml = r[1], dist = (intptr_t)r[2] + 1;
+        int k;
+        r += 3;
+        if (__builtin_expect(ll == 0xFFFF, 0)) {
+            uint32_t v;
+            __builtin_memcpy(&v, r, 4);
+            ll = v;
+            __builtin_memcpy(&v, r + 2, 4);
+            ml = v;
+            r += 6;
+        }
+        k = dist == prev;
+        prev = dist;
+        if (ll <= MAX_LL4 && ml <= MAX_ML4)
+            cnt[(k * (ROW4_EXT + 1) + ll) * (COL4_EXT + 1) + ml]++;
+        else
+            count_split4(st->codes, cnt, k, ll, ml);
+    }
 }
 
 /* ── levels 0-1 ───────────────────────────────────────────────────────── */
@@ -1124,11 +1239,30 @@ done:
 #define FAST_LOG0 13
 #define FAST_LOG1 15
 
+/* The probes as written below for gcc; clang (macOS) compiles the first
+   form better (on macos-arm64 levels 0-1 were 5-6% slower with this one,
+   and on linux-arm64 with gcc 4-5% faster) and keeps it */
+#if defined(__clang__)
+#define FAST4_PROBES_GCC 0
+#else
+#define FAST4_PROBES_GCC 1
+#endif
+
+/* The 4 bytes at the probe ip: on 64-bit targets carried from the load
+   for its hash (cur), on 32-bit ones read again (one register more kept
+   across the loop made it 9% slower on i386) */
+#if UINTPTR_MAX > 0xFFFFFFFF
+#define FAST4_CUR(ip) cur
+#else
+#define FAST4_CUR(ip) read32(src + (ip))
+#endif
+
 /* CompressFastCore4 in sylz.pas, same output byte for byte. Inlined once
    per level, with the hash shift a constant (a shift by a variable takes
    three operations on x86 without BMI2), and with the probes that step
    one byte (the first 64 after a match, the only ones that try the
-   previous offset) in a loop of their own. The distance is fast_dist's
+   previous offset) in a loop of their own, its one counter bounded by
+   both the 64 and mflimit. The candidate is ip less fast_dist's distance
    without its branch (a remainder of 0 is 65536 as the mask wraps), and
    no candidate is checked against the start of the input: an entry is an
    earlier position, or 0 (src) in the table cleared for this input, so
@@ -1141,18 +1275,80 @@ static inline __attribute__((always_inline)) void compress_fast4(sylzc_fast *st,
     intptr_t n = st->n;
     uint16_t *table = st->table;
     sylzc_emit e = st->e;
-    uint16_t *rec = e.rec;
-    uint8_t *wlit = e.lit, *tok = e.ctrl, *off = e.off;
-    intptr_t anchor = 0, ip, fwd, ref = 0, d, len, probes, mflimit, rep = 1;
-    uint32_t h, fwdH;
+    open4_state w;
+    intptr_t anchor = 0, ip, fwd, ref = 0, len, probes, mflimit, rep = 1;
+    uint32_t h, fwdH, cur __attribute__((unused));   /* (FAST4_CUR) */
+    uint64_t next;
+#if FAST4_PROBES_GCC
+    intptr_t lim;
+#else
+    intptr_t d;
     int i;
+#endif
 
+    open4_load(&w, &e);
+    if (w.direct)
+        split4_clear(w.memo);
     if (n < 12 + 1)
         goto done;
     mflimit = n - 12;
     ip = 1;
-    fwdH = (uint32_t)((read64(src + ip) * FAST_MULT16) >> (64 - hashLog));
+    next = read64(src + ip);
     for (;;) {
+#if FAST4_PROBES_GCC
+        /* next: the 8 bytes at ip, its hash fwdH; cur: the 4 at the probe,
+           carried from the hash's load (the table stores in between could
+           alias src as far as the compiler knows, so it read them again) */
+        fwdH = (uint32_t)((next * FAST_MULT16) >> (64 - hashLog));
+        cur = (uint32_t)next;
+        /* step one byte, up to 64 probes (fwd the probe after this one):
+           the previous offset one byte on, then the table's candidate */
+        lim = ip + (1 << SKIP_STRENGTH);
+        if (lim > mflimit)
+            lim = mflimit;
+        for (fwd = ip + 1; fwd <= lim; fwd++) {
+            const uint8_t *q = src + fwd;
+            uint32_t c;
+            h = fwdH;
+            ip = fwd - 1;
+            next = read64(q);
+            c = table[h];
+            table[h] = (uint16_t)ip;
+            fwdH = (uint32_t)((next * FAST_MULT16) >> (64 - hashLog));
+            if (read32(q - rep) == (uint32_t)next) {
+                ip = fwd;
+                ref = ip - rep;
+                goto found;
+            }
+            ref = (ip - 1) - ((ip - 1 - c) & 0xFFFF);
+            if (read32(src + ref) == FAST4_CUR(ip))
+                goto found;
+            cur = (uint32_t)next;
+        }
+        if (fwd > mflimit)
+            goto done;
+        fwd--;
+        /* then further and further */
+        probes = 2 << SKIP_STRENGTH;
+        for (;;) {
+            uint32_t c;
+            h = fwdH;
+            ip = fwd;
+            fwd += probes >> SKIP_STRENGTH;
+            probes++;
+            if (fwd > mflimit)
+                goto done;
+            next = read64(src + fwd);
+            c = table[h];
+            table[h] = (uint16_t)ip;
+            fwdH = (uint32_t)((next * FAST_MULT16) >> (64 - hashLog));
+            ref = (ip - 1) - ((ip - 1 - c) & 0xFFFF);
+            if (read32(src + ref) == FAST4_CUR(ip))
+                break;
+            cur = (uint32_t)next;
+        }
+#else
+        fwdH = (uint32_t)((next * FAST_MULT16) >> (64 - hashLog));
         fwd = ip;
         /* step one byte: the previous offset, one byte on, then the
            table's candidate */
@@ -1189,14 +1385,14 @@ static inline __attribute__((always_inline)) void compress_fast4(sylzc_fast *st,
             if (read32(src + ref) == read32(src + ip))
                 break;
         }
+#endif
     found:
         while (ip > anchor && ref > 0 && src[ip - 1] == src[ref - 1]) {
             ip--;
             ref--;
         }
         len = MINMATCH + count_match_inl(src + ip + MINMATCH, src + ref + MINMATCH, src + n);
-        emit_open4(&e, &rec, &tok, &off, &wlit, src + anchor, ip - anchor, ip - ref,
-                   len, rep);
+        emit_open4(&e, &w, src + anchor, ip - anchor, ip - ref, len, rep);
         rep = ip - ref;
         ip += len;
         anchor = ip;
@@ -1204,14 +1400,10 @@ static inline __attribute__((always_inline)) void compress_fast4(sylzc_fast *st,
             goto done;
         /* the search goes on at the match's end */
         table[(uint32_t)((read64(src + ip - 2) * FAST_MULT16) >> (64 - hashLog))] = (uint16_t)(ip - 2);
-        fwdH = (uint32_t)((read64(src + ip) * FAST_MULT16) >> (64 - hashLog));
+        next = read64(src + ip);
     }
 done:
-    e.rec = rec;
-    e.ctrl = tok;
-    e.off = off;
-    e.lit = wlit;
-    e.rep = rep;
+    open4_store(&e, &w, rep);
     st->anchor = anchor;
     st->e = e;
 }
@@ -1268,61 +1460,23 @@ typedef struct {
     sylzc_emit e;
 } sylzc_mid;
 
-/* CompressMidCore in sylz.pas, same output byte for byte; v4 is a
-   constant in each of the functions made from it, and so are, in v4's
-   made for levels 2 and 3, the level's parameters (a shift by a variable
-   takes three operations on x86 without BMI2, and the fields of st would
-   be read again after each byte stored) */
-/* v4's levels 2-3 inline the match count on 64-bit targets: a call
-   there makes the loop keep fewer of its variables in registers (on
-   win32, mingw would then call libgcc's __ctzdi2, which FPC does not
-   link) */
-#if UINTPTR_MAX > 0xFFFFFFFF
-#define MID_COUNT(a, b, l) (v4 ? count_match_inl(a, b, l) : count_match(a, b, l))
-#else
-#define MID_COUNT(a, b, l) count_match(a, b, l)
-#endif
-
-static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st, const int v4,
-    const int hashLog, const intptr_t lazy, const intptr_t skip, const intptr_t lazyEnough,
-    const intptr_t nextBelow)
+/* CompressMidCore in sylz.pas for format v2, same output byte for byte
+   (compress_mid4_core below is v4's) */
+static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *st,
+    const int hashLog, const intptr_t lazy,
+    const intptr_t skip, const intptr_t lazyEnough, const intptr_t nextBelow)
 {
     const uint8_t *src = st->src;
     intptr_t n = st->n;
     uint16_t *tl = st->tl, *ts = st->ts;
     sylzc_emit e = st->e;
-    uint16_t *rec = e.rec;   /* v4: emit_open4's pointers */
-    uint8_t *tok = e.ctrl, *woff = e.off, *wlit = e.lit;
-    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit, rep = 1;
+    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k, mend, mflimit;
 
     if (n < 12 + 1)
         goto done;
     mflimit = n - 12;
     pos = 0;
     while (pos < mflimit) {
-        /* (rep <= pos always: 1 at first, then a match's distance, which
-           is at most its position) */
-        if (v4 && read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
-            /* the previous offset, one byte on, or the long table's
-               candidate here if that match is short and this one longer */
-            len = MINMATCH + MID_COUNT(src + pos + 1 + MINMATCH, src + pos + 1 - rep + MINMATCH, src + n);
-            dist = 0;
-            if (len < nextBelow)
-                dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
-            else
-                tl[mid_hash_long(src + pos, hashLog)] = (uint16_t)pos;
-            ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
-            len2 = 0;
-            if (dist > 0)
-                len2 = MINMATCH + MID_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
-            if (len2 > len + 1)
-                len = len2;
-            else {
-                pos++;
-                dist = rep;
-            }
-            goto found;
-        }
         dist = mid_cand(tl, mid_hash_long(src + pos, hashLog), src, pos);
         if (dist > 0)
             ts[mid_hash_short(src + pos, hashLog)] = (uint16_t)pos;
@@ -1333,7 +1487,7 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
                 continue;
             }
         }
-        len = MINMATCH + MID_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+        len = MINMATCH + count_match(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
         if (lazy) {
             /* both tables one byte later, while that finds a longer match */
             while (len < lazyEnough && pos + 1 < mflimit) {
@@ -1344,7 +1498,7 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
                     dist2 = dshort;
                 if (dist2 == 0)
                     break;
-                len2 = MINMATCH + MID_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
                 if (len2 <= len)
                     break;
                 pos = k;
@@ -1356,7 +1510,179 @@ static inline __attribute__((always_inline)) void compress_mid_core(sylzc_mid *s
             k = pos + 1;
             dist2 = mid_cand(tl, mid_hash_long(src + k, hashLog), src, k);
             if (dist2 > 0) {
-                len2 = MINMATCH + MID_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                len2 = MINMATCH + count_match(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                if (len2 > len) {
+                    pos = k;
+                    len = len2;
+                    dist = dist2;
+                }
+            }
+        }
+        while (pos > anchor && pos > dist && src[pos - 1] == src[pos - 1 - dist]) {
+            pos--;
+            len++;
+        }
+        emit_sequence(&e, src + anchor, pos - anchor, dist, len);
+        mend = pos + len;
+        if (mend < mflimit) {
+            tl[mid_hash_long(src + pos + 1, hashLog)] = (uint16_t)(pos + 1);
+            ts[mid_hash_short(src + pos + 2, hashLog)] = (uint16_t)(pos + 2);
+            tl[mid_hash_long(src + mend - 2, hashLog)] = (uint16_t)(mend - 2);
+            ts[mid_hash_short(src + mend - 1, hashLog)] = (uint16_t)(mend - 1);
+        }
+        pos = mend;
+        anchor = pos;
+    }
+done:
+    st->anchor = anchor;
+    st->e = e;
+}
+
+void sylzc_compress_mid(sylzc_mid *st)
+{
+    compress_mid_core(st, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
+                      st->nextBelow);
+}
+
+/* v4's levels 2-3 inline the match count on 64-bit targets: a call
+   there makes the loop keep fewer of its variables in registers (on
+   win32, mingw would then call libgcc's __ctzdi2, which FPC does not
+   link) */
+#if UINTPTR_MAX > 0xFFFFFFFF
+#define MID4_COUNT(a, b, l) count_match_inl(a, b, l)
+#else
+#define MID4_COUNT(a, b, l) count_match(a, b, l)
+#endif
+
+/* MidHashLong and MidHashShort of the 8 bytes v at a position (the shift
+   by 16 folded into the multiplier, as FAST_MULT16), kl and ks the
+   multipliers */
+#define MID4_HL(v) ((uint32_t)(((v) * kl) >> (64 - hashLog)))
+#define MID4_HS(v) ((uint32_t)((uint32_t)(v) * ks) >> (32 - hashLog))
+
+/* mid_cand with the 4 bytes at pos given (v), on the candidate's
+   position, fast_dist's without its branch (as compress_fast4): two
+   operations fewer than the distance and its test, which gcc for arm64
+   made with a select (levels 2-3 4% faster there) */
+static inline __attribute__((always_inline)) intptr_t mid4_cand(uint16_t *table, uint32_t h,
+    const uint8_t *src, intptr_t pos, uint32_t v)
+{
+    /* the candidate's position (a distance over pos: before src) */
+    intptr_t r = (pos - 1) - ((pos - 1 - table[h]) & 0xFFFF);
+    table[h] = (uint16_t)pos;
+    if (r < 0 || read32(src + r) != v)
+        return 0;
+    return pos - r;
+}
+
+/* CompressMidCore in sylz.pas for format v4, same output byte for byte.
+   Inlined once per level with its parameters constants (a shift by a
+   variable takes three operations on x86 without BMI2, and the fields of
+   st would be read again after each byte stored). A position's 8 bytes
+   are loaded once, before the tables are written: both hashes and the
+   candidates' test take them from that load (the stores to the tables
+   could alias src as far as the compiler knows, and it read them again
+   after each). */
+static inline __attribute__((always_inline)) void compress_mid4_core(sylzc_mid *st,
+    const int hashLog, const intptr_t lazy, const intptr_t skip, const intptr_t lazyEnough,
+    const intptr_t nextBelow)
+{
+    const uint8_t *src = st->src;
+    intptr_t n = st->n;
+    uint16_t *tl = st->tl, *ts = st->ts;
+    sylzc_emit e = st->e;
+    open4_state w;
+    intptr_t anchor = 0, pos, len, dist, len2, dist2, dshort, k = 0, mend, mflimit, rep = 1;
+    uint64_t v, v1 = 0;
+#if UINTPTR_MAX > 0xFFFFFFFF
+    /* the previous offset's test, one byte on: srep1[pos] against the 4
+       bytes of v after its first (on 32-bit targets from rep and src: two
+       registers more made i386 slower) */
+    const uint8_t *srep1 = src;
+#endif
+    /* the hashes' multipliers (MID4_HL, MID4_HS) */
+    uint64_t kl = FAST_MULT16;
+    uint32_t ks = 2654435761u;
+#if defined(__aarch64__)
+    /* hidden from the compiler: gcc for arm64 made them again at each
+       position (five instructions) for want of registers in this loop, and
+       levels 2-3 were 3-7% slower; in a register they stay. (x86 multiplies
+       by an immediate: there the asm only takes a register.) */
+    __asm__("" : "+r"(kl), "+r"(ks));
+#endif
+
+    open4_load(&w, &e);
+    if (w.direct)
+        split4_clear(w.memo);
+    if (n < 12 + 1)
+        goto done;
+    mflimit = n - 12;
+    pos = 0;
+    while (pos < mflimit) {
+        v = read64(src + pos);
+        /* (rep <= pos always: 1 at first, then a match's distance, which
+           is at most its position) */
+#if UINTPTR_MAX > 0xFFFFFFFF
+        if (read32(srep1 + pos) == (uint32_t)(v >> 8)) {
+#else
+        if (read32(src + pos + 1 - rep) == read32(src + pos + 1)) {
+#endif
+            /* the previous offset, one byte on, or the long table's
+               candidate here if that match is short and this one longer */
+            len = MINMATCH + MID4_COUNT(src + pos + 1 + MINMATCH, src + pos + 1 - rep + MINMATCH, src + n);
+            dist = 0;
+            if (len < nextBelow)
+                dist = mid4_cand(tl, MID4_HL(v), src, pos, (uint32_t)v);
+            else
+                tl[MID4_HL(v)] = (uint16_t)pos;
+            ts[MID4_HS(v)] = (uint16_t)pos;
+            len2 = 0;
+            if (dist > 0)
+                len2 = MINMATCH + MID4_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+            if (len2 > len + 1)
+                len = len2;
+            else {
+                pos++;
+                dist = rep;
+            }
+            goto found;
+        }
+        dist = mid4_cand(tl, MID4_HL(v), src, pos, (uint32_t)v);
+        if (dist > 0)
+            ts[MID4_HS(v)] = (uint16_t)pos;
+        else {
+            dist = mid4_cand(ts, MID4_HS(v), src, pos, (uint32_t)v);
+            if (dist == 0) {
+                pos += 1 + ((pos - anchor) >> skip);
+                continue;
+            }
+        }
+        len = MINMATCH + MID4_COUNT(src + pos + MINMATCH, src + pos - dist + MINMATCH, src + n);
+        if (lazy) {
+            /* both tables one byte later, while that finds a longer match */
+            while (len < lazyEnough && pos + 1 < mflimit) {
+                k = pos + 1;
+                v1 = read64(src + k);
+                dist2 = mid4_cand(tl, MID4_HL(v1), src, k, (uint32_t)v1);
+                dshort = mid4_cand(ts, MID4_HS(v1), src, k, (uint32_t)v1);
+                if (dist2 == 0)
+                    dist2 = dshort;
+                if (dist2 == 0)
+                    break;
+                len2 = MINMATCH + MID4_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
+                if (len2 <= len)
+                    break;
+                pos = k;
+                len = len2;
+                dist = dist2;
+            }
+        } else if (len < nextBelow && pos + 1 < mflimit) {
+            /* a short match: a long one one byte later? */
+            k = pos + 1;
+            v1 = read64(src + k);
+            dist2 = mid4_cand(tl, MID4_HL(v1), src, k, (uint32_t)v1);
+            if (dist2 > 0) {
+                len2 = MINMATCH + MID4_COUNT(src + k + MINMATCH, src + k - dist2 + MINMATCH, src + n);
                 if (len2 > len) {
                     pos = k;
                     len = len2;
@@ -1369,37 +1695,27 @@ found:
             pos--;
             len++;
         }
-        if (v4)
-            emit_open4(&e, &rec, &tok, &woff, &wlit, src + anchor, pos - anchor, dist, len, rep);
-        else
-            emit_sequence(&e, src + anchor, pos - anchor, dist, len);
+        emit_open4(&e, &w, src + anchor, pos - anchor, dist, len, rep);
         rep = dist;
+#if UINTPTR_MAX > 0xFFFFFFFF
+        srep1 = src + 1 - rep;
+#endif
         mend = pos + len;
         if (mend < mflimit) {
-            tl[mid_hash_long(src + pos + 1, hashLog)] = (uint16_t)(pos + 1);
-            ts[mid_hash_short(src + pos + 2, hashLog)] = (uint16_t)(pos + 2);
-            tl[mid_hash_long(src + mend - 2, hashLog)] = (uint16_t)(mend - 2);
-            ts[mid_hash_short(src + mend - 1, hashLog)] = (uint16_t)(mend - 1);
+            v = read64(src + pos + 1);
+            v1 = read64(src + mend - 2);
+            tl[MID4_HL(v)] = (uint16_t)(pos + 1);
+            ts[MID4_HS(v >> 8)] = (uint16_t)(pos + 2);
+            tl[MID4_HL(v1)] = (uint16_t)(mend - 2);
+            ts[MID4_HS(v1 >> 8)] = (uint16_t)(mend - 1);
         }
         pos = mend;
         anchor = pos;
     }
 done:
-    if (v4) {
-        e.rec = rec;
-        e.ctrl = tok;
-        e.off = woff;
-        e.lit = wlit;
-        e.rep = rep;
-    }
+    open4_store(&e, &w, rep);
     st->anchor = anchor;
     st->e = e;
-}
-
-void sylzc_compress_mid(sylzc_mid *st)
-{
-    compress_mid_core(st, 0, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
-                      st->nextBelow);
 }
 
 /* MID_MAXLOG, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW in sylz.pas */
@@ -1413,15 +1729,15 @@ void sylzc_compress_mid4(sylzc_mid *st)
     if (st->skip == MID_SKIP && st->lazyEnough == MID_LAZY_ENOUGH
         && st->nextBelow == MID_NEXT_BELOW) {
         if (!st->lazy && st->hashLog == MID_MAXLOG - 1) {
-            compress_mid_core(st, 1, MID_MAXLOG - 1, 0, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
+            compress_mid4_core(st, MID_MAXLOG - 1, 0, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
             return;
         }
         if (st->lazy && st->hashLog == MID_MAXLOG) {
-            compress_mid_core(st, 1, MID_MAXLOG, 1, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
+            compress_mid4_core(st, MID_MAXLOG, 1, MID_SKIP, MID_LAZY_ENOUGH, MID_NEXT_BELOW);
             return;
         }
     }
-    compress_mid_core(st, 1, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
+    compress_mid4_core(st, (int)st->hashLog, st->lazy, st->skip, st->lazyEnough,
                       st->nextBelow);
 }
 

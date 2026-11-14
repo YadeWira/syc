@@ -1320,9 +1320,19 @@ type
     p, off: PByte;             { in/out: token and offset write pointers }
     prev: SizeInt;             { in/out: the distance before the records }
     codes: Pointer;            { TCodes4 }
+    memo: PByte;               { levels 0-3: the C loops' memo of split tokens, or nil }
+  end;
+
+  { sylzc_count4 in sylzc.c: fixed field order }
+  TCount4C = record
+    rec, rend: PUInt16;
+    prev: SizeInt;             { the distance before the records }
+    codes: Pointer;            { TCodes4 }
+    cnt: PUInt32;              { TPairCounts4 }
   end;
 
 procedure sylzc_put_chunk4(st: Pointer); cdecl; external name 'sylzc_put_chunk4';
+procedure sylzc_count_chunk4(st: Pointer); cdecl; external name 'sylzc_count_chunk4';
 {$endif}
 
 { The header of the chunk at e.head, whose tokens start at e.body (after
@@ -1378,6 +1388,7 @@ var
   open: Boolean;
 {$ifdef SYLZ_C}
   pc: TPut4C;
+  cc: TCount4C;
 {$endif}
 begin
   Result := True;
@@ -1413,6 +1424,19 @@ begin
   prev := e.tokRep;
   if e.counted and not e.whole then
     Move(e.cnt, cnt, SizeOf(cnt))   { counted as recorded; no v2 layout to weigh }
+{$ifdef SYLZ_C}
+  else if open and SylzUseAsm then
+  begin
+    { an open chunk wants only the count: in C (FPC's aarch64 code for
+      CountAll4 took 1% of level 0 on GitHub's linux-arm64) }
+    cc.rec := r;
+    cc.rend := rend;
+    cc.prev := prev;
+    cc.codes := @e.codes;
+    cc.cnt := @cnt[0, 0, 0];
+    sylzc_count_chunk4(@cc);
+  end
+{$endif}
   else
   begin
     CountAll4(r, rend, prev, e.codes, cnt, sums);
@@ -1473,6 +1497,11 @@ begin
     pc.off := off;
     pc.prev := prev;
     pc.codes := @e.codes;
+    { levels 0-3: the memo of the C loops (sylzc.c), 8 words past the
+      records, cleared and filled here for the chunk's table }
+    pc.memo := nil;
+    if e.prefix > 0 then
+      pc.memo := PByte(e.recs + 3 * FAST_PREFIX4 + 8);
     sylzc_put_chunk4(@pc);
     p := pc.p;
     off := pc.off;
@@ -1747,6 +1776,35 @@ begin
   end;
 end;
 
+{ Move for EmitFinish's copies into dst (from buffers that do not overlap
+  it). FPC 3.2.2 has no Move of its own for aarch64: the generic one goes
+  a byte at a time unless source and destination have the same alignment
+  mod 8, which for the literals and offsets is chance (on GitHub's
+  linux-arm64, silesia.tar: 8% of format v2's compression at level 0, 4%
+  of v4's at level 2). Unaligned 8-byte moves are fine there. }
+procedure CopyOut(src, dst: PByte; n: SizeInt);{$ifndef CPUAARCH64} inline;{$endif}
+begin
+{$ifdef CPUAARCH64}
+  while n >= 16 do
+  begin
+    PUInt64(dst)^ := PUInt64(src)^;
+    PUInt64(dst + 8)^ := PUInt64(src + 8)^;
+    Inc(src, 16);
+    Inc(dst, 16);
+    Dec(n, 16);
+  end;
+  while n > 0 do
+  begin
+    dst^ := src^;
+    Inc(src);
+    Inc(dst);
+    Dec(n);
+  end;
+{$else}
+  Move(src^, dst^, n);
+{$endif}
+end;
+
 function EmitFinish(var e: TEmit; lit: PByte; litLen: SizeInt): SizeInt;
 var
   ctrlLen, litTotal, v3, offLen: SizeInt;
@@ -1843,24 +1901,24 @@ begin
         e.ctrl^ := Byte(v3);
         Inc(e.ctrl);
       end;
-      Move(e.offs^, e.ctrl^, offLen);
+      CopyOut(e.offs, e.ctrl, offLen);
       Inc(e.ctrl, offLen);
       PUInt32(e.dst)^ := hdr;
       if e.entropy and (litTotal > 0) then
       begin
-        Move(lit^, e.lit^, litLen);
+        CopyOut(lit, e.lit, litLen);
         v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, True);
         if (v3 >= 0) and (v3 < litTotal) then
         begin
           PUInt32(e.dst)^ := hdr or HDR_ENTROPY;
           Exit(e.ctrl - e.dst + v3);
         end;
-        Move(e.lits^, e.ctrl^, litTotal);
+        CopyOut(e.lits, e.ctrl, litTotal);
         Exit(e.ctrl - e.dst + litTotal);
       end;
       { the tail straight from the input: incompressible data is all tail }
-      Move(e.lits^, e.ctrl^, e.lit - e.lits);
-      Move(lit^, (e.ctrl + (e.lit - e.lits))^, litLen);
+      CopyOut(e.lits, e.ctrl, e.lit - e.lits);
+      CopyOut(lit, e.ctrl + (e.lit - e.lits), litLen);
       Exit(e.ctrl - e.dst + litTotal);
     end;
   end;
@@ -1872,7 +1930,7 @@ begin
   begin
     { all literals in the scratch stream (it holds n + slack bytes), then
       code them; only kept when smaller than the v2 layout }
-    Move(lit^, e.lit^, litLen);
+    CopyOut(lit, e.lit, litLen);
     v3 := EncodeLiteralChunks(e.lits, litTotal, e.ctrl, e.oend - e.ctrl, False);
     if (v3 >= 0) and (v3 < litTotal) then
     begin
@@ -1880,12 +1938,12 @@ begin
       Exit(HEADER_SIZE + ctrlLen + v3);
     end;
     PUInt32(e.dst)^ := UInt32(ctrlLen);
-    Move(e.lits^, e.ctrl^, litTotal);
+    CopyOut(e.lits, e.ctrl, litTotal);
     Exit(HEADER_SIZE + ctrlLen + litTotal);
   end;
   PUInt32(e.dst)^ := UInt32(ctrlLen);
-  Move(e.lits^, e.ctrl^, e.lit - e.lits);
-  Move(lit^, (e.ctrl + (e.lit - e.lits))^, litLen);
+  CopyOut(e.lits, e.ctrl, e.lit - e.lits);
+  CopyOut(lit, e.ctrl + (e.lit - e.lits), litLen);
   Result := HEADER_SIZE + ctrlLen + litTotal;
 end;
 
@@ -2824,6 +2882,15 @@ type
     codes: Pointer;            { TCodes4 }
   end;
   PEmitC = ^TEmitC;
+
+const
+  { sylzc.c's v4 levels 0-3 keep a memo of split tokens in the record
+    buffer, 8 words after their recEnd (3 * FAST_PREFIX4 words, a long
+    record started before it reaching 6 more) }
+  SPLIT4_MEMO_BYTES = 2 * (LIT_SPLIT4 + 1) * (ML_SPLIT4 + 1) * 4;
+{$if (3 * FAST_PREFIX4 + 8) * 2 + SPLIT4_MEMO_BYTES > 3 * 2 * CHUNK4_SEQS}
+  {$error the split token memo does not fit after the levels 0-3 records}
+{$endif}
 
 { sylzc.c's v4 emitters call this when their records or their open chunk
   are full. The C compressors run only with room for SylzBound(n), so the
