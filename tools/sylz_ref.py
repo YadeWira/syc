@@ -173,8 +173,10 @@ def canonical_codes(lengths):
             count[l] += 1
     used = sum(count[1:])
     kraft = sum(count[b] << (MAXBITS - b) for b in range(1, MAXBITS + 1))
-    if used < 2 or kraft != 1 << MAXBITS:
-        raise SylzError("not a complete prefix code over two or more symbols")
+    # (complete means two symbols at least: one alone, of length 1 or more,
+    # fills half the code space at most)
+    if kraft != 1 << MAXBITS:
+        raise SylzError("not a complete prefix code")
     nxt = [0] * (MAXBITS + 2)
     for b in range(1, MAXBITS + 1):
         nxt[b + 1] = (nxt[b] + count[b]) << 1
@@ -321,7 +323,7 @@ def decode_block4(b, n):
         # the offsets' count: 1 to 5 bytes, 7 bits each, low bits first
         shift = 0
         while True:
-            if i >= len(b) or shift == 35:
+            if i >= len(b):
                 raise SylzError("truncated offset count")
             v = b[i]
             i += 1

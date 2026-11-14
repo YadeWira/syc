@@ -314,6 +314,25 @@ def _w():
     return block4([toks], [4], b'abcdxy', one=True), 14, False
 
 
+@case('one-chunk-update', 'not damaged: a block of one chunk with an update (bits 29 and 28), its tokens after the update')
+def _w2():
+    u = upd((60, entry(4, 4, False)), (61, entry(0, 4, True)))
+    blk = block4([u + bytes([60, 61])], [4], b'abcdxy', one=True, upd_one=True)
+    if R.decode_block(blk, 14) != b'abcdabcdabcdxy':
+        raise SystemExit('one-chunk-update: wrong output')
+    return blk, 14, False
+
+
+@case('one-chunk-update-v5', 'not damaged: v5, one chunk with an update to an extended entry, then a raw literal chunk')
+def _w3():
+    u = upd((60, entry(31, 63, False)))
+    lits = bytes(range(65, 85))
+    blk = block4([u + bytes([60, 20, 40])], [20], raw_section(lits), v5=True, one=True, upd_one=True)
+    if R.decode_block(blk, 64) != lits + lits + lits + lits[:4]:
+        raise SystemExit('one-chunk-update-v5: wrong output')
+    return blk, 64, False
+
+
 @case('v5-ok-raw', 'not damaged: v5 with a raw literal chunk (a control)')
 def _x():
     ch, offs, lits, n = valid_base()
