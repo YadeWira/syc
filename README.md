@@ -155,7 +155,22 @@ older versions. What is new in them:
   uses most; a small block pays no more header than v2's;
 - v5's Huffman chunks have eight interleaved streams.
 
-The same levels as v2 and v3 (v5 at v3's `-ec` levels), one block of
+On GitHub's own machines (silesia.tar, the formats interleaved level by
+level, best of 3 rounds, 2026-11-14; `bench` workflow), how much faster
+the new format is than the old one, in MB/s, over levels 0-10:
+
+| machine | v4 vs v2, compress | v4 vs v2, decompress | v5 vs v3, compress | v5 vs v3, decompress |
+|---|---|---|---|---|
+| Linux x86-64 | +3% to +20% | +9% to +34% | +3% to +56% | +15% to +21% |
+| Windows x86-64 | +3% to +13% | +3% to +19% | +3% to +52% | +12% to +15% |
+| Linux arm64 | +3% to +11% | +20% to +31% | +3% to +51% | +23% to +32% |
+| macOS arm64 | +2% to +20% | +17% to +37% | +4% to +59% | +18% to +45% |
+
+(macOS: the average of two runs; its single runs move by ±5%, so one or
+two levels per run, different each time, came out a few percent either
+way.) In both formats every level is also 1.0-1.9 points smaller.
+
+In cycles on one machine, the same levels as v2 and v3 (v5 at v3's `-ec` levels), one block of
 each corpus, one core (CPU 17 of the Xeon E5-2697A v4, shared machine),
 user-space cycles per input byte from `perf stat` (the difference
 between 3 and 1 compressions, 2 and 1 at levels 7-10; 11 and 1 decodes;
