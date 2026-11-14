@@ -9,7 +9,7 @@ for modest hardware.
 | CI | [![CI][ciBadge]][ciLink] |
 | Latest release | [![Release][relBadge]][relLink] |
 | Language | Free Pascal 3.2.2, with C and assembler beside a Pascal reference |
-| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional; sylz blocks v2 and v3 frozen, v4 and v5 provisional |
+| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional; sylz blocks v2, v3, v4 and v5 frozen |
 
 [ciBadge]: https://github.com/YadeWira/syc/actions/workflows/ci.yml/badge.svg "Continuous Integration"
 [ciLink]: https://github.com/YadeWira/syc/actions/workflows/ci.yml
@@ -25,7 +25,7 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.7.x, pre-release.** Every release stays a pre-release until
+**Status: v0.8.x, pre-release.** Every release stays a pre-release until
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
@@ -137,11 +137,13 @@ Same session, v2 `-10`: 36.03% at 3498 MB/s decode. With one thread v3
 decodes at 60-65% of v2's speed on silesia.tar, at twice zstd -1's; on
 mixed data zstd -1 is still smaller.
 
-### Formats v4 and v5 (provisional)
+### Formats v4 and v5 (frozen at v0.8.0)
 
-`--format 4` writes format v4, and with `-ec` v5: the next formats, **not
-frozen yet** (until they are, read such files with the syc version that
-wrote them; the default stays v2). What is new in them:
+`--format 4` writes format v4, and with `-ec` v5. **Frozen at v0.8.0**
+(the layout of 0.7.0, which they read; 0.6.0's earlier layout is not
+read): from now on they never change. The default stays v2 (v3 with
+`-ec`) for now, so that what syc writes by default stays readable by
+older versions. What is new in them:
 
 - three streams instead of two: one-byte tokens, offsets, literals;
 - a match can take the previous match's offset again for no offset bytes
@@ -232,7 +234,7 @@ under v2, v5 1.0 to 1.6 under v3, and smaller on every file of Silesia
 at every level), **faster to compress** (v4 5-18% fewer cycles than v2
 on silesia.tar, 8-39% on the mixed corpus; v5 5-36% and 7-38% fewer
 than v3) and **faster to decompress** (v4 11-26% and 5-14%, v5 18-28%
-and 21-27%). They stay provisional until frozen. More:
+and 21-27%). More:
 [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks) and the
 sylz format page.
 
