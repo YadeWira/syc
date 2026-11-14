@@ -76,7 +76,7 @@ check "a wrong --paths" 2 "$SYC" t -q --paths fastest w.sylz
 
 # syc i on streams, without a password for an encrypted one
 check "i on a stream" 0 "$SYC" i w.sylz
-has "i: the header" out.txt 'stream, format version 4, codec sylz, written at level 1; not encrypted'
+has "i: the header" out.txt 'stream, format version 4, codec sylz (block formats v4 and v5), written at level 1; not encrypted'
 has "i: the blocks" out.txt '^blocks'
 has "i: the raw size" out.txt "^raw size *$(wc -c < data | tr -d ' ') bytes"
 check "c -b 1 -pPASSWORD" 0 "$SYC" c -q -b 1 -pclitest --kdf-mem 8 -o enc.sylz data
@@ -84,7 +84,7 @@ check "i on an encrypted stream" 0 "$SYC" i -v enc.sylz
 has "i: encrypted" out.txt 'format version 5.*encrypted (XChaCha20-Poly1305, key from Argon2id over 8 MiB)'
 has "i -v: a line per block" out.txt '^ *0 '
 check "i -v on an -ec stream" 0 "$SYC" i -v e-auto.sylz
-has "i -v: the blocks' format" out.txt '  sylz v[23]'
+has "i -v: the blocks' format" out.txt '  sylz v[2345]'
 check "i on an archive" 0 "$SYC" i w.syc
 has "i: the archive's versions" out.txt '^ *1  [0-9][0-9][0-9][0-9]-'
 check "i -v on an archive" 0 "$SYC" i -v w.syc
@@ -132,7 +132,7 @@ has "b: a row per level" out.txt '^ *3  *[0-9][0-9]*  *[0-9.]*%  *[0-9.]* MB/s  
 [ "$(grep -c 'MB/s' out.txt)" = 3 ] || { echo "FAIL: b --levels 0,2-3 did not run 3 levels"; cat out.txt; fail=1; }
 check "b -ec -N -b" 0 "$SYC" b -ec -1 -b 1 --time 0 data data
 [ "$(grep -c 'MB/s' out.txt)" = 2 ] || { echo "FAIL: b -1 on two files did not print 2 rows"; cat out.txt; fail=1; }
-has "b -ec" out.txt 'sylz format v3'
+has "b -ec" out.txt 'sylz format v5'
 check "b on a missing file" 4 "$SYC" b --time 0 no-such-file
 check "b, wrong levels" 2 "$SYC" b --levels 3-1 data
 check "b without a file" 2 "$SYC" b

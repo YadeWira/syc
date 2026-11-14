@@ -665,6 +665,7 @@ begin
   Result := Default(TOptions);
   Result.cmd := cmd;
   Result.level := SYLZ_DEFLEVEL;
+  Result.flags := DEFAULT_FLAGS;
   Result.blockMiB := 1;
   Result.threads := 2;
   Result.verbosity := vQuiet;
@@ -747,7 +748,7 @@ begin
       o := QuietOpts('c', [f1]);
       o.passwordInline := pw;
       if pass = 1 then
-        o.flags := SYLZ_ENTROPY;
+        o.flags := o.flags or SYLZ_ENTROPY;
       ok := RunQuiet(o) = EXIT_OK;
       o := QuietOpts('t', [sylz]);
       o.passwordInline := pw;

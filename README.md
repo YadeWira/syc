@@ -25,7 +25,7 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.8.x, pre-release.** Every release stays a pre-release until
+**Status: v0.9.x, pre-release.** Every release stays a pre-release until
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
@@ -47,11 +47,16 @@ the main language.
 
 ## sylz
 
+**syc writes sylz format v4 by default since v0.9.0, and v5 with `-ec`**
+(below: [Formats v4 and v5](#formats-v4-and-v5-frozen-at-v080)); `-F 2`
+writes the older formats v2 and v3, larger and slower but readable by
+every syc since 0.2.14. What follows first describes v2 and v3.
+
 The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
 literal length, and a token table derived from measured parses, so that
 few sequences need a length extension (a branch the CPU can't predict).
-Format v3 (`-ec`, extra compression, experimental) adds Huffman-coded literals, in 64 KiB
+Format v3 (`-F 2 -ec`; extra compression) adds Huffman-coded literals, in 64 KiB
 chunks with four interleaved streams; a v2 block is a valid v3 block.
 Eleven levels, `-0` to `-10` (default `-1`): `-0` and `-1` are greedy
 single-hash levels (`-1` with the bigger table); `-2` and `-3` use two
@@ -112,7 +117,7 @@ Windows 7 32-bit (a VM, mozilla): compress -1 282 MB/s, -4 66.6 MB/s,
 11.1 MB/s, decode 850-1150 MB/s.
 [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks#32-bit-windows-v0211).
 
-Format v3 (`-ec`, Huffman-coded literals, experimental), every level, in
+Format v3 (`-F 2 -ec`, Huffman-coded literals), every level, in
 another session (load ~4): `-ec -0` .. `-8` parse as `-2` .. `-10` do
 (v2's `-0` and `-1` leave so many literals that, Huffman-coded, they
 decode slower and compress worse than `-2`'s parse); `-ec -9` / `-10` run
@@ -139,11 +144,12 @@ mixed data zstd -1 is still smaller.
 
 ### Formats v4 and v5 (frozen at v0.8.0)
 
-`--format 4` writes format v4, and with `-ec` v5. **Frozen at v0.8.0**
-(the layout of 0.7.0, which they read; 0.6.0's earlier layout is not
-read): from now on they never change. The default stays v2 (v3 with
-`-ec`) for now, so that what syc writes by default stays readable by
-older versions. What is new in them:
+syc writes format v4 by default since v0.9.0, and v5 with `-ec`
+(`--format 4` / `-F 4` asks for it explicitly; `-F 2` for v2 and v3).
+**Frozen at v0.8.0** (the layout of 0.7.0, which they read; 0.6.0's
+earlier layout is not read): from now on they never change. syc 0.7.0
+and later read them; for readers older than that, write with `-F 2`.
+What is new in them:
 
 - three streams instead of two: one-byte tokens, offsets, literals;
 - a match can take the previous match's offset again for no offset bytes
@@ -302,8 +308,8 @@ out/syc l --all backup.syc docs/     # every version of each file
 out/syc a -p secret.syc docs/        # encrypted (asks for the password; or --password-file)
 out/syc k secret.syc                 # a new password, in place (no recompression)
 
-out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads)
-out/syc c -F 4 file        # the same in sylz format v4 (provisional): smaller
+out/syc c -1 file          # -> file.sylz   (-0 .. -10, -ec, -b MIB, -t N threads; format v4)
+out/syc c -F 2 file        # in sylz format v2 (v3 with -ec): for syc before 0.7.0
 out/syc d file.sylz        # -> file        (keeps the input; --rm deletes it)
 out/syc t file.sylz        # check it, write nothing
 tar c dir | out/syc c > dir.tar.sylz       # no FILE: stdin -> stdout
@@ -321,7 +327,7 @@ data, 4 I/O error.
 For developing syc, and for reporting a problem with it:
 
 ```sh
-out/syc b FILE             # benchmark: every level in memory (--levels 1,4,9; -ec; -F 4; --time S)
+out/syc b FILE             # benchmark: every level in memory (--levels 1,4,9; -ec; -F 2; --time S)
 out/syc s                  # self-test: is this build right on this machine?
 out/syc r                  # report: build, machine, self-test, for a bug report
 out/syc c --stats file     # at the end: bytes, time, speed, threads, peak memory

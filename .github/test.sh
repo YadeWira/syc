@@ -92,7 +92,11 @@ done
 echo ok
 
 echo '== the same bytes: streams and raw blocks, sylz formats v2 to v5, every level'
-for fmt in '' '-F 4'; do
+# (the v2/v3 lines keep the labels they had when v2 was the default, so
+# that their hash, the frozen formats' check, stays what it was)
+for fmt in '-F 2' '-F 4'; do
+  label=$fmt
+  [ "$fmt" = '-F 2' ] && label=
   for L in 0 1 2 3 4 5 6 7 8 9 10; do
     for ec in '' -ec; do
       for raw in '' --raw; do
@@ -100,7 +104,7 @@ for fmt in '' '-F 4'; do
         "$SYC" c -q -f $raw $fmt $ec -$L -o "$W/c" "$W/sample"
         [ -n "$raw" ] || { "$SYC" d -q -f -o "$W/d" "$W/c"; cmp "$W/d" "$W/sample"; }
         "$PY" -c 'import hashlib,sys; f,n=sys.argv[1:]; print(hashlib.sha256(open(f,"rb").read()).hexdigest(), n)' \
-          "$W/c" "$fmt-$L$ec$raw" >> "$W/hashes"
+          "$W/c" "$label-$L$ec$raw" >> "$W/hashes"
       done
     done
   done

@@ -14,11 +14,14 @@ uses
   SysUtils, sylz, sycblocks, sycui;
 
 const
-  SYC_VERSION   = '0.8.0';
+  SYC_VERSION   = '0.9.0';
   STREAM_SUFFIX = '.sylz';
   RAW_SUFFIX    = '.sylzraw';
   DEFAULT_STREAM_BLOCK_MIB = 4;
   DEFAULT_ARCHIVE_BLOCK_MIB = 16;
+  { the sylz block format written by default: v4 (v5 with -ec) since syc
+    0.9.0; -F 2 for v2 (v3 with -ec), which syc before 0.7.0 reads too }
+  DEFAULT_FLAGS = SYLZ_V4;
 
 type
   TVerbosity = (vQuiet, vNormal, vVerbose);
@@ -28,7 +31,7 @@ type
     cmd: Char;               { 'a', 'x', 'l', 'i', 'c', 'd', 't', 'k', 'b', 's', 'r' }
     level: Integer;
     levelSet: Boolean;       { a level was given (b: only that one) }
-    flags: Integer;          { SYLZ_ENTROPY with -ec }
+    flags: Integer;          { SYLZ_V4 unless -F 2 or 3; SYLZ_ENTROPY with -ec }
     blockMiB: Integer;       { the command's default unless -b }
     threads: Integer;
     outPath: string;         { -o; '' when not given (x: the directory) }
@@ -75,7 +78,7 @@ function SetCodePaths(const name: string): Boolean;
 { the paths built into this binary and the ones in use, in words }
 function CodePathsBuilt: string;
 function CodePathsInUse: string;
-{ "syc 0.8.0" and, on a second line, the commit, compiler and target }
+{ "syc 0.9.0" and, on a second line, the commit, compiler and target }
 function VersionLines: string;
 
 implementation
@@ -316,14 +319,15 @@ begin
     SYLZ_DEFLEVEL);
   WriteLn('              (0-1 single hash, 2-3 two hashes, 4-8 hash chains,');
   WriteLn('              9-10 optimal parsing)');
-  WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v3),');
+  WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v5;');
+  WriteLn('              v3 with -F 2),');
   WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
     ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do');
-  WriteLn('              (format 5 too), 9-10 price literals by');
+  WriteLn('              (both formats), 9-10 price literals by');
   WriteLn('              their Huffman codes');
-  WriteLn('  -F, --format N   the sylz block format: 2 (default; 3 with -ec), or 4');
-  WriteLn('              (5 with -ec): smaller and faster to compress and decompress');
-  WriteLn('              at every level; read by syc 0.7.0 and later');
+  WriteLn('  -F, --format N   the sylz block format: 4 (default; 5 with -ec), read by');
+  WriteLn('              syc 0.7.0 and later; or 2 (3 with -ec), larger and slower');
+  WriteLn('              but read by every syc since 0.2.14');
 end;
 
 procedure PasswordUsage(cmd: Char);
@@ -501,8 +505,8 @@ begin
         WriteLn('  -O, --stdout           write to stdout');
         WriteLn('  -f, --force            overwrite an existing output; write to a terminal');
         WriteLn('  --rm                   delete FILE once it is compressed');
-        WriteLn('  --raw                  one bare sylz block (v2, v3 with -ec; -F), what the');
-        WriteLn('                         zpaq-std plugins'' compress() returns: no header,');
+        WriteLn('  --raw                  one bare sylz block (v4, v5 with -ec; -F 2: v2, v3),');
+        WriteLn('                         what the zpaq-std plugins'' compress() returns: no header,');
         WriteLn('                         size or CRC; FILE up to ', MAX_BLOCK shr 20, ' MiB, -> FILE', RAW_SUFFIX);
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
@@ -604,6 +608,7 @@ begin
     SetCodePaths(paths);
   opts := Default(TOptions);
   opts.level := SYLZ_DEFLEVEL;
+  opts.flags := DEFAULT_FLAGS;
   opts.blockMiB := 0;
   opts.threads := 1;
   opts.verbosity := vNormal;
