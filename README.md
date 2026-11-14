@@ -164,7 +164,7 @@ the new format is than the old one, in MB/s, over levels 0-10:
 | Linux x86-64 | +3% to +20% | +9% to +34% | +3% to +56% | +15% to +21% |
 | Windows x86-64 | +3% to +13% | +3% to +19% | +3% to +52% | +12% to +15% |
 | Linux arm64 | +3% to +11% | +20% to +31% | +3% to +51% | +23% to +32% |
-| macOS arm64 | +2% to +20% | +17% to +37% | +4% to +59% | +18% to +45% |
+| macOS arm64 | +2% to +20% | +17% to +39% | +4% to +59% | +22% to +38% |
 
 (macOS: the average of two runs; its single runs move by ±5%, so one or
 two levels per run, different each time, came out a few percent either
