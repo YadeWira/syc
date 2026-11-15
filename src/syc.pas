@@ -28,6 +28,14 @@ begin
   SetMultiByteFileSystemCodePage(CP_UTF8);
   SetMultiByteRTLFileSystemCodePage(CP_UTF8);
   SetConsoleOutputCP(CP_UTF8);
+  { and what goes to stdout and stderr is UTF-8 too, a pipe included:
+    otherwise the RTL converts it to the ANSI code page }
+  SetTextCodePage(Output, CP_UTF8);
+  SetTextCodePage(StdErr, CP_UTF8);
+{$else}
+  { "\" is part of a name on Unix: the RTL's path functions (ExtractFileDir,
+    ForceDirectories) would otherwise split names at it }
+  AllowDirectorySeparators := ['/'];
 {$endif}
   try
     ParseCommandLine(opts);

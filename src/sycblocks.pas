@@ -10,7 +10,7 @@ interface
 uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}termio,{$endif}
-  SysUtils, Classes, Math, sylz, sycui;
+  SysUtils, Classes, Math, sylz, sycui, sycfs;
 
 const
   MAX_BLOCK   = 512 shl 20;
@@ -279,7 +279,7 @@ end;
 function ReplaceFile(const src, dst: string): Boolean;
 begin
 {$ifdef windows}
-  Result := MoveFileExW(PWideChar(UnicodeString(src)), PWideChar(UnicodeString(dst)),
+  Result := MoveFileExW(PWideChar(UnicodeString(LongPath(src))), PWideChar(UnicodeString(LongPath(dst))),
     MOVEFILE_REPLACE_EXISTING);
 {$else}
   Result := RenameFile(src, dst);

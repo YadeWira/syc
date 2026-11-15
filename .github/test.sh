@@ -57,6 +57,9 @@ else
   REF=1 "$PY" tests/compat/check.py "$SYC" "$W/compat"
 fi
 
+echo '== names: Windows rejects what it cannot take; Unicode names, long paths'
+"$PY" tests/names/check.py "$SYC" "$W/names"
+
 echo '== the zpaq-std plugin, loaded as zpaq-std does (its four codecs)'
 # shellcheck disable=SC2086
 pt=$("$FPC" $FPCOPTS -iTO)-$("$FPC" $FPCOPTS -iTP)

@@ -42,14 +42,21 @@ function GetMeta(const path: string; out m: TMeta): Boolean;
   it cannot be read. }
 function ListDir(const dir: string; names: TStringList): Boolean;
 
-{ An operand as the archive stores it: "/" separators, no leading "/" or
-  drive letter, no "." components, no trailing "/". Raises EConvertError
+{ An operand as the archive stores it: "/" separators (on Windows "\"
+  too), no leading "/" or (on Windows) drive letter, no "." components,
+  no trailing "/". Raises EConvertError
   on a path that leaves its directory (a ".." component). '' is the
   current directory. }
 function StoredPath(const path: string): string;
 { a stored path (always valid, checked by the reader) as a local one under
   dir }
 function LocalPath(const dir, stored: string): string;
+{ every component of a stored path is a name Windows can create as it is:
+  no \ : * ? " < > | or control character (a separator, a drive, a data
+  stream), no trailing dot or space (Windows drops them), not a device
+  name (CON, NUL, COM1, ...). syc x on Windows skips the rest: a name
+  made elsewhere could otherwise leave the output directory. }
+function WindowsName(const stored: string): Boolean;
 
 { Glob: * and ? within a component, ** across them. A pattern without "/"
   matches the last component of path, one with "/" the whole path. }
@@ -74,6 +81,12 @@ function ApplyMeta(const path: string; const m: TMeta; noPerms, noOwner: Boolean
 function MakeSymlink(const m: TMeta; const path: string): Boolean;
 { removes a file or a symlink (not a directory) }
 function RemoveFile(const path: string): Boolean;
+{ Windows: path as one that opens past MAX_PATH (260 characters): when
+  its full form is that long, that form with the \\?\ prefix; else path
+  itself. Elsewhere path. }
+function LongPath(const path: string): string;
+{ ForceDirectories, through LongPath on Windows }
+function ForceDirs(const dir: string): Boolean;
 
 implementation
 
@@ -224,6 +237,16 @@ begin
   Result := True;
 end;
 
+function LongPath(const path: string): string;
+begin
+  Result := path;
+end;
+
+function ForceDirs(const dir: string): Boolean;
+begin
+  Result := ForceDirectories(dir);
+end;
+
 {$else}
 
 { 100 ns intervals since 1601 -> ns since 1970 }
@@ -241,6 +264,71 @@ const
   SYMBOLIC_LINK_FLAG_DIRECTORY = 1;
   SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE = 2;   { Windows 10 1703+, developer mode }
 
+function LongPath(const path: string): string;
+var
+  full: string;
+begin
+  Result := path;
+  if (Length(path) < 200) and (Length(path) >= 3) and (path[2] = ':') and (path[3] = '\')
+     or (Copy(path, 1, 4) = '\\?\') then
+    Exit;   { short and absolute, or already in that form }
+  full := StringReplace(ExpandFileName(path), '/', '\', [rfReplaceAll]);
+  if Length(full) < 248 then   { CreateDirectory's limit is 248 }
+    Exit;
+  if Copy(full, 1, 2) = '\\' then
+    Result := '\\?\UNC\' + Copy(full, 3, MaxInt)
+  else
+    Result := '\\?\' + full;
+end;
+
+function WPath(const path: string): UnicodeString;
+begin
+  Result := UnicodeString(LongPath(path));
+end;
+
+function ForceDirs(const dir: string): Boolean;
+var
+  p: UnicodeString;
+  i, start: SizeInt;
+  a: DWORD;
+begin
+  p := WPath(dir);
+  if Copy(p, 1, 4) <> '\\?\' then
+    Exit(ForceDirectories(dir));
+  { the components after the root: \\?\C:\ or \\?\UNC\server\share\ }
+  if Copy(p, 5, 4) = 'UNC\' then
+  begin
+    start := 9;
+    for i := 1 to 2 do
+    begin
+      while (start <= Length(p)) and (p[start] <> '\') do
+        Inc(start);
+      Inc(start);
+    end;
+  end
+  else
+    start := 8;
+  for i := start to Length(p) do
+    if (p[i] = '\') or (i = Length(p)) then
+    begin
+      if p[i] = '\' then
+        a := GetFileAttributesW(PWideChar(Copy(p, 1, i - 1)))
+      else
+        a := GetFileAttributesW(PWideChar(p));
+      if a = INVALID_FILE_ATTRIBUTES then
+      begin
+        if p[i] = '\' then
+          Result := CreateDirectoryW(PWideChar(Copy(p, 1, i - 1)), nil)
+        else
+          Result := CreateDirectoryW(PWideChar(p), nil);
+        if not Result and (GetLastError <> ERROR_ALREADY_EXISTS) then
+          Exit(False);
+      end;
+    end;
+  a := GetFileAttributesW(PWideChar(p));
+  Result := (a <> INVALID_FILE_ATTRIBUTES) and (a and FILE_ATTRIBUTE_DIRECTORY <> 0);
+end;
+
 function CreateSymbolicLinkW(link, target: PWideChar; flags: DWORD): BOOLEAN;
   stdcall; external 'kernel32' name 'CreateSymbolicLinkW';
 
@@ -257,7 +345,7 @@ begin
   Result := False;
   tag := 0;
   target := '';
-  h := CreateFileW(PWideChar(UnicodeString(path)), 0, FILE_SHARE_READ or FILE_SHARE_WRITE
+  h := CreateFileW(PWideChar(WPath(path)), 0, FILE_SHARE_READ or FILE_SHARE_WRITE
     or FILE_SHARE_DELETE, nil, OPEN_EXISTING,
     FILE_FLAG_OPEN_REPARSE_POINT or FILE_FLAG_BACKUP_SEMANTICS, 0);
   if h = INVALID_HANDLE_VALUE then
@@ -302,7 +390,7 @@ end;
 
 function PathExists(const path: string): Boolean;
 begin
-  Result := GetFileAttributesW(PWideChar(UnicodeString(path))) <> INVALID_FILE_ATTRIBUTES;
+  Result := GetFileAttributesW(PWideChar(WPath(path))) <> INVALID_FILE_ATTRIBUTES;
 end;
 
 { symlinks and junctions: other reparse points (cloud placeholders,
@@ -312,7 +400,7 @@ var
   a, tag: DWORD;
   target: string;
 begin
-  a := GetFileAttributesW(PWideChar(UnicodeString(path)));
+  a := GetFileAttributesW(PWideChar(WPath(path)));
   Result := (a <> INVALID_FILE_ATTRIBUTES) and (a and FILE_ATTRIBUTE_REPARSE_POINT <> 0)
     and ReadReparse(path, tag, target)
     and ((tag = IO_REPARSE_TAG_SYMLINK) or (tag = IO_REPARSE_TAG_MOUNT_POINT));
@@ -326,7 +414,7 @@ var
   flags: DWORD;
 begin
   Result := True;
-  w := UnicodeString(path);
+  w := WPath(path);
   { a read-only file refuses new times: attributes go last }
   SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_NORMAL);
   flags := FILE_ATTRIBUTE_NORMAL;
@@ -378,11 +466,11 @@ begin
       full := ExtractFilePath(path) + target;
     flags := Ord(DirectoryExists(full)) * SYMBOLIC_LINK_FLAG_DIRECTORY;
   end;
-  Result := CreateSymbolicLinkW(PWideChar(UnicodeString(path)), PWideChar(UnicodeString(target)),
+  Result := CreateSymbolicLinkW(PWideChar(WPath(path)), PWideChar(UnicodeString(target)),
     flags or SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE);
   { before Windows 10 1703 the extra flag is an invalid parameter }
   if not Result and (GetLastError = ERROR_INVALID_PARAMETER) then
-    Result := CreateSymbolicLinkW(PWideChar(UnicodeString(path)), PWideChar(UnicodeString(target)),
+    Result := CreateSymbolicLinkW(PWideChar(WPath(path)), PWideChar(UnicodeString(target)),
       flags);
 end;
 
@@ -390,7 +478,7 @@ function RemoveFile(const path: string): Boolean;
 var
   w: UnicodeString;
 begin
-  w := UnicodeString(path);
+  w := WPath(path);
   SetFileAttributesW(PWideChar(w), FILE_ATTRIBUTE_NORMAL);
   Result := DeleteFileW(PWideChar(w));
 end;
@@ -403,7 +491,7 @@ var
   target: string;
 begin
   m := Default(TMeta);
-  w := UnicodeString(path);
+  w := WPath(path);
   if not GetFileAttributesExW(PWideChar(w), GetFileExInfoStandard, @data) then
     Exit(False);
   tag := 0;
@@ -441,7 +529,7 @@ var
   name: string;
 begin
   names.Clear;
-  w := UnicodeString(IncludeTrailingPathDelimiter(dir) + '*');
+  w := WPath(IncludeTrailingPathDelimiter(dir) + '*');
   h := FindFirstFileW(PWideChar(w), @fd);
   if h = INVALID_HANDLE_VALUE then
     Exit(GetLastError = ERROR_FILE_NOT_FOUND);
@@ -465,10 +553,13 @@ var
   s, part: string;
   i, start: Integer;
 begin
-  s := StringReplace(path, '\', '/', [rfReplaceAll]);
+  s := path;
+{$ifdef windows}
+  s := StringReplace(s, '\', '/', [rfReplaceAll]);
   { a drive letter; leading slashes go with the empty components }
   if (Length(s) >= 2) and (s[2] = ':') and (UpCase(s[1]) in ['A'..'Z']) then
     Delete(s, 1, 2);
+{$endif}
   Result := '';
   start := 1;
   for i := 1 to Length(s) + 1 do
@@ -494,6 +585,50 @@ begin
 {$endif}
   if dir <> '' then
     Result := IncludeTrailingPathDelimiter(dir) + Result;
+end;
+
+function WindowsComponent(const part: string): Boolean;
+const
+  DEVICES: array[0..5] of string = ('CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$');
+var
+  i: Integer;
+  base: string;
+begin
+  for i := 1 to Length(part) do
+    if (part[i] < ' ') or (part[i] in ['\', ':', '*', '?', '"', '<', '>', '|']) then
+      Exit(False);
+  if part[Length(part)] in ['.', ' '] then
+    Exit(False);
+  { a device name, whatever its extension: the part before the first dot,
+    without trailing spaces }
+  base := part;
+  i := Pos('.', base);
+  if i > 0 then
+    SetLength(base, i - 1);
+  base := UpperCase(TrimRight(base));
+  for i := 0 to High(DEVICES) do
+    if base = DEVICES[i] then
+      Exit(False);
+  if ((Copy(base, 1, 3) = 'COM') or (Copy(base, 1, 3) = 'LPT')) and
+     ((Length(base) = 4) and (base[4] in ['0'..'9']) or
+      (Length(base) = 5) and (base[4] = #$C2) and (base[5] in [#$B9, #$B2, #$B3])) then
+    Exit(False);   { COM0..COM9, and COM¹ COM² COM³ (in UTF-8) }
+  Result := True;
+end;
+
+function WindowsName(const stored: string): Boolean;
+var
+  i, start: Integer;
+begin
+  start := 1;
+  for i := 1 to Length(stored) + 1 do
+    if (i > Length(stored)) or (stored[i] = '/') then
+    begin
+      if not WindowsComponent(Copy(stored, start, i - start)) then
+        Exit(False);
+      start := i + 1;
+    end;
+  Result := True;
 end;
 
 { p[pi..] against s[si..] }

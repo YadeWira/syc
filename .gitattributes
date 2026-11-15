@@ -2,3 +2,4 @@
 tests/compat/*.syc -text
 tests/compat/*.sylz -text
 tests/enc3/** -text
+tests/names/*.syc -text

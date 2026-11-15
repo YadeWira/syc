@@ -6,7 +6,7 @@
 # (linux-i386; windows-i386 through wine with a wrapper script).
 #   tests/bigtest.sh SYC WORKDIR
 set -u
-S=$1; D=$2
+S=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); D=$2
 mkdir -p "$D/in" && cd "$D" || exit 2
 if [ ! -f big.sha ]; then
   { head -c 4400000000 /dev/urandom

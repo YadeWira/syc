@@ -694,7 +694,7 @@ begin
       end;
       e := @entries[rdEntry];
       try
-        rdFile := TFileStream.Create(e^.local, fmOpenRead or fmShareDenyNone);
+        rdFile := TFileStream.Create(LongPath(e^.local), fmOpenRead or fmShareDenyNone);
       except
         on EFOpenError do
         begin
@@ -2442,6 +2442,15 @@ begin
       begin
         act[i] := acWrite;
         local := LocalPath(x.outDir, sel[i].path);
+{$ifdef windows}
+        if not WindowsName(sel[i].path) then
+        begin
+          WriteLn(StdErr, WarnTag, sel[i].path, ': not a valid name on Windows, skipped');
+          x.status := Max(x.status, EXIT_WARN);
+          act[i] := acSkip;
+          Continue;
+        end;
+{$endif}
         if not x.SafeParents(sel[i].path) then
         begin
           WriteLn(StdErr, WarnTag, local, ': a directory on the way is a symlink, skipped');
@@ -2454,7 +2463,7 @@ begin
         exists := PathExists(local);
         if not exists then
           Continue;
-        if DirectoryExists(local) and not IsLink(local) then
+        if DirectoryExists(LongPath(local)) and not IsLink(local) then
         begin
           WriteLn(StdErr, WarnTag, local, ': a directory is in the way, skipped');
           x.status := Max(x.status, EXIT_WARN);
@@ -2528,7 +2537,7 @@ begin
         case sel[i].kind of
           ET_DIR:
             begin
-              if not ForceDirectories(local) then
+              if not ForceDirs(local) then
               begin
                 WriteLn(StdErr, WarnTag, local, ': cannot create the directory');
                 x.status := Max(x.status, EXIT_WARN);
@@ -2538,13 +2547,13 @@ begin
           ET_FILE:
             begin
               part := ExtractFileDir(local);
-              if (part <> '') and not ForceDirectories(part) then
+              if (part <> '') and not ForceDirs(part) then
               begin
                 WriteLn(StdErr, WarnTag, part, ': cannot create the directory');
                 Fail(EXIT_FATAL, 'cannot go on: the files under it would be out of order');
               end;
               try
-                fout := TFileStream.Create(local + TMP_SUFFIX, fmCreate);
+                fout := TFileStream.Create(LongPath(local + TMP_SUFFIX), fmCreate);
               except
                 on EFCreateError do
                 begin
@@ -2564,20 +2573,20 @@ begin
               except
                 fout.Free;
                 fout := nil;
-                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
                 raise;
               end;
               fout.Free;
               if (act[i] = acReplace) and not RemoveFile(local) then
               begin
-                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
                 WriteLn(StdErr, WarnTag, local, ': cannot replace it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
               if not ReplaceFile(local + TMP_SUFFIX, local) then
               begin
-                SysUtils.DeleteFile(local + TMP_SUFFIX);
+                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
                 WriteLn(StdErr, WarnTag, local, ': cannot create it (from ', local + TMP_SUFFIX, ')');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
@@ -2595,7 +2604,7 @@ begin
           local := LocalPath(x.outDir, sel[i].path);
           part := ExtractFileDir(local);
           if part <> '' then
-            ForceDirectories(part);
+            ForceDirs(part);
           if (act[i] = acReplace) and not RemoveFile(local) then
           begin
             WriteLn(StdErr, WarnTag, local, ': cannot replace it');

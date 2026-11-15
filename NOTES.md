@@ -67,6 +67,40 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Names on Windows; long paths; UTF-8 output; "\" on Unix (2026-11-15)
+
+Tested on Windows 10 (the win10 VM, 64- and 32-bit binaries) with
+`tests/names/check.py`, now in CI on every platform. Four fixes:
+
+- **Path traversal on Windows (security).** `syc x` turned "/" into "\"
+  and nothing else, so a name that Linux allows went through as Windows
+  reads it. With 0.10.0 on Windows, from an archive written on Linux,
+  `..\..\..\escaped.txt` landed two directories above `-o`, and
+  `C:\Users\Public\syc-evil2.txt` was written there (no `-o`).
+  `WindowsName` (sycfs) now rejects, per component: `\ : * ? " < > |`
+  and control characters (separators, drives, data streams), a trailing
+  dot or space (Windows drops them), device names (CON, PRN, AUX, NUL,
+  COM0-9, LPT0-9, COM¹²³, CONIN$, CONOUT$, any extension). `syc x` on
+  Windows skips such entries with a warning, exit 1.
+- **"\" on Unix.** FPC's `AllowDirectorySeparators` holds "\" on Unix
+  too, so `ForceDirectories`/`ExtractFileDir` split `..\..\x` and could
+  create (empty) directories outside the output directory, or stop with
+  exit 4. syc now sets it to ['/'] on Unix; `StoredPath` turns "\" into
+  "/" and drops a drive letter only on Windows (on Unix `a\b` is a name).
+- **Paths over 260 characters on Windows** failed (`cannot read`).
+  `LongPath` gives the `\\?\` form when the full path reaches 248
+  characters; every W call in sycfs, the file streams of `a`/`x`,
+  `ReplaceFile`, and `ForceDirs` (FPC's ForceDirectories does not take
+  that prefix) go through it. No need for `LongPathsEnabled` (0 on win10).
+- **stdout and stderr in UTF-8 on Windows.** Into a pipe or a file, the
+  RTL converted text to the ANSI code page: `syc l` wrote "ñ" as one byte
+  (cp1252) and names outside it as "?". `SetTextCodePage(Output/StdErr,
+  CP_UTF8)`. The console showed them right before and after (ConPTY).
+
+Also checked there: Unicode names (Greek, Cyrillic, Arabic, Japanese,
+emoji, a combining accent) through a, l, l --null, x, x -O NAME; a
+Unicode password with -p, SYC_PASSWORD and --password-file.
+
 ## Files over 4 GiB (2026-11-15)
 
 A 4.6 GB file (4.4 GB random, then silesia.tar) through every path, with
