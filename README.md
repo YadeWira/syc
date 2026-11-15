@@ -9,7 +9,7 @@ for modest hardware.
 | CI | [![CI][ciBadge]][ciLink] |
 | Latest release | [![Release][relBadge]][relLink] |
 | Language | Free Pascal 3.2.2, with C and assembler beside a Pascal reference |
-| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 3 and `.sylz` 5 provisional; sylz blocks v2, v3, v4 and v5 frozen |
+| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 4 and `.sylz` 6 frozen (3 and 5 of v0.5–0.9 still read); sylz blocks v2, v3, v4 and v5 frozen |
 
 [ciBadge]: https://github.com/YadeWira/syc/actions/workflows/ci.yml/badge.svg "Continuous Integration"
 [ciLink]: https://github.com/YadeWira/syc/actions/workflows/ci.yml
@@ -25,7 +25,7 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.9.x, pre-release.** Every release stays a pre-release until
+**Status: v0.10.x, pre-release.** Every release stays a pre-release until
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 

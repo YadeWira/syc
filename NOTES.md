@@ -67,6 +67,34 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Encryption frozen: archive format 4, stream version 6 (2026-11-14)
+
+Before freezing, a separate review pass (design and code, read-only) went
+over the spec and the code; what it found and what was done:
+
+- **Format** (fixed by new numbers, format 3 / version 5 still read,
+  appended to and rekeyed; fixtures written by 0.9.0 in `tests/enc3/`):
+  the `--visible-names` index had a CRC only (forged a setuid file that
+  `syc x -p` restored); vhead time, codec and the end marker were not
+  covered; versions of two copies could be spliced; the gear table came
+  from 64 bits through splitmix64 (invertible); no key commitment. Format 4:
+  index record sealed in both modes (readable payload authenticated as
+  AAD), vhead in every AAD, previous index tag in the index AAD, key check
+  BLAKE2s(K, "syc key check") in a 248-byte key record, gear from 64 keyed
+  BLAKE2s, passes <= 64.
+- **Code**: Argon2's `SetLength(mem, mBlocks)` wrapped on 32-bit for
+  m = 4 GiB (heap overrun before any password check; now checked in 64
+  bits, exit 4 "out of memory" on linux-i386 and win32 under wine);
+  `--kdf-mem-max` (1024 MiB default); a password given for an unencrypted
+  file refused (env only: warning, append refused); end marker and time
+  checked; stream flags checked; `syc k` keeps t and p; echo restored on
+  SIGINT/TERM/HUP; inline passwords and the C ChaCha state wiped.
+- **Checks**: every byte of small encrypted archives (both modes) and a
+  stream flipped: all exit 3 except the last commit (exit 1, rollback to
+  the version before). `syc_ref.py` reads format 4 and recuts files with the
+  keyed table (a wrong table is caught); a forged readable index is a
+  bad vector.
+
 ## v4/v5 compression on arm64: the C paths of levels 0-3 (2026-11-13)
 
 GitHub's arm64 machines (bench.yml, silesia.tar) had v4 compressing

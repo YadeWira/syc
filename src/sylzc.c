@@ -2950,6 +2950,11 @@ void sylzc_chacha20_xor(const uint8_t *key, const uint8_t *nonce12, uint32_t cou
         n -= take;
         st[12]++;
     }
+    {   /* the state holds the key: cleared (volatile, so not optimized out) */
+        volatile uint32_t *w = st;
+        for (i = 0; i < 16; i++)
+            w[i] = 0;
+    }
 }
 
 /* Poly1305 over whole 16-byte blocks (hibit: 1 << 24 for full blocks, 0

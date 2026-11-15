@@ -81,7 +81,7 @@ has "i: the blocks" out.txt '^blocks'
 has "i: the raw size" out.txt "^raw size *$(wc -c < data | tr -d ' ') bytes"
 check "c -b 1 -pPASSWORD" 0 "$SYC" c -q -b 1 -pclitest --kdf-mem 8 -o enc.sylz data
 check "i on an encrypted stream" 0 "$SYC" i -v enc.sylz
-has "i: encrypted" out.txt 'format version 5.*encrypted (XChaCha20-Poly1305, key from Argon2id over 8 MiB)'
+has "i: encrypted" out.txt 'format version 6.*encrypted (XChaCha20-Poly1305, key from Argon2id over 8 MiB)'
 has "i -v: a line per block" out.txt '^ *0 '
 check "i -v on an -ec stream" 0 "$SYC" i -v e-auto.sylz
 has "i -v: the blocks' format" out.txt '  sylz v[2345]'

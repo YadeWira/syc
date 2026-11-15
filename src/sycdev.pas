@@ -25,7 +25,7 @@ uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}BaseUnix,{$endif}
   SysUtils, Classes, Math, sylz, sylzhuf, blake2s, syccdc, syccrypto, sycblocks, sycui,
-  sycbuild, sycvectors, sycstream, sycarc;
+  sycbuild, sycvectors, sycstream, sycarc, sycenc;
 
 const
   ISSUES_URL = 'https://github.com/YadeWira/syc/issues';
@@ -933,6 +933,7 @@ function RunSelfTestCommand(const opts: TOptions): Integer;
 var
   t0: UInt64;
 begin
+  UseEnvPassword := False;
   stVerbosity := opts.verbosity;
   stSilent := False;
   t0 := NowNs;
@@ -1162,6 +1163,7 @@ var
   end;
 
 begin
+  UseEnvPassword := False;
   WriteLn(Paint(1, stHead, 'syc report'), ' (paste it whole into the issue: ', ISSUES_URL, ')');
   Row('version', 'syc ' + SYC_VERSION);
   Row('commit', Format('%s (%s)', [BUILD_COMMIT, BUILD_DATE]));

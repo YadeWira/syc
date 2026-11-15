@@ -14,7 +14,7 @@ uses
   SysUtils, sylz, sycblocks, sycui;
 
 const
-  SYC_VERSION   = '0.9.0';
+  SYC_VERSION   = '0.10.0';
   STREAM_SUFFIX = '.sylz';
   RAW_SUFFIX    = '.sylzraw';
   DEFAULT_STREAM_BLOCK_MIB = 4;
@@ -46,6 +46,7 @@ type
     visibleNames: Boolean;   { a --visible-names }
     kdfMemMiB: Integer;      { --kdf-mem }
     kdfMemSet: Boolean;      { --kdf-mem given (k: else the current slot's) }
+    kdfMemMaxMiB: Integer;   { --kdf-mem-max: a key needing more is refused }
     newPasswordInline: string;   { k --new-password=PASSWORD }
     newPasswordFile: string;     { k --new-password-file }
     rawSize: Integer;        { d/t --size: its decoded size; -1 not given }
@@ -135,7 +136,7 @@ end;
 type
   TOptId = (oLevel, oEc, oFormat, oBlock, oThreads, oOut, oStdout, oForce, oRm,
     oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
-    oRaw, oSize, oPassword, oPasswordFile, oNewPassword, oNewPasswordFile, oVisibleNames, oKdfMem, oProgress, oNoProgress,
+    oRaw, oSize, oPassword, oPasswordFile, oNewPassword, oNewPasswordFile, oVisibleNames, oKdfMem, oKdfMemMax, oProgress, oNoProgress,
     oLevels, oTime, oStats, oDebug, oPaths, oColor, oQuiet, oVerbose, oHelp);
 
   TOptDef = record
@@ -146,7 +147,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..37] of TOptDef = (
+  OPTION_DEFS: array[0..38] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'acb'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'acb'),
     (id: oFormat;  short: 'F';  long: 'format';     value: True;  cmds: 'acb'),
@@ -174,6 +175,7 @@ const
     (id: oNewPasswordFile; short: ''; long: 'new-password-file'; value: True; cmds: 'k'),
     (id: oVisibleNames; short: ''; long: 'visible-names'; value: False; cmds: 'a'),
     (id: oKdfMem;  short: '';   long: 'kdf-mem';    value: True;  cmds: 'ack'),
+    (id: oKdfMemMax; short: ''; long: 'kdf-mem-max'; value: True; cmds: 'axlidtk'),
     (id: oProgress; short: '';  long: 'progress';   value: False; cmds: 'axcdt'),
     (id: oNoProgress; short: ''; long: 'no-progress'; value: False; cmds: 'axcdt'),
     (id: oLevels;  short: '';   long: 'levels';     value: True;  cmds: 'b'),
@@ -343,7 +345,9 @@ begin
       WriteLn('  --visible-names        encrypt the data only: names, sizes, dates stay listable');
   end
   else if cmd in ['x', 'l', 'i', 't', 'd'] then
-    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)')
+    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)');
+  if cmd in ['a', 'x', 'l', 'i', 't', 'd', 'k'] then
+    WriteLn('  --kdf-mem-max MIB      refuse files whose key needs more memory, default 1024')
   else if cmd = 'k' then
   begin
     WriteLn('  -pPASSWORD, --password-file FILE   the current password (or SYC_PASSWORD,');
@@ -614,6 +618,7 @@ begin
   opts.verbosity := vNormal;
   opts.rawSize := -1;
   opts.kdfMemMiB := 64;
+  opts.kdfMemMaxMiB := 1024;
   opts.benchSeconds := 1;
 
   if CmdArgCount < 1 then
@@ -787,6 +792,7 @@ begin
           opts.kdfMemMiB := IntArg(shown, value, 8, 4096);
           opts.kdfMemSet := True;
         end;
+      oKdfMemMax: opts.kdfMemMaxMiB := IntArg(shown, value, 8, 4096);
       oNewPassword:
         begin
           if value = '' then

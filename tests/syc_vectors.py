@@ -11,8 +11,8 @@ attributes, uid/gid, size and SHA-256 of files, symlink targets), taken
 from the trees syc archived, not from syc; "damaged" says whether bytes
 follow the last complete version. For each stream NAME.sylz,
 NAME.sylz.json holds the decoded size and SHA-256. Vectors with
-"corrupt": true must be refused. Encrypted ones (enc-*, format 3 and
-stream version 5) give their "password" in the .json; enc-rekeyed's was
+"corrupt": true must be refused. Encrypted ones (enc-*, format 4 and
+stream version 6) give their "password" in the .json; enc-rekeyed's was
 changed with syc k (its live key slot is the second).
 """
 import hashlib
@@ -24,6 +24,10 @@ import stat
 import struct
 import subprocess
 import sys
+import zlib
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+import sylz_ref  # noqa: E402  (to forge a readable index)
 
 rnd = random.Random(2026)
 
@@ -194,7 +198,7 @@ def main():
         open(os.path.join(out, name + '.syc'), 'wb').write(d)
         json.dump({'corrupt': True}, open(os.path.join(out, name + '.syc.json'), 'w'))
 
-    # encrypted archives (format 3): both modes, versions, several blocks
+    # encrypted archives (format 4): both modes, versions, several blocks
     pw = 'syc vectors ñ'
     archive('enc-basic', [basic], ('-p' + pw,), password=pw)
     archive('enc-visible', [basic], ('-p' + pw, '--visible-names', '--kdf-mem', '8'), password=pw)
@@ -214,7 +218,7 @@ def main():
         write(t + '/r2', bytes(rnd.getrandbits(8) for _ in range(1 << 20)), T0)
     dest, _ = archive('enc-swap-ok', [two_random], ('-p' + pw, '--kdf-mem', '8', '-b', '1'), password=pw)
     d = open(dest, 'rb').read()
-    p = 8 + 216 + 20
+    p = 8 + 248 + 20
     spans = []
     while struct.unpack_from('<I', d, p)[0]:
         n = 12 + 40 + (struct.unpack_from('<I', d, p + 4)[0] & 0x7FFFFFFF)
@@ -228,6 +232,24 @@ def main():
     json.dump({'corrupt': True, 'password': pw}, open(os.path.join(out, 'bad-enc-swap.syc.json'), 'w'))
     os.remove(dest)
     os.remove(dest + '.json')
+    # refused: a readable index (--visible-names) changed, its CRC and the
+    # commit made right again: only its tag finds it
+    d = open(os.path.join(out, 'enc-visible.syc'), 'rb').read()
+    vstart, istart = struct.unpack_from('<QQ', d, len(d) - 20)
+    raw_len, packed, crc = struct.unpack_from('<III', d, istart + 4)
+    n = packed & 0x7FFFFFFF
+    pay = d[istart + 40:istart + 40 + n]
+    index = bytearray(pay if packed & 0x80000000 else sylz_ref.decode_block(pay, raw_len))
+    assert zlib.crc32(index) == crc
+    k = index.find(b'.txt')
+    index[k + 1] ^= 0x20                       # a name changed: .txt -> .Txt
+    rec = (b'SYCI' + struct.pack('<III', raw_len, raw_len | 0x80000000, zlib.crc32(index))
+           + d[istart + 16:istart + 40] + bytes(index) + d[istart + 40 + n:istart + 56 + n])
+    commit = b'SYCE' + struct.pack('<QQ', vstart, istart)
+    open(os.path.join(out, 'bad-enc-visible-index.syc'), 'wb').write(
+        d[:istart] + rec + commit + struct.pack('<I', zlib.crc32(commit)))
+    json.dump({'corrupt': True, 'password': pw},
+              open(os.path.join(out, 'bad-enc-visible-index.syc.json'), 'w'))
 
     # streams
     def stream(name, data, opts=(), password=None):
@@ -249,7 +271,7 @@ def main():
     dest = stream('enc-three-blocks', (text * 3)[:2600000], ('-p' + pw, '--kdf-mem', '8', '-b', '1'), pw)
     # refused: cut after its first block, with the end record copied after it
     d = open(dest, 'rb').read()
-    p = 7 + 216
+    p = 7 + 248
     first = 12 + 40 + (struct.unpack_from('<I', d, p + 4)[0] & 0x7FFFFFFF)
     open(os.path.join(out, 'bad-enc-cut.sylz'), 'wb').write(d[:p + first] + d[-44:])
     json.dump({'corrupt': True, 'password': pw}, open(os.path.join(out, 'bad-enc-cut.sylz.json'), 'w'))

@@ -27,8 +27,10 @@ def gear_table():
 GEAR = gear_table()
 
 
-def cut(data, s, min_log=14, avg_log=16, max_log=19):
-    """length of the fragment starting at s"""
+def cut(data, s, min_log=14, avg_log=16, max_log=19, gear=None):
+    """length of the fragment starting at s (gear: an encrypted archive's
+    keyed table, else the fixed one)"""
+    g = gear or GEAR
     mn, avg, mx = 1 << min_log, 1 << avg_log, 1 << max_log
     n = len(data) - s
     if n <= mn:
@@ -37,7 +39,7 @@ def cut(data, s, min_log=14, avg_log=16, max_log=19):
     i = mn
     lim = min(n, mx)
     while i < lim:
-        h = ((h << 1) + GEAR[data[s + i]]) & MASK64
+        h = ((h << 1) + g[data[s + i]]) & MASK64
         i += 1
         bits = avg_log + 2 if i < avg else avg_log - 2
         if h >> (64 - bits) == 0:

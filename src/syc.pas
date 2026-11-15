@@ -13,7 +13,7 @@ program syc;
 uses
   {$ifdef unix}cthreads,{$endif}
   {$ifdef windows}Windows,{$endif}
-  SysUtils, sycblocks, sycui, syccli, sycstream, sycarc, syckey, sycdev;
+  SysUtils, sycblocks, sycui, syccli, sycstream, sycarc, syckey, sycdev, sycenc;
 
 var
   opts: TOptions;
@@ -31,6 +31,7 @@ begin
 {$endif}
   try
     ParseCommandLine(opts);
+    KdfMemMaxKiB := UInt32(opts.kdfMemMaxMiB) * 1024;
     case opts.cmd of
       'a', 'x', 'l':
         ExitCode := RunArchiveCommand(opts);
@@ -64,5 +65,17 @@ begin
     if opts.stats then
       ShowStats(opts.threads, t0);
     ShowPhases;
+  end;
+  { the passwords given on the command line, cleared (best effort: the
+    process's arguments still hold them) }
+  if opts.passwordInline <> '' then
+  begin
+    UniqueString(opts.passwordInline);
+    FillChar(opts.passwordInline[1], Length(opts.passwordInline), 0);
+  end;
+  if opts.newPasswordInline <> '' then
+  begin
+    UniqueString(opts.newPasswordInline);
+    FillChar(opts.newPasswordInline[1], Length(opts.newPasswordInline), 0);
   end;
 end.

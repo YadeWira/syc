@@ -290,20 +290,23 @@ type
   end;
 
   { Seals (writing) or opens (reading) an encrypted archive's blocks, on
-    their threads: XChaCha20-Poly1305 with K_aead, AAD "SYCB" vnum k rawLen
-    packed, k the block's place in its version }
+    their threads: XChaCha20-Poly1305 with K_aead, AAD "SYCB" vhead k
+    rawLen packed (format 3: "SYCB" vnum k rawLen packed), k the block's
+    place in its version }
   TArcSealer = class
     keys: TSycKeys;
     vnum: UInt32;     { writing: the version's number; job.tag = k }
+    vhead: array[0..VHEAD_SIZE - 1] of Byte;   { writing: the version's head }
+    prevTag: TTag16;  { writing: the previous version's index tag (format 4) }
     arc: TObject;     { reading: the TArchive; job.tag = its block number }
-    function BlockAad(vn: UInt32; k: Int64; job: TJob): TBytes;
+    function BlockAad(vh: PByte; vn: UInt32; k: Int64; job: TJob): TBytes;
     procedure SealJob(job: TJob);
     procedure OpenJob(job: TJob);
   end;
 
   TAdder = class
     opts: TOptions;
-    enc, indexEnc: Boolean;      { format 3; its index sealed too }
+    enc, indexEnc: Boolean;      { format 3 or 4; its index sealed too }
     sealer: TArcSealer;
     gearK: array[0..255] of UInt64;   { the keyed cutter's table }
     status: Integer;
@@ -406,13 +409,38 @@ begin
   inherited Destroy;
 end;
 
-function TArcSealer.BlockAad(vn: UInt32; k: Int64; job: TJob): TBytes;
+{ an encrypted archive's index AAD: format 4 "SYCI" vhead prevTag rawLen
+  packed, format 3 "SYCI" vnum rawLen packed }
+function IndexAad(ver: Byte; vh: PByte; vn: UInt32; const prevTag: TTag16;
+  rawLen, packedField: UInt32): TBytes;
+begin
+  Result := nil;
+  PutBytes(Result, 'SYCI');
+  if ver = 2 then
+  begin
+    SetLength(Result, 4 + VHEAD_SIZE + 16);
+    Move(vh^, Result[4], VHEAD_SIZE);
+    Move(prevTag, Result[4 + VHEAD_SIZE], 16);
+  end
+  else
+    PutU32(Result, vn);
+  PutU32(Result, rawLen);
+  PutU32(Result, packedField);
+end;
+
+function TArcSealer.BlockAad(vh: PByte; vn: UInt32; k: Int64; job: TJob): TBytes;
 var
   packedField: UInt32;
 begin
   Result := nil;
   PutBytes(Result, 'SYCB');
-  PutU32(Result, vn);
+  if keys.ver = 2 then
+  begin
+    SetLength(Result, 4 + VHEAD_SIZE);
+    Move(vh^, Result[4], VHEAD_SIZE);
+  end
+  else
+    PutU32(Result, vn);
   PutU32(Result, UInt32(k));
   PutU32(Result, UInt32(job.n));
   packedField := UInt32(job.payLen);
@@ -433,7 +461,7 @@ begin
   end
   else
     job.payLen := job.c;
-  SealData(keys.aead, BlockAad(vnum, job.tag, job), job.payload, job.payLen, @job.seal[0]);
+  SealData(keys.aead, BlockAad(@vhead[0], vnum, job.tag, job), job.payload, job.payLen, @job.seal[0]);
 end;
 
 procedure TAdder.AddEntry(const local, stored: string; const m: TMeta);
@@ -849,9 +877,12 @@ begin
   istart := pos;
   fout.WriteBuffer(INDEX_MAGIC[1], 4);
   WriteU32(fout, b.len);
-  if indexEnc then
+  if indexEnc or (enc and (sealer.keys.ver = 2)) then
   begin
-    { sealed: AAD "SYCI" vnum rawLen packed; no CRC }
+    { sealed: AAD "SYCI" vhead prevTag rawLen packed (format 3: "SYCI"
+      vnum rawLen packed), no CRC; format 4 with --visible-names: the
+      payload stays readable, with its CRC, and the tag authenticates the
+      AAD followed by the payload }
     stored := (c < 0) or (c >= b.len);
     if stored then
     begin
@@ -862,14 +893,23 @@ begin
     end
     else
       packedField := UInt32(c);
-    aad := nil;
-    PutBytes(aad, 'SYCI');
-    PutU32(aad, sealer.vnum);
-    PutU32(aad, b.len);
-    PutU32(aad, packedField);
-    SealData(sealer.keys.aead, aad, @dst[0], c, @seal[0]);
+    aad := IndexAad(sealer.keys.ver, @sealer.vhead[0], sealer.vnum, sealer.prevTag, b.len, packedField);
+    if indexEnc then
+    begin
+      SealData(sealer.keys.aead, aad, @dst[0], c, @seal[0]);
+      crc := 0;
+    end
+    else
+    begin
+      SetLength(aad, Length(aad) + c);
+      Move(dst[0], aad[Length(aad) - c], c);
+      SealData(sealer.keys.aead, aad, @dst[0], 0, @seal[0]);
+      crc := crc32(0, @b.data[0], b.len);
+    end;
+    if sealer.keys.ver = 2 then
+      Move(seal[24], sealer.prevTag, 16);
     WriteU32(fout, packedField);
-    WriteU32(fout, 0);
+    WriteU32(fout, crc);
     fout.WriteBuffer(seal[0], 24);
     fout.WriteBuffer(dst[0], c);
     fout.WriteBuffer(seal[24], 16);
@@ -918,6 +958,8 @@ type
     firstBlock: SizeInt;
     indexBytes: Int64;    { the index record, header included }
     idx: TIndex;
+    vhead: array[0..VHEAD_SIZE - 1] of Byte;
+    indexTag: TTag16;     { format 4: its index's tag, in the next one's AAD }
   end;
 
   TArcBlock = record
@@ -938,10 +980,10 @@ type
     fragOff: array of UInt32;     { offset in its block }
     fragBlock: array of UInt32;   { its block, in blocks[] }
     damaged: Boolean;             { bytes after the last good commit }
-    fmt: Byte;                    { ARC_FMT, 1, or ARC_FMT_ENC }
+    fmt: Byte;                    { ARC_FMT, 1, ARC_FMT_ENC or ARC_FMT_ENC2 }
     vheadSize: Integer;           { VHEAD_SIZE, or VHEAD_SIZE_1 }
     allowEmpty: Boolean;          { an archive with no complete version is not an error }
-    { format 3 (encrypted) }
+    { formats 3 and 4 (encrypted) }
     enc, indexEnc: Boolean;
     dataStart: Int64;             { where the first version starts }
     blockExtra, indexExtra: Integer;   { a sealed record's nonce and tag, 40, else 0 }
@@ -1013,7 +1055,7 @@ begin
   size := fs.Size;
   if not ReadAt(0, @hdr, HEADER_SIZE) or (CompareByte(hdr[0], ARC_MAGIC[1], 4) <> 0) then
     Corrupt('not a syc archive');
-  if (hdr[4] <> ARC_FMT) and (hdr[4] <> 1) and (hdr[4] <> ARC_FMT_ENC) then
+  if not (hdr[4] in [ARC_FMT, 1, ARC_FMT_ENC, ARC_FMT_ENC2]) then
     Corrupt(Format('archive format %d not supported by syc %s', [hdr[4], SYC_VERSION]));
   fmt := hdr[4];
   if fmt = 1 then
@@ -1024,19 +1066,22 @@ begin
     Corrupt('bad fragment parameters in the header');
   prm := CdcParams(hdr[5], hdr[6], hdr[7]);
   dataStart := HEADER_SIZE;
-  if fmt = ARC_FMT_ENC then
+  if fmt in [ARC_FMT_ENC, ARC_FMT_ENC2] then
   begin
     { the key record; the password when the index or the data is read }
     enc := True;
     SetLength(keyHeader, HEADER_SIZE);
     Move(hdr, keyHeader[0], HEADER_SIZE);
-    SetLength(keyRecord, KEYREC_SIZE);
-    if not ReadAt(HEADER_SIZE, @keyRecord[0], KEYREC_SIZE) then
+    if fmt = ARC_FMT_ENC then
+      SetLength(keyRecord, KEYREC_SIZE_1)
+    else
+      SetLength(keyRecord, KEYREC_SIZE);
+    if not ReadAt(HEADER_SIZE, @keyRecord[0], Length(keyRecord)) then
       Corrupt('truncated key record');
     indexEnc := keyRecord[4] and KEYREC_FLAG_INDEX <> 0;
-    dataStart := HEADER_SIZE + KEYREC_SIZE;
+    dataStart := HEADER_SIZE + Length(keyRecord);
     blockExtra := SEAL_SIZE;
-    if indexEnc then
+    if indexEnc or (fmt = ARC_FMT_ENC2) then
       indexExtra := SEAL_SIZE;
     if indexEnc or needData then
     begin
@@ -1048,10 +1093,14 @@ begin
       sealer.keys := keys;
       sealer.arc := Self;
       WipeKeys(keys);
-      MakeGear(LEtoN(PUInt64(@sealer.keys.cdc[0])^), gearK);
+      KeyedGear(sealer.keys, gearK);
       prm.gear := @gearK[0];
     end;
-  end;
+  end
+  else if EncryptionRequested(opts) then
+    raise ESycError.Create(EXIT_USAGE, name + ': not encrypted, but a password was given')
+  else if PasswordInEnvironment then
+    WriteLn(StdErr, WarnTag, name, ': not encrypted (SYC_PASSWORD was not used)');
 
   { back from the end, commit by commit }
   list := nil;
@@ -1105,7 +1154,8 @@ var
 begin
   a := TArchive(arc);
   blk := @a.blocks[job.tag];
-  if not OpenData(keys.aead, BlockAad(blk^.ver + 1, job.tag - a.versions[blk^.ver].firstBlock, job),
+  if not OpenData(keys.aead, BlockAad(@a.versions[blk^.ver].vhead[0], blk^.ver + 1,
+     job.tag - a.versions[blk^.ver].firstBlock, job),
      job.payload, job.payLen, @job.seal[0]) then
   begin
     job.ok := False;
@@ -1185,6 +1235,9 @@ var
   blk: ^TArcBlock;
   seal: array[0..SEAL_SIZE - 1] of Byte;
   aad: TBytes;
+  endMark: UInt32;
+  prevTag: TTag16;
+  ok: Boolean;
 begin
   v := @versions[k];
   if not ReadAt(v^.vstart, @head, vheadSize) or (CompareByte(head[0], VHEAD_MAGIC[1], 4) <> 0) then
@@ -1199,8 +1252,13 @@ begin
   end;
   v^.vnum := LEtoN(PUInt32(@head[4])^);
   v^.time := LEtoN(PInt64(@head[8])^);
+  if fmt >= 2 then
+    Move(head[0], v^.vhead[0], VHEAD_SIZE);
   if v^.vnum <> k + 1 then
     Corrupt(Format('version %d numbered %d', [k + 1, v^.vnum]));
+  { format 3: the time is in the index, the header's is 0 }
+  if enc and (v^.time <> 0) then
+    Corrupt(Format('version %d: bad header', [k + 1]));
 
   { the index }
   if not ReadAt(v^.istart, @ih, SizeOf(ih)) or (CompareByte(ih[0], INDEX_MAGIC[1], 4) <> 0) then
@@ -1215,20 +1273,32 @@ begin
     Corrupt(Format('version %d: bad index header', [k + 1]));
   v^.indexBytes := SizeOf(ih) + indexExtra + payLen;
   SetLength(payload, payLen + 1);
-  if indexEnc then
+  if indexExtra <> 0 then
   begin
-    { nonce, sealed payload, tag }
+    { nonce, payload (sealed, or readable in format 4), tag }
     if not ReadAt(v^.istart + SizeOf(ih), @seal[0], 24)
        or not ReadAt(v^.istart + SizeOf(ih) + 24, @payload[0], payLen)
        or not ReadAt(v^.istart + SizeOf(ih) + 24 + payLen, @seal[24], 16) then
       Corrupt(Format('version %d: truncated index', [k + 1]));
-    aad := nil;
-    PutBytes(aad, 'SYCI');
-    PutU32(aad, k + 1);
-    PutU32(aad, rawLen);
-    PutU32(aad, packedField);
-    if not OpenData(sealer.keys.aead, aad, @payload[0], payLen, @seal[0]) then
-      Corrupt(Format('version %d: the index does not authenticate', [k + 1]));
+    Move(seal[24], v^.indexTag, 16);
+    if k > 0 then
+      prevTag := versions[k - 1].indexTag
+    else
+      FillChar(prevTag, SizeOf(prevTag), 0);
+    if sealer <> nil then
+    begin
+      aad := IndexAad(sealer.keys.ver, @v^.vhead[0], k + 1, prevTag, rawLen, packedField);
+      if not indexEnc then
+      begin
+        SetLength(aad, Length(aad) + payLen);
+        Move(payload[0], aad[Length(aad) - payLen], payLen);
+        ok := OpenData(sealer.keys.aead, aad, @payload[0], 0, @seal[0]);
+      end
+      else
+        ok := OpenData(sealer.keys.aead, aad, @payload[0], payLen, @seal[0]);
+      if not ok then
+        Corrupt(Format('version %d: the index does not authenticate', [k + 1]));
+    end;
   end
   else if not ReadAt(v^.istart + SizeOf(ih), @payload[0], payLen) then
     Corrupt(Format('version %d: truncated index', [k + 1]));
@@ -1298,7 +1368,7 @@ begin
     Inc(f, blk^.frags);
     Inc(p, blk^.bytes);
   end;
-  if p + 4 <> v^.istart then
+  if (p + 4 <> v^.istart) or not ReadAt(p, @endMark, 4) or (endMark <> 0) then
     Corrupt(Format('version %d: the blocks do not lead to the index', [k + 1]));
 
   { file sizes against their fragments }
@@ -1511,11 +1581,14 @@ begin
         a.indexEnc := arc.indexEnc;
         a.sealer := TArcSealer.Create;
         a.sealer.keys := arc.sealer.keys;
+        if Length(arc.versions) > 0 then
+          a.sealer.prevTag := arc.versions[High(arc.versions)].indexTag;
         if opts.visibleNames then
           Fail(EXIT_USAGE, '--visible-names is chosen when an archive is created');
       end
-      else if EncryptionRequested(opts) then
-        Fail(EXIT_USAGE, arcPath + ' is not encrypted: a version cannot add a password to it');
+      else if EncryptionRequested(opts) or PasswordInEnvironment then
+        Fail(EXIT_USAGE, arcPath + ' is not encrypted: a version cannot add a password to it'
+          + ' (unset SYC_PASSWORD to add an unencrypted version)');
       a.prm := arc.prm;
       fmt := arc.fmt;
       prev := arc.State(Length(arc.versions));
@@ -1660,9 +1733,9 @@ begin
         hdr[7] := CDC_MAX_LOG;
         if EncryptionRequested(opts) then
         begin
-          { format 3: the key record after the header }
-          hdr[4] := ARC_FMT_ENC;
-          fmt := ARC_FMT_ENC;
+          { format 4: the key record after the header }
+          hdr[4] := ARC_FMT_ENC2;
+          fmt := ARC_FMT_ENC2;
           a.enc := True;
           a.indexEnc := not opts.visibleNames;
           SetLength(hdrB, HEADER_SIZE);
@@ -1687,7 +1760,7 @@ begin
       if a.enc then
       begin
         { the keyed cutter, the version's number for the AADs }
-        MakeGear(LEtoN(PUInt64(@a.sealer.keys.cdc[0])^), a.gearK);
+        KeyedGear(a.sealer.keys, a.gearK);
         a.prm.gear := @a.gearK[0];
         a.sealer.vnum := vnum;
       end;
@@ -1699,11 +1772,13 @@ begin
       FillChar(vhead, SizeOf(vhead), 0);
       Move(VHEAD_MAGIC[1], vhead[0], 4);
       PUInt32(@vhead[4])^ := NtoLE(vnum);
-      if fmt <> ARC_FMT_ENC then
-        PInt64(@vhead[8])^ := NtoLE(UnixNow);   { format 3: 0, the time is in the index }
+      if not (fmt in [ARC_FMT_ENC, ARC_FMT_ENC2]) then
+        PInt64(@vhead[8])^ := NtoLE(UnixNow);   { formats 3, 4: 0, the time is in the index }
       vhead[16] := CODEC_SYLZ;   { format 2 only: format 1 ends before }
       if opts.flags and SYLZ_V4 <> 0 then
         vhead[16] := CODEC_SYLZ4;
+      if a.enc then
+        Move(vhead, a.sealer.vhead, VHEAD_SIZE);
       a.fout.WriteBuffer(vhead, vheadSize);
       a.pos := vstart + vheadSize;
 

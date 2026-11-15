@@ -10,10 +10,11 @@ interface
 uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}BaseUnix, termio,{$endif}
-  SysUtils, Classes, sycblocks, syccli, syccrypto, blake2s;
+  SysUtils, Classes, sycblocks, syccli, syccrypto, blake2s, syccdc;
 
 const
-  KEYREC_SIZE = 216;
+  KEYREC_SIZE_1 = 216;     { archive format 3, stream version 5 }
+  KEYREC_SIZE = 248;       { archive format 4, stream version 6: with the key check }
   SLOT_SIZE = 104;
   KDF_ARGON2ID = 1;
   SEAL_SIZE = 40;          { a block's nonce and tag }
@@ -25,15 +26,25 @@ type
     k: TKey32;               { the data key }
     aead, frag, cdc: TKey32; { its subkeys }
     flags: Byte;
+    ver: Byte;               { the key record's: 1 (216 bytes) or 2 (248) }
   end;
 
-{ A new data key, and the key record wrapping it with the password (slot
-  0, gen 1; Argon2id t = 3, p = 1, memKiB). prefix: the file's bytes
-  before the key record (the header). }
+var
+  { a key record asking Argon2id for more memory is refused (a file
+    could ask for 4 GiB, before anything in it can be checked);
+    --kdf-mem-max }
+  KdfMemMaxKiB: UInt32 = 1024 * 1024;
+  { False: SYC_PASSWORD and SYC_NEW_PASSWORD are ignored (syc s, syc r:
+    the self-test gives its own passwords, whatever the environment) }
+  UseEnvPassword: Boolean = True;
+
+{ A new data key, and the key record (version 2, with its key check)
+  wrapping it with the password (slot 0, gen 1; Argon2id t = 3, p = 1,
+  memKiB). prefix: the file's bytes before the key record (the header). }
 procedure NewKeyRecord(const prefix: TBytes; const pw: TBytes; memKiB: UInt32; flags: Byte;
   out keys: TSycKeys; out rec: TBytes);
-{ The data key from a key record; False when no slot opens with the
-  password. Raises ESycError(EXIT_CORRUPT) on a record that breaks the
+{ The data key from a key record (its version from its length, 216 or
+  248 bytes); False when no slot opens with the password. Raises ESycError(EXIT_CORRUPT) on a record that breaks the
   format. name is for the messages. }
 function OpenKeyRecord(const prefix, rec, pw: TBytes; const name: string;
   out keys: TSycKeys): Boolean;
@@ -43,10 +54,14 @@ function OpenKeyRecordSlot(const prefix, rec, pw: TBytes; const name: string;
 { A new password for a key record that slot opened, in two steps
   (wiki: syc encryption): withBoth has the data key wrapped with newPw in
   the other slot, at a higher generation, and slot as it was; withNew has
-  slot zeroed too. memKiB 0: the opened slot's. }
+  slot zeroed too. memKiB 0: the opened slot's; the passes and lanes are
+  the opened slot's. The record keeps its version. }
 procedure RewrapKeyRecord(const prefix, rec: TBytes; slot: Integer; const keys: TSycKeys;
   const newPw: TBytes; memKiB: UInt32; out withBoth, withNew: TBytes);
 procedure WipeKeys(var keys: TSycKeys);
+{ the cutter's gear table for an encrypted archive: key record version 1
+  splitmix64 from K_cdc's first 8 bytes, version 2 64 keyed BLAKE2s-256s }
+procedure KeyedGear(const keys: TSycKeys; out g: array of UInt64);
 
 { seals data[0..n) in place with key: a random nonce, the tag (into
   seal) }
@@ -63,6 +78,8 @@ function GetPassword(const opts: TOptions; creating: Boolean; const what: string
 function GetNewPassword(const opts: TOptions; const what: string): TBytes;
 { a new archive or stream is to be encrypted }
 function EncryptionRequested(const opts: TOptions): Boolean;
+{ SYC_PASSWORD is set (not empty) }
+function PasswordInEnvironment: Boolean;
 
 { little helpers for the AADs }
 procedure PutBytes(var b: TBytes; const s: string);
@@ -120,23 +137,65 @@ begin
   Wipe(@keys, SizeOf(keys));
 end;
 
-{ the slot's AAD: the header, the record's first 8 bytes, the slot's
-  first 16 }
-function SlotAad(const prefix, rec: TBytes; slotAt: SizeInt): TBytes;
+procedure KeyedGear(const keys: TSycKeys; out g: array of UInt64);
+var
+  j, i: Integer;
+  msg: array[0..3] of Byte;
+  d: TBlake2sDigest;
 begin
-  Result := Copy(prefix);
-  SetLength(Result, Length(prefix) + 8 + 16);
-  Move(rec[0], Result[Length(prefix)], 8);
-  Move(rec[slotAt], Result[Length(prefix) + 8], 16);
+  if keys.ver = 1 then
+  begin
+    MakeGear(LEtoN(PUInt64(@keys.cdc[0])^), g);
+    Exit;
+  end;
+  { gear[4j + i] = u64 i of BLAKE2s-256(key = K_cdc, message = u32 j) }
+  for j := 0 to 63 do
+  begin
+    PUInt32(@msg[0])^ := NtoLE(UInt32(j));
+    Blake2s256Key(@keys.cdc[0], 32, @msg[0], 4, d);
+    for i := 0 to 3 do
+      g[4 * j + i] := LEtoN(PUInt64(@d[8 * i])^);
+  end;
+  Wipe(@d, SizeOf(d));
 end;
 
-{ fills the slot at rec[s]: gen, Argon2id (t = 3, p = 1, memKiB), a new
-  salt and nonce, and the data key k wrapped with the password }
-procedure FillSlot(const prefix: TBytes; var rec: TBytes; s: SizeInt; gen: UInt32;
-  const k: TKey32; const pw: TBytes; memKiB: UInt32);
+{ the record's bytes before its slots: "SYCK" flags reserved[3], and in
+  version 2 the key check }
+function RecHead(ver: Byte): SizeInt;
+begin
+  if ver = 1 then
+    Result := 8
+  else
+    Result := 40;
+end;
+
+{ the key check of version 2: BLAKE2s-256(key = K, "syc key check"), so
+  that a record opens to one data key only }
+procedure KeyCheck(const k: TKey32; out c: TKey32);
 const
-  PASSES = 3;
-  LANES = 1;
+  LBL: string = 'syc key check';
+var
+  d: TBlake2sDigest;
+begin
+  Blake2s256Key(@k[0], 32, @LBL[1], Length(LBL), d);
+  Move(d, c, 32);
+  Wipe(@d, SizeOf(d));
+end;
+
+{ the slot's AAD: the header, the record's bytes before the slots, the
+  slot's first 16 }
+function SlotAad(const prefix, rec: TBytes; slotAt, head: SizeInt): TBytes;
+begin
+  Result := Copy(prefix);
+  SetLength(Result, Length(prefix) + head + 16);
+  Move(rec[0], Result[Length(prefix)], head);
+  Move(rec[slotAt], Result[Length(prefix) + head], 16);
+end;
+
+{ fills the slot at rec[s]: gen, Argon2id (passes, memKiB, lanes), a new
+  salt and nonce, and the data key k wrapped with the password }
+procedure FillSlot(const prefix: TBytes; var rec: TBytes; s, head: SizeInt; gen: UInt32;
+  const k: TKey32; const pw: TBytes; memKiB, PASSES: UInt32; LANES: Byte);
 var
   kek: TKey32;
   aad: TBytes;
@@ -153,7 +212,7 @@ begin
   Argon2id(@pw[0], Length(pw), @rec[s + 16], 16, nil, 0, nil, 0, PASSES, memKiB, LANES,
     @kek[0], 32);
   Move(k, rec[s + 56], 32);
-  aad := SlotAad(prefix, rec, s);
+  aad := SlotAad(prefix, rec, s, head);
   XChaChaPolyEncrypt(kek, PNonce24(@rec[s + 32])^, @aad[0], Length(aad), @rec[s + 56], 32, tag);
   Move(tag, rec[s + 88], 16);
   Wipe(@kek, SizeOf(kek));
@@ -161,27 +220,34 @@ end;
 
 procedure NewKeyRecord(const prefix: TBytes; const pw: TBytes; memKiB: UInt32; flags: Byte;
   out keys: TSycKeys; out rec: TBytes);
+var
+  check: TKey32;
 begin
   keys := Default(TSycKeys);
   RandomBytes(@keys.k[0], 32);
   keys.flags := flags;
+  keys.ver := 2;
   DeriveSubkeys(keys);
   rec := nil;
   SetLength(rec, KEYREC_SIZE);
   FillChar(rec[0], KEYREC_SIZE, 0);
   Move(PChar('SYCK')^, rec[0], 4);
   rec[4] := flags;
-  FillSlot(prefix, rec, 8, 1, keys.k, pw, memKiB);   { slot 0, gen 1 }
+  KeyCheck(keys.k, check);
+  Move(check, rec[8], 32);
+  Wipe(@check, SizeOf(check));
+  FillSlot(prefix, rec, 40, 40, 1, keys.k, pw, memKiB, 3, 1);   { slot 0, gen 1; t = 3, p = 1 }
 end;
 
 procedure RewrapKeyRecord(const prefix, rec: TBytes; slot: Integer; const keys: TSycKeys;
   const newPw: TBytes; memKiB: UInt32; out withBoth, withNew: TBytes);
 var
-  s, o: SizeInt;
+  s, o, head: SizeInt;
   gen, other: UInt32;
 begin
-  s := 8 + slot * SLOT_SIZE;
-  o := 8 + (1 - slot) * SLOT_SIZE;
+  head := RecHead(keys.ver);
+  s := head + slot * SLOT_SIZE;
+  o := head + (1 - slot) * SLOT_SIZE;
   gen := LEtoN(PUInt32(@rec[s])^);
   other := LEtoN(PUInt32(@rec[o])^);
   if other > gen then
@@ -191,7 +257,8 @@ begin
   if memKiB = 0 then
     memKiB := LEtoN(PUInt32(@rec[s + 8])^);
   withBoth := Copy(rec);
-  FillSlot(prefix, withBoth, o, gen + 1, keys.k, newPw, memKiB);
+  FillSlot(prefix, withBoth, o, head, gen + 1, keys.k, newPw, memKiB,
+    LEtoN(PUInt32(@rec[s + 12])^), rec[s + 5]);
   withNew := Copy(withBoth);
   FillChar(withNew[s], SLOT_SIZE, 0);
 end;
@@ -209,10 +276,10 @@ function OpenKeyRecordSlot(const prefix, rec, pw: TBytes; const name: string;
 var
   gens: array[0..1] of UInt32;
   order: array[0..1] of Integer;
-  i, k, s: Integer;
-  lanes: Byte;
-  memKiB, passes: UInt32;
-  kek: TKey32;
+  i, k, s, head: Integer;
+  lanes, ver: Byte;
+  memKiB, passes, maxPasses: UInt32;
+  kek, check: TKey32;
   aad: TBytes;
   key: array[0..31] of Byte;
 
@@ -225,14 +292,26 @@ begin
   Result := False;
   slot := -1;
   keys := Default(TSycKeys);
-  if (Length(rec) <> KEYREC_SIZE) or (CompareByte(rec[0], PChar('SYCK')^, 4) <> 0) then
+  if Length(rec) = KEYREC_SIZE_1 then
+  begin
+    ver := 1;
+    maxPasses := 256;
+  end
+  else
+  begin
+    ver := 2;
+    maxPasses := 64;
+  end;
+  head := RecHead(ver);
+  if ((Length(rec) <> KEYREC_SIZE_1) and (Length(rec) <> KEYREC_SIZE))
+     or (CompareByte(rec[0], PChar('SYCK')^, 4) <> 0) then
     Bad('no "SYCK"');
   if (rec[4] and not KEYREC_FLAG_INDEX <> 0) or (rec[5] or rec[6] or rec[7] <> 0) then
     Bad('flags');
   { the slots' structure, before any Argon2id }
   for i := 0 to 1 do
   begin
-    s := 8 + i * SLOT_SIZE;
+    s := head + i * SLOT_SIZE;
     gens[i] := LEtoN(PUInt32(@rec[s])^);
     if gens[i] = 0 then
     begin
@@ -245,8 +324,11 @@ begin
     memKiB := LEtoN(PUInt32(@rec[s + 8])^);
     passes := LEtoN(PUInt32(@rec[s + 12])^);
     if (rec[s + 4] <> KDF_ARGON2ID) or (lanes < 1) or (lanes > 16) or (rec[s + 6] or rec[s + 7] <> 0)
-       or (memKiB < 8 * UInt32(lanes)) or (memKiB > 4194304) or (passes < 1) or (passes > 256) then
+       or (memKiB < 8 * UInt32(lanes)) or (memKiB > 4194304) or (passes < 1) or (passes > maxPasses) then
       Bad('slot parameters');
+    if memKiB > KdfMemMaxKiB then
+      Fail(EXIT_FATAL, Format('%s: its key needs %d MiB of memory, over the limit of %d '
+        + '(--kdf-mem-max MIB allows more)', [name, (memKiB + 1023) div 1024, KdfMemMaxKiB div 1024]));
   end;
   if (gens[0] = 0) and (gens[1] = 0) then
     Bad('no slot');
@@ -266,16 +348,28 @@ begin
     i := order[k];
     if gens[i] = 0 then
       Continue;
-    s := 8 + i * SLOT_SIZE;
+    s := head + i * SLOT_SIZE;
     Argon2id(@pw[0], Length(pw), @rec[s + 16], 16, nil, 0, nil, 0,
       LEtoN(PUInt32(@rec[s + 12])^), LEtoN(PUInt32(@rec[s + 8])^), rec[s + 5], @kek[0], 32);
     Move(rec[s + 56], key, 32);
-    aad := SlotAad(prefix, rec, s);
+    aad := SlotAad(prefix, rec, s, head);
     if XChaChaPolyDecrypt(kek, PNonce24(@rec[s + 32])^, @aad[0], Length(aad), @key[0], 32,
        PTag16(@rec[s + 88])^) then
     begin
       Move(key, keys.k, 32);
+      if ver = 2 then
+      begin
+        KeyCheck(keys.k, check);
+        if not SameBytes(@check[0], @rec[8], 32) then
+        begin
+          Wipe(@key, SizeOf(key));
+          Wipe(@kek, SizeOf(kek));
+          WipeKeys(keys);
+          Bad('the key check does not match');
+        end;
+      end;
       keys.flags := rec[4];
+      keys.ver := ver;
       DeriveSubkeys(keys);
       slot := i;
       Result := True;
@@ -317,11 +411,29 @@ begin
 end;
 
 {$ifdef unix}
+var
+  ttyFd: cint = -1;     { while echo is off: the terminal, and its settings }
+  ttyOld: TermIOS;
+
+{ Ctrl-C (or a kill) while the password is typed: echo back on, then the
+  signal's default action }
+procedure RestoreEcho(sig: cint); cdecl;
+begin
+  if ttyFd >= 0 then
+  begin
+    TCSetAttr(ttyFd, TCSANOW, ttyOld);
+    fpWrite(ttyFd, #10, 1);
+  end;
+  fpSignal(sig, SignalHandler(SIG_DFL));
+  fpKill(fpGetPid, sig);
+end;
+
 { a line from the terminal, without echo; '' and False when there is none }
 function ReadTerminal(const prompt: string; out line: string): Boolean;
 var
   fd: cint;
   old, t: TermIOS;
+  oldInt, oldTerm, oldHup: SignalHandler;
   c: Char;
   got: TSsize;
   echoOff: Boolean;
@@ -335,6 +447,11 @@ begin
     echoOff := TCGetAttr(fd, old) = 0;
     if echoOff then
     begin
+      ttyOld := old;
+      ttyFd := fd;
+      oldInt := fpSignal(SIGINT, @RestoreEcho);
+      oldTerm := fpSignal(SIGTERM, @RestoreEcho);
+      oldHup := fpSignal(SIGHUP, @RestoreEcho);
       t := old;
       t.c_lflag := t.c_lflag and not ECHO;
       TCSetAttr(fd, TCSANOW, t);
@@ -352,7 +469,13 @@ begin
       end;
     finally
       if echoOff then
+      begin
         TCSetAttr(fd, TCSANOW, old);
+        ttyFd := -1;
+        fpSignal(SIGINT, oldInt);
+        fpSignal(SIGTERM, oldTerm);
+        fpSignal(SIGHUP, oldHup);
+      end;
       fpWrite(fd, #10, 1);
     end;
     Result := True;
@@ -422,6 +545,8 @@ var
   n: DWORD;
 begin
   Result := '';
+  if not UseEnvPassword then
+    Exit;
   n := GetEnvironmentVariableW(PWideChar(UnicodeString(v)), nil, 0);
   if n = 0 then
     Exit;
@@ -432,9 +557,16 @@ begin
 end;
 {$else}
 begin
-  Result := GetEnvironmentVariable(v);
+  Result := '';
+  if UseEnvPassword then
+    Result := GetEnvironmentVariable(v);
 end;
 {$endif}
+
+function PasswordInEnvironment: Boolean;
+begin
+  Result := EnvPassword('SYC_PASSWORD') <> '';
+end;
 
 { the password from inline, else the file's first line, else the
   variable envVar, else the terminal (prompt; twice when twice); missing:

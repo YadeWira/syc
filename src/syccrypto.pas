@@ -332,6 +332,7 @@ var
   curr, prev, refLane, refIndex, startIdx: UInt32;
   pseudo, refArea, rel, startPos: UInt64;
   final: TArgonBlock;
+  limit: UInt64;
 begin
   { H0 }
   B2bInit(s, 64);
@@ -354,6 +355,11 @@ begin
   mBlocks := 4 * p * (mKiB div (4 * p));
   q := mBlocks div p;
   segLen := q div ARGON2_SYNC_POINTS;
+  { in 64 bits: on 32-bit systems mBlocks * 1024 can wrap around, and
+    SetLength would then make a small array }
+  limit := UInt64(High(SizeInt)) div SizeOf(TArgonBlock);
+  if UInt64(mBlocks) > limit then
+    raise EOutOfMemory.Create('Argon2id: more memory than this system can address');
   SetLength(mem, mBlocks);
 
   { the first two blocks of each lane }

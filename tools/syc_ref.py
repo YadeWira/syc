@@ -32,6 +32,9 @@ _here = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location('sylz_ref', os.path.join(_here, 'sylz_ref.py'))
 sylz_ref = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sylz_ref)
+_spec = importlib.util.spec_from_file_location('syc_cdc_ref', os.path.join(_here, 'syc_cdc_ref.py'))
+syc_cdc_ref = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(syc_cdc_ref)
 
 MAX_BLOCK = 1 << 29
 CODEC_SYLZ = 1
@@ -94,7 +97,10 @@ def decode_block(b, i, magic=b''):
 
 # ── encryption (wiki: syc encryption) ────────────────────────────────────
 
-KEYREC_SIZE, SLOT_SIZE, SEAL = 216, 104, 40
+SLOT_SIZE, SEAL = 104, 40
+# the key record: version 1 (archive format 3, stream version 5) 216 bytes,
+# version 2 (archive format 4, stream version 6) 248, with the key check
+KEYREC_SIZE = {1: 216, 2: 248}
 
 
 def argon2id(pw, salt, t, m, p):
@@ -120,33 +126,40 @@ def aead_open(key, nonce, ct_tag, aad, what):
 
 
 class Keys:
-    """the data key from a key record (after `prefix`, the header)"""
-    def __init__(self, prefix, rec, password):
-        need(len(rec) == KEYREC_SIZE and rec[:4] == b'SYCK', 'key record')
+    """the data key from a key record of version ver (after `prefix`, the
+    header)"""
+    def __init__(self, prefix, rec, password, ver):
+        self.ver = ver
+        head = 8 if ver == 1 else 40
+        need(len(rec) == KEYREC_SIZE[ver] and rec[:4] == b'SYCK', 'key record')
         need(rec[4] & ~1 == 0 and rec[5:8] == b'\0\0\0', 'key record flags')
         self.index_sealed = bool(rec[4] & 1)
         need(password is not None, 'encrypted: a password is needed')
         slots = []
         for i in range(2):
-            sl = rec[8 + i * SLOT_SIZE:8 + (i + 1) * SLOT_SIZE]
+            sl = rec[head + i * SLOT_SIZE:head + (i + 1) * SLOT_SIZE]
             gen = u32(sl, 0)
             if gen == 0:
                 need(sl == bytes(SLOT_SIZE), 'an empty slot is not zero')
                 continue
             kdf, lanes, mem, passes = sl[4], sl[5], u32(sl, 8), u32(sl, 12)
             need(kdf == 1 and 1 <= lanes <= 16 and sl[6:8] == b'\0\0'
-                 and 8 * lanes <= mem <= 4194304 and 1 <= passes <= 256, 'slot parameters')
+                 and 8 * lanes <= mem <= 4194304
+                 and 1 <= passes <= (256 if ver == 1 else 64), 'slot parameters')
             slots.append((gen, sl))
         need(slots, 'no slot')
         self.k = None
         for gen, sl in sorted(slots, key=lambda g: -g[0]):
             kek = argon2id(password, sl[16:32], u32(sl, 12), u32(sl, 8), sl[5])
             try:
-                self.k = aead_open(kek, sl[32:56], sl[56:104], prefix + rec[:8] + sl[:16], 'slot')
+                self.k = aead_open(kek, sl[32:56], sl[56:104], prefix + rec[:head] + sl[:16], 'slot')
                 break
             except SycError:
                 pass
         need(self.k is not None, 'wrong password, or a damaged key record')
+        if ver == 2:
+            need(hashlib.blake2s(b'syc key check', key=self.k).digest() == rec[8:40],
+                 'the key check does not match')
         sub = lambda label: hashlib.blake2s(label, key=self.k).digest()
         self.aead, self.frag, self.cdc = sub(b'syc aead'), sub(b'syc fragment'), sub(b'syc cdc')
 
@@ -181,7 +194,7 @@ def unpack_payload(payload, raw_len, packed):
 def read_stream(b, password=None):
     need(b[:4] == b'SYZ0' and len(b) >= 6, 'not a .sylz stream')
     version = b[4]
-    need(1 <= version <= 5, 'stream version %d not known' % version)
+    need(1 <= version <= 6, 'stream version %d not known' % version)
     if version >= 4:
         need(len(b) >= 7, 'truncated')
         need(b[5] in (CODEC_SYLZ, CODEC_SYLZ4), 'codec %d not known' % b[5])
@@ -189,9 +202,11 @@ def read_stream(b, password=None):
     else:
         i = 6
     keys = None
-    if version == 5:
-        keys = Keys(b[:7], b[7:7 + KEYREC_SIZE], password)
-        i = 7 + KEYREC_SIZE
+    if version >= 5:
+        ver = version - 4
+        keys = Keys(b[:7], b[7:7 + KEYREC_SIZE[ver]], password, ver)
+        need(not keys.index_sealed, 'key record flags')
+        i = 7 + KEYREC_SIZE[ver]
     out = []
     while True:
         if u32(b, i) == 0:
@@ -340,15 +355,24 @@ def read_archive(b, password=None):
     its hash, files' sizes against their fragments"""
     need(b[:4] == b'SYCA' and len(b) >= 8, 'not a syc archive')
     fmt = b[4]
-    need(fmt in (1, 2, 3), 'archive format %d not known' % fmt)
+    need(fmt in (1, 2, 3, 4), 'archive format %d not known' % fmt)
     mn, avg, mx = b[5], b[6], b[7]
     need(6 <= mn < avg < mx <= 24, 'fragment parameters')
     vhead_size = 16 if fmt == 1 else 20
     keys, start, bx, ix = None, 8, 0, 0
-    if fmt == 3:
-        keys = Keys(b[:8], b[8:8 + KEYREC_SIZE], password)
-        start, bx = 8 + KEYREC_SIZE, SEAL
-        ix = SEAL if keys.index_sealed else 0
+    if fmt >= 3:
+        ver = fmt - 2
+        keys = Keys(b[:8], b[8:8 + KEYREC_SIZE[ver]], password, ver)
+        start, bx = 8 + KEYREC_SIZE[ver], SEAL
+        ix = SEAL if keys.index_sealed or fmt == 4 else 0
+    prev_tag = bytes(16)
+    gear = None
+    if fmt == 4:
+        # gear[4j + i] = u64 i of BLAKE2s-256(key = K_cdc, message = u32 j)
+        gear = []
+        for j in range(64):
+            d = hashlib.blake2s(struct.pack('<I', j), key=keys.cdc).digest()
+            gear += list(struct.unpack('<4Q', d))
     found, damaged = find_versions(b, vhead_size, start, bx, ix)
     frag_data = []          # [fragment number - 1] -> bytes
     versions = []
@@ -360,7 +384,30 @@ def read_archive(b, password=None):
             need(b[vstart + 16] in (CODEC_SYLZ, CODEC_SYLZ4),
                  'codec %d not known' % b[vstart + 16])
             need(b[vstart + 17:vstart + 20] == b'\0\0\0', 'reserved bytes')
-        if keys and keys.index_sealed:
+        vhead = b[vstart:vstart + 20]
+        if fmt == 4:
+            # AAD "SYCI" vhead prevTag rawLen packed; with --visible-names
+            # the payload is readable (with its CRC) and follows the AAD
+            need(b[istart:istart + 4] == b'SYCI', 'bad record magic')
+            raw_len, packed, crc = u32(b, istart + 4), u32(b, istart + 8), u32(b, istart + 12)
+            pay_len = packed & 0x7FFFFFFF
+            need(1 <= raw_len <= MAX_BLOCK, 'index header')
+            nonce = b[istart + 16:istart + 40]
+            pay = b[istart + 40:istart + 40 + pay_len]
+            tag = b[istart + 40 + pay_len:istart + 56 + pay_len]
+            need(len(tag) == 16, 'truncated index')
+            aad = b'SYCI' + vhead + prev_tag + struct.pack('<II', raw_len, packed)
+            if keys.index_sealed:
+                need(crc == 0, 'index header')
+                index = unpack_payload(aead_open(keys.aead, nonce, pay + tag, aad, 'the index'),
+                                       raw_len, packed)
+            else:
+                aead_open(keys.aead, nonce, tag, aad + pay, 'the index')
+                index = unpack_payload(pay, raw_len, packed)
+                need(crc32(index) == crc, 'index CRC-32 mismatch')
+            prev_tag = tag
+            end = istart + 56 + pay_len
+        elif keys and keys.index_sealed:
             need(b[istart:istart + 4] == b'SYCI', 'bad record magic')
             payload, raw_len, packed, end = open_sealed(
                 b, istart + 4, keys.aead,
@@ -369,8 +416,8 @@ def read_archive(b, password=None):
         else:
             index, end = decode_block(b, istart, b'SYCI')
         need(end == commit, 'the index does not end at the commit')
-        if fmt == 3:
-            need(time == 0 and len(index) >= 8, 'format 3: the time is in the index')
+        if fmt >= 3:
+            need(time == 0 and len(index) >= 8, 'formats 3, 4: the time is in the index')
             time, index = struct.unpack_from('<q', index, 0)[0], index[8:]
         blocks, frags, entries = parse_index(index, len(frag_data) + 1, 1 << mx, bx)
         p, f = vstart + vhead_size, 0
@@ -378,7 +425,8 @@ def read_archive(b, password=None):
             if keys:
                 payload, raw_len, packed, after = open_sealed(
                     b, p, keys.aead,
-                    lambda rl, pk: b'SYCB' + struct.pack('<IIII', vnum, kb, rl, pk),
+                    lambda rl, pk: b'SYCB' + (vhead if fmt == 4 else struct.pack('<I', vnum))
+                    + struct.pack('<III', kb, rl, pk),
                     'block %d of version %d' % (kb, vnum))
                 raw = unpack_payload(payload, raw_len, packed)
             else:
@@ -400,6 +448,16 @@ def read_archive(b, password=None):
             if e['type'] == FILE:
                 need(sum(len(frag_data[r - 1]) for r in e['refs']) == e['size'],
                      e['path'] + ': size does not match its fragments')
+                if gear:
+                    # format 4: the file cut again with the keyed table
+                    # gives the same fragments (checks the table's spec)
+                    data, s, want = b''.join(frag_data[r - 1] for r in e['refs']), 0, []
+                    while s < len(data):
+                        n = syc_cdc_ref.cut(data, s, mn, avg, mx, gear)
+                        want.append(n)
+                        s += n
+                    need(want == [len(frag_data[r - 1]) for r in e['refs']],
+                         e['path'] + ': not cut where the keyed table cuts')
         versions.append((k + 1, time, entries))
     return versions, damaged, frag_data
 

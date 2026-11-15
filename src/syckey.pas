@@ -25,7 +25,8 @@ uses
 
 const
   STREAM_MAGIC = 'SYZ0';
-  STREAM_FMT_ENC = 5;
+  STREAM_FMT_ENC1 = 5;
+  STREAM_FMT_ENC = 6;
   STREAM_PREFIX = 7;   { "SYZ0" version codec level }
 
 { the file's bytes on the disk, not only in the system's cache }
@@ -42,7 +43,7 @@ end;
 procedure WriteRecord(f: TFileStream; at: Int64; const rec: TBytes; const name: string);
 begin
   f.Position := at;
-  f.WriteBuffer(rec[0], KEYREC_SIZE);
+  f.WriteBuffer(rec[0], Length(rec));
   Flush(f, name);
 end;
 
@@ -52,7 +53,7 @@ var
   hdr: array[0..7] of Byte;
   prefix, rec, withBoth, withNew: TBytes;
   keys, check: TSycKeys;
-  slot, checkSlot, n: Integer;
+  slot, checkSlot, n, recSize: Integer;
   memKiB: UInt32;
   ok: Boolean;
 begin
@@ -71,22 +72,28 @@ begin
     n := f.Read(hdr, SizeOf(hdr));
     if (n = SizeOf(hdr)) and (CompareByte(hdr[0], ARC_MAGIC[1], 4) = 0) then
     begin
-      if hdr[4] <> ARC_FMT_ENC then
+      if not (hdr[4] in [ARC_FMT_ENC, ARC_FMT_ENC2]) then
         Fail(EXIT_USAGE, name + ': not encrypted (syc k changes the password of encrypted files)');
       SetLength(prefix, HEADER_SIZE);
+      recSize := KEYREC_SIZE;
+      if hdr[4] = ARC_FMT_ENC then
+        recSize := KEYREC_SIZE_1;
     end
     else if (n >= STREAM_PREFIX) and (CompareByte(hdr[0], STREAM_MAGIC[1], 4) = 0) then
     begin
-      if hdr[4] <> STREAM_FMT_ENC then
+      if not (hdr[4] in [STREAM_FMT_ENC1, STREAM_FMT_ENC]) then
         Fail(EXIT_USAGE, name + ': not encrypted (syc k changes the password of encrypted files)');
       SetLength(prefix, STREAM_PREFIX);
+      recSize := KEYREC_SIZE;
+      if hdr[4] = STREAM_FMT_ENC1 then
+        recSize := KEYREC_SIZE_1;
     end
     else
       Fail(EXIT_CORRUPT, name + ': not a syc archive or stream');
     Move(hdr, prefix[0], Length(prefix));
-    SetLength(rec, KEYREC_SIZE);
+    SetLength(rec, recSize);
     f.Position := Length(prefix);
-    if f.Read(rec[0], KEYREC_SIZE) <> KEYREC_SIZE then
+    if f.Read(rec[0], recSize) <> recSize then
       Fail(EXIT_CORRUPT, name + ': truncated key record');
 
     if not OpenKeyRecordSlot(prefix, rec, oldPw, name, keys, slot) then

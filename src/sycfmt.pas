@@ -17,8 +17,11 @@ const
   INDEX_MAGIC   = 'SYCI';
   COMMIT_MAGIC  = 'SYCE';
   ARC_FMT       = 2;
-  ARC_FMT_ENC   = 3;    { encrypted (wiki: syc encryption): a key record
-                          after the header; sealed blocks and index }    { 2: the version head names its codec (syc 0.4.0-);
+  ARC_FMT_ENC   = 3;    { encrypted, syc 0.5.0-0.9.x (wiki: syc encryption):
+                          read and appended to as such }
+  ARC_FMT_ENC2  = 4;    { encrypted (wiki: syc encryption): a key record
+                          after the header; sealed blocks; the index sealed,
+                          or readable and authenticated }    { 2: the version head names its codec (syc 0.4.0-);
                           1: no codec, sylz implied (syc 0.3.1-0.3.4), read
                           and appended to as such }
   HEADER_SIZE   = 8;

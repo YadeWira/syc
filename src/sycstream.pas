@@ -38,7 +38,8 @@ const
                         blocks, v3 chunks of mode 2 (syc 0.2.14-0.3.4); 2:
                         v3 chunks of mode 1 (syc 0.2.5-0.2.13); 1: v2 only
                         (syc 0.2.2-); 0 was sylz v1 (syc 0.2.0-0.2.1) }
-  FORMAT_ENC   = 5;   { 5: encrypted (wiki: syc encryption) }
+  FORMAT_ENC1  = 5;   { 5: encrypted, syc 0.5.0-0.9.x (wiki: syc encryption) }
+  FORMAT_ENC   = 6;   { 6: encrypted, a key record with its key check }
   CODEC_SYLZ   = 1;
   CODEC_SYLZ4  = 2;   { sylz blocks of formats v2 to v5 (syc 0.7.0-; 0.6.0 wrote an
                         earlier layout of v4/v5, which is not read) }
@@ -47,7 +48,7 @@ const
 
 type
   { seals (compressing) or opens (decompressing) the blocks of an
-    encrypted stream (version 5), on each block's thread }
+    encrypted stream (version 5 or 6), on each block's thread }
   TStreamSealer = class
     keys: TSycKeys;
     function Aad(job: TJob): TBytes;
@@ -294,6 +295,10 @@ begin
   if (hdr[4] < 1) or (hdr[4] > FORMAT_ENC) then
     Fail(EXIT_CORRUPT, Format('%s: stream format version %d not supported by syc %s',
       [name, hdr[4], SYC_VERSION]));
+  if (hdr[4] < FORMAT_ENC1) and EncryptionRequested(opts) then
+    Fail(EXIT_USAGE, name + ': not encrypted, but a password was given');
+  if (hdr[4] < FORMAT_ENC1) and PasswordInEnvironment then
+    WriteLn(StdErr, WarnTag, name, ': not encrypted (SYC_PASSWORD was not used)');
   { version 4 and up: hdr[5] is the codec; the level byte follows }
   if hdr[4] >= 4 then
   begin
@@ -302,7 +307,7 @@ begin
     if ReadFull(fin, @hdr[6], 1) <> 1 then
       Fail(EXIT_CORRUPT, name + ': truncated');
   end;
-  enc := hdr[4] = FORMAT_ENC;
+  enc := hdr[4] >= FORMAT_ENC1;
   sealer := nil;
   pipe := TPipeline.Create(opts.threads, True, 0, 0);
   try
@@ -310,9 +315,14 @@ begin
     begin
       Phase('d: the key (Argon2id)');
       prefix := StreamPrefix(hdr[4], hdr[5], hdr[6]);
-      SetLength(rec, KEYREC_SIZE);
-      if ReadFull(fin, @rec[0], KEYREC_SIZE) <> KEYREC_SIZE then
+      if hdr[4] = FORMAT_ENC1 then
+        SetLength(rec, KEYREC_SIZE_1)
+      else
+        SetLength(rec, KEYREC_SIZE);
+      if ReadFull(fin, @rec[0], Length(rec)) <> Length(rec) then
         Fail(EXIT_CORRUPT, name + ': truncated');
+      if (Length(rec) > 4) and (rec[4] <> 0) then
+        Fail(EXIT_CORRUPT, name + ': damaged key record (flags)');
       pw := GetPassword(opts, False, name);
       sealer := TStreamSealer.Create;
       if not OpenKeyRecord(prefix, rec, pw, name, sealer.keys) then
@@ -686,7 +696,7 @@ var
   c: Char;
   enc, pretty: Boolean;
   what, kind: string;
-  i: Integer;
+  i, recHead: Integer;
 
   procedure Need(p: Pointer; n: SizeInt);
   begin
@@ -717,7 +727,7 @@ begin
     end
     else
       hdr[6] := hdr[5];
-    enc := hdr[4] = FORMAT_ENC;
+    enc := hdr[4] >= FORMAT_ENC1;
     extra := 0;
     what := Format('%s stream, format version %d, codec sylz, written at level %d',
       [STREAM_SUFFIX, hdr[4], hdr[6]]);
@@ -728,16 +738,20 @@ begin
     begin
       { the key record: "SYCK", flags, then two slots; the one of the
         highest generation holds the current password's parameters }
-      Need(@rec[0], KEYREC_SIZE);
+      if hdr[4] = FORMAT_ENC1 then
+        recHead := 8
+      else
+        recHead := 40;
+      Need(@rec[0], recHead + 2 * SLOT_SIZE);
       bestGen := 0;
       memKiB := 0;
       for i := 0 to 1 do
       begin
-        gen := LEtoN(PUInt32(@rec[8 + i * SLOT_SIZE])^);
+        gen := LEtoN(PUInt32(@rec[recHead + i * SLOT_SIZE])^);
         if gen > bestGen then
         begin
           bestGen := gen;
-          memKiB := LEtoN(PUInt32(@rec[8 + i * SLOT_SIZE + 8])^);
+          memKiB := LEtoN(PUInt32(@rec[recHead + i * SLOT_SIZE + 8])^);
         end;
       end;
       what := what + Format('; encrypted (XChaCha20-Poly1305, key from Argon2id over %d MiB)',

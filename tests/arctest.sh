@@ -211,14 +211,16 @@ import struct, subprocess, sys
 syc, bad = sys.argv[1], 0
 for before, after, p, mem in (('enc.syc', 'enck.syc', 8, 9216), ('enck0.sylz', 'enck.sylz', 7, 8192)):
     b, a = open(before, 'rb').read(), open(after, 'rb').read()
-    if len(a) != len(b) or a[:p + 8] != b[:p + 8] or a[p + 216:] != b[p + 216:]:
+    # the key record (version 2): "SYCK" flags reserved, the key check,
+    # then two slots of 104 bytes
+    if len(a) != len(b) or a[:p + 40] != b[:p + 40] or a[p + 248:] != b[p + 248:]:
         print('FAIL: k changed more than the key record of %s' % after); bad += 1
-    slot = lambda d, i: d[p + 8 + 104 * i:p + 8 + 104 * (i + 1)]
+    slot = lambda d, i: d[p + 40 + 104 * i:p + 40 + 104 * (i + 1)]
     if slot(a, 0) != bytes(104) or struct.unpack_from('<II', slot(a, 1), 0)[0] != 2 \
        or struct.unpack_from('<I', slot(a, 1), 8)[0] != mem:
         print('FAIL: %s: slots after k' % after); bad += 1
     mid = bytearray(a)
-    mid[p + 8:p + 8 + 104] = slot(b, 0)
+    mid[p + 40:p + 40 + 104] = slot(b, 0)
     open('mid', 'wb').write(mid)
     for pw in ('S3cret', 'N3w'):
         r = subprocess.run([syc, 't', '-q', '-p' + pw, 'mid'], capture_output=True).returncode
@@ -228,6 +230,30 @@ sys.exit(1 if bad else 0)
 PY
 check "k again: gen 3 in slot 0" 0 "$SYC" k -q -pN3w --new-password=Z enck.syc
 check "k again: the newest" 0 "$SYC" t -q -pZ enck.syc
+
+# the earlier encrypted formats (archive 3, stream 5, syc 0.5.0-0.9.x):
+# still read, appended to and rekeyed
+e3=$here/tests/enc3
+check "format 3: t" 0 "$SYC" t -q -pS3cret "$e3/arc3.syc"
+check "format 3: x" 0 "$SYC" x -q -pS3cret -o oe3x "$e3/arc3.syc"
+diff -r oe3x/tree2 "$e3/tree2" > /dev/null || { echo "FAIL: format 3: not the same files"; fail=1; }
+check "format 3 --visible-names: l without one" 0 sh -c "'$SYC' l '$e3/arc3v.syc' < /dev/null"
+check "format 3 --visible-names: t" 0 "$SYC" t -q -pS3cret "$e3/arc3v.syc"
+check "stream version 5: d" 0 sh -c "'$SYC' d -q -pS3cret -O '$e3/s5.sylz' > e5.out"
+cmp -s e5.out "$e3/tree/a" || { echo "FAIL: stream version 5: not the same data"; fail=1; }
+cp "$e3/arc3.syc" a3.syc
+check "format 3: a, a third version" 0 "$SYC" a -q -pS3cret a3.syc tree
+check "format 3: still format 3" 0 sh -c "head -c 5 a3.syc | tail -c 1 | od -An -tu1 | grep -qx ' *3'"
+check "format 3: k" 0 "$SYC" k -q -pS3cret --new-password=N3w a3.syc
+check "format 3: the reference reader" 0 python3 -I "$here/tools/syc_ref.py" -pN3w t a3.syc
+
+# a password given for a file that is not encrypted: refused; one only in
+# SYC_PASSWORD: a warning when reading, refused when appending
+check "t -p, not encrypted" 2 "$SYC" t -q -pS3cret t1.syc
+check "t SYC_PASSWORD, not encrypted" 0 env SYC_PASSWORD=S3cret "$SYC" t -q t1.syc
+cp t1.syc t1e.syc
+check "a SYC_PASSWORD, not encrypted" 2 env SYC_PASSWORD=S3cret "$SYC" a -q t1e.syc tree2
+check "a key needing more than --kdf-mem-max" 4 "$SYC" t -q -pZ --kdf-mem-max 8 enck.syc
 
 # the test vectors: written by this syc, read by the reference reader
 # (tools/syc_ref.py, from the wiki's format pages) and by syc
@@ -318,6 +344,37 @@ if r != 1:
     print('FAIL: trailing junk: t exit %d' % r); bad += 1
 if ignored:
     print('arctest: %d of 200 flipped bits ignored by the decoder, data intact' % ignored)
+sys.exit(1 if bad else 0)
+EOF
+
+# damage to encrypted files: every flipped bit is found (exit 3), in both
+# archive modes and in a stream; only the last commit may fall back to the
+# version before it (exit 1, the rollback the format cannot see)
+"$SYC" a -q -pS3cret --kdf-mem 8 -b 1 fe.syc small
+printf more > small/c && "$SYC" a -q -pS3cret fe.syc small
+rm -f small/c; "$SYC" a -q -pS3cret --kdf-mem 8 --visible-names -b 1 fv.syc small; printf more > small/c
+"$SYC" a -q -pS3cret fv.syc small
+"$SYC" c -q -f -pS3cret --kdf-mem 8 -b 1 -o fs.sylz small/b
+python3 - "$SYC" <<'EOF' || fail=1
+import random, subprocess, sys
+syc = sys.argv[1]
+random.seed(3)
+bad = 0
+for name, tail in (('fe.syc', 24), ('fv.syc', 24), ('fs.sylz', 0)):
+    orig = open(name, 'rb').read()
+    # the header and the key record entirely, then random bytes
+    places = list(range(min(len(orig), 8 + 248 + 20))) + random.sample(range(len(orig)), 150)
+    for k in places:
+        d = bytearray(orig)
+        d[k] ^= 1 << random.randrange(8)
+        open('fz-' + name, 'wb').write(d)
+        run = subprocess.run([syc, 't', '-q', '-pS3cret', 'fz-' + name], capture_output=True)
+        r = run.returncode
+        # (a slot's memory made larger: refused before any password, exit 4)
+        if r == 4 and b'--kdf-mem-max' in run.stderr:
+            continue
+        if r != 3 and not (r == 1 and k >= len(orig) - tail):
+            print('FAIL: %s: byte %d flipped: t exit %d' % (name, k, r)); bad += 1
 sys.exit(1 if bad else 0)
 EOF
 
