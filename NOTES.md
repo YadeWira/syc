@@ -67,6 +67,23 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## Files over 4 GiB (2026-11-15)
+
+A 4.6 GB file (4.4 GB random, then silesia.tar) through every path, with
+the 0.10.0 sources: `c`/`d` (also through stdin and stdout), `a` (a new
+archive, then a second version written past 4 GiB, also `a -` to stdout),
+`l -l`, `i`, `t`, `x -u 1`, and all of it encrypted (`-p`). All exact on
+linux-x86_64, linux-i386 and windows-i386 (wine). The progress line,
+`--stats` and `i` count past 4 GiB correctly on 32-bit (sizes, offsets
+and counters are Int64/UInt64 throughout; the index stores sizes as
+varints). `tests/bigtest.sh SYC WORKDIR` repeats it; it is not in CI
+(about 14 GB of disk).
+
+`a` took 115-150 s on /mnt/IA_LAB against 18 s on tmpfs: the disk, not
+syc. `a` fsyncs the archive before its commit (and `c` does not), and a
+plain `dd conv=fsync` of 1.6 GB took 88 s on that disk at the time
+(shared, I/O pressure ~30%).
+
 ## Encryption frozen: archive format 4, stream version 6 (2026-11-14)
 
 Before freezing, a separate review pass (design and code, read-only) went
