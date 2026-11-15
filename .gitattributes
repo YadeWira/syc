@@ -1,0 +1,4 @@
+# fixtures compared byte for byte: never converted at checkout
+tests/compat/*.syc -text
+tests/compat/*.sylz -text
+tests/enc3/** -text

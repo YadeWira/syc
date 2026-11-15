@@ -37,7 +37,7 @@ echo '== syc s: the self-test of the binary itself; syc r: the report'
 
 "$PY" .github/sample.py "$W/sample"
 echo '== clitest'
-SYC=$SYC sh tests/clitest.sh "$W/sample" "$W/clitest"
+SYC=$SYC PYTHON=$PY sh tests/clitest.sh "$W/sample" "$W/clitest"
 if [ -z "$WINDOWS" ]; then
   echo '== sylzfuzz'
   out/sylzfuzz 300 "$W/sample" src/*.pas
@@ -48,6 +48,13 @@ if [ -z "$WINDOWS" ]; then
   echo '== vectors, read back by the reference reader'
   "$PY" tests/syc_vectors.py "$SYC" "$W/vectors" "$W/sample" >/dev/null
   "$PY" tools/syc_ref.py --check "$W/vectors"
+fi
+
+echo '== what released versions wrote (0.2.2 to 0.9.0), still read'
+if [ -n "$WINDOWS" ]; then
+  "$PY" tests/compat/check.py "$SYC" "$W/compat"
+else
+  REF=1 "$PY" tests/compat/check.py "$SYC" "$W/compat"
 fi
 
 echo '== the zpaq-std plugin, loaded as zpaq-std does (its four codecs)'

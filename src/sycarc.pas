@@ -1945,7 +1945,7 @@ end;
 function ListCommand(const opts: TOptions): Integer;
 var
   a: TArchive;
-  tmp, line: string;
+  tmp, line, ending: string;
   st: TEntries;
   filters: array of string;
   i, n, v, upTo: SizeInt;
@@ -1955,7 +1955,14 @@ begin
   Result := EXIT_OK;
   { on a terminal: colours, rounded sizes and a total; into a pipe or a
     file the plain lines, as scripts read them }
-  pretty := IsTerminal(1);
+  pretty := IsTerminal(1) and not opts.nullSep;
+  if opts.nullSep then
+  begin
+    ending := #0;
+    SetColorMode(cmNever);
+  end
+  else
+    ending := LineEnding;
   shownFiles := 0;
   shownBytes := 0;
   SetLength(filters, Length(opts.operands) - 1);
@@ -1993,7 +2000,10 @@ begin
       line := st[i].path;
       if st[i].kind = ET_DELETED then
       begin
-        WriteLn(Format('%5d  %s', [st[i].ver, line + Paint(1, stDim, '  (deleted)')]));
+        if opts.nullSep then
+          Write(Format('%5d  %s  (deleted)', [st[i].ver, line]), ending)
+        else
+          WriteLn(Format('%5d  %s', [st[i].ver, line + Paint(1, stDim, '  (deleted)')]));
         Inc(shown);
         Continue;
       end;
@@ -2015,7 +2025,7 @@ begin
             FormatTime(st[i].meta.mtime div 1000000000, False), line]);
       if opts.allVersions then
         line := Format('%5d  %s', [st[i].ver, line]);
-      WriteLn(line);
+      Write(line, ending);
       Inc(shown);
     end;
     if (Length(filters) > 0) and (shown = 0) then

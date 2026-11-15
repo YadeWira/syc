@@ -57,6 +57,7 @@ type
     noDedup, noDelete: Boolean;
     allVersions: Boolean;    { l --all }
     longList: Boolean;       { l -l }
+    nullSep: Boolean;        { l --null }
     untilSpec: string;       { -u: a version number or a date; '' latest }
     noPerms, noOwner: Boolean;
     stats: Boolean;          { --stats }
@@ -135,7 +136,7 @@ end;
 
 type
   TOptId = (oLevel, oEc, oFormat, oBlock, oThreads, oOut, oStdout, oForce, oRm,
-    oCd, oExclude, oNoDedup, oNoDelete, oAll, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
+    oCd, oExclude, oNoDedup, oNoDelete, oAll, oNull, oLong, oSkip, oUntil, oNoPerms, oNoOwner,
     oRaw, oSize, oPassword, oPasswordFile, oNewPassword, oNewPasswordFile, oVisibleNames, oKdfMem, oKdfMemMax, oProgress, oNoProgress,
     oLevels, oTime, oStats, oDebug, oPaths, oColor, oQuiet, oVerbose, oHelp);
 
@@ -147,7 +148,7 @@ type
   end;
 
 const
-  OPTION_DEFS: array[0..38] of TOptDef = (
+  OPTION_DEFS: array[0..39] of TOptDef = (
     (id: oLevel;   short: '';   long: 'level';      value: True;  cmds: 'acb'),
     (id: oEc;      short: 'ec'; long: 'ec';         value: False; cmds: 'acb'),
     (id: oFormat;  short: 'F';  long: 'format';     value: True;  cmds: 'acb'),
@@ -162,6 +163,7 @@ const
     (id: oNoDedup; short: '';   long: 'no-dedup';   value: False; cmds: 'a'),
     (id: oNoDelete; short: '';  long: 'no-delete';  value: False; cmds: 'a'),
     (id: oAll;     short: '';   long: 'all';        value: False; cmds: 'l'),
+    (id: oNull;    short: '';   long: 'null';       value: False; cmds: 'l'),
     (id: oLong;    short: 'l';  long: 'long';       value: False; cmds: 'l'),
     (id: oSkip;    short: '';   long: 'skip';       value: False; cmds: 'x'),
     (id: oUntil;   short: 'u';  long: 'until';      value: True;  cmds: 'xl'),
@@ -322,11 +324,9 @@ begin
   WriteLn('              (0-1 single hash, 2-3 two hashes, 4-8 hash chains,');
   WriteLn('              9-10 optimal parsing)');
   WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v5;');
-  WriteLn('              v3 with -F 2),');
-  WriteLn('              smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL,
-    ': 0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL, ' do');
-  WriteLn('              (both formats), 9-10 price literals by');
-  WriteLn('              their Huffman codes');
+  WriteLn('              v3 with -F 2), smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL, ':');
+  WriteLn('              0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL,
+    ' do, 9-10 price literals by their Huffman codes');
   WriteLn('  -F, --format N   the sylz block format: 4 (default; 5 with -ec), read by');
   WriteLn('              syc 0.7.0 and later; or 2 (3 with -ec), larger and slower');
   WriteLn('              but read by every syc since 0.2.14');
@@ -345,9 +345,7 @@ begin
       WriteLn('  --visible-names        encrypt the data only: names, sizes, dates stay listable');
   end
   else if cmd in ['x', 'l', 'i', 't', 'd'] then
-    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)');
-  if cmd in ['a', 'x', 'l', 'i', 't', 'd', 'k'] then
-    WriteLn('  --kdf-mem-max MIB      refuse files whose key needs more memory, default 1024')
+    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)')
   else if cmd = 'k' then
   begin
     WriteLn('  -pPASSWORD, --password-file FILE   the current password (or SYC_PASSWORD,');
@@ -357,6 +355,8 @@ begin
     WriteLn('  --kdf-mem MIB          Argon2id''s memory for the new password, default: as');
     WriteLn('                         the current one''s');
   end;
+  if cmd in ['a', 'x', 'l', 'i', 't', 'd', 'k'] then
+    WriteLn('  --kdf-mem-max MIB      refuse files whose key needs more memory, default 1024');
 end;
 
 { the options every command takes }
@@ -442,6 +442,8 @@ begin
         WriteLn('                         rounded and a total follows; -v: exact bytes)');
         WriteLn('  -u, --until V          as of version V (a number or a date, as in syc x)');
         WriteLn('  --all                  every version of each path, deletions included');
+        WriteLn('  --null                 end each entry with a NUL byte, not a newline (for');
+        WriteLn('                         scripts: names may hold newlines; plain, no colours)');
         WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
         WriteLn('  -q, --quiet / -v, --verbose');
         ProgressUsage(cmd);
@@ -465,7 +467,8 @@ begin
         WriteLn;
         WriteLn('  --levels LIST          levels to run: 1,4,9 or 0-10 or both; default all');
         WriteLn('                         (-N: only level N)');
-        WriteLn('  -ec, --ec              format v3 (entropy-coded literals)');
+        WriteLn('  -ec, --ec              entropy-coded literals (format v5; v3 with -F 2)');
+        WriteLn('  -F, --format N         the sylz block format: 4 (default; 5 with -ec) or 2');
         WriteLn('  --time SECONDS         least time per measurement, default 1');
         WriteLn('  -b, --block-size MIB   blocks of MIB, as syc c makes them; default: FILE as');
         WriteLn('                         one block (up to ', MAX_BLOCK shr 20, ' MiB)');
@@ -807,6 +810,7 @@ begin
         end;
       oSize: opts.rawSize := IntArg(shown, value, 0, MAX_BLOCK);
       oAll: opts.allVersions := True;
+      oNull: opts.nullSep := True;
       oLong: opts.longList := True;
       oSkip: opts.skipExisting := True;
       oUntil:

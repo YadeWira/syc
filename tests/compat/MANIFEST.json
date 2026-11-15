@@ -1,0 +1,22 @@
+{
+ "password": "compat",
+ "stream": "9b2c95776d0132593ef05fcd82fa88369578e749e6c796395596ba1a80fe20ee",
+ "versions": [
+  {
+   "tree/": "dir",
+   "tree/empty": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 1767341045",
+   "tree/random.bin": "6888038581ce0ca4ca2202e3ca3b8b0e36001f7c0256c6f7eb7fa8e18515a4e0 1767341045",
+   "tree/sub/": "dir",
+   "tree/sub/again.txt": "a1345320e22d98e27ff11c114cd344d1c05b9236749905cf3ccc7a8f46e6e3b4 1767341045",
+   "tree/text.txt": "f19737b554b114391226ac30e781e7cb61f321dd4fec96246a1c9078ad232aca 1767341045"
+  },
+  {
+   "tree/": "dir",
+   "tree/empty": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 1767341045",
+   "tree/sub/": "dir",
+   "tree/sub/again.txt": "a1345320e22d98e27ff11c114cd344d1c05b9236749905cf3ccc7a8f46e6e3b4 1767341045",
+   "tree/sub/new.txt": "ae1d2af33632fd47fa8437fca3767b3efaa9dd4b04cf4e4e031e2afe54a627e6 1767341045",
+   "tree/text.txt": "88526548d99267ed51a74f14942dfec8b22af4f28bf51138b5bbede6bd86e1eb 1767341045"
+  }
+ ]
+}

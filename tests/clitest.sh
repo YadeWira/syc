@@ -55,6 +55,12 @@ cmp -s back data || { echo "FAIL: decompress does not give the file back"; fail=
 check "add" 0 "$SYC" add -q w.syc tree
 check "list" 0 "$SYC" list w.syc
 has "list" out.txt '^tree/sub/two'
+has "list: a directory ends with /" out.txt '^tree/sub/$'
+check "l --null" 0 "$SYC" l --null w.syc
+"${PYTHON:-python3}" -c 'import sys; d = open("out.txt", "rb").read(); sys.exit(not (d.endswith(b"\0") and b"\n" not in d and b"tree/sub/two\0" in d))' \
+  || { echo "FAIL: l --null: not NUL-terminated entries"; fail=1; }
+check "syc h k: its password options" 0 "$SYC" h k
+has "syc h k: --new-password" out.txt '--new-password=PASSWORD'
 check "extract" 0 "$SYC" extract -q -o ox w.syc
 cmp -s ox/tree/sub/two data || { echo "FAIL: extract does not give the file back"; fail=1; }
 

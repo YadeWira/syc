@@ -29,6 +29,12 @@ the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
+**Compatibility:** every later syc reads what an earlier one wrote, back
+to 0.2.2; a frozen format never changes; `syc a` appends in the archive's
+own format. CI reads files written by the released binaries of 0.2.2 to
+0.9.0 (`tests/compat/`) on every platform. The whole promise:
+[Versioning and releases](https://github.com/YadeWira/syc/wiki/Versioning-and-releases#compatibility).
+
 ## Goals
 
 "Modest hardware" is taken literally:
