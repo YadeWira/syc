@@ -243,7 +243,7 @@ check "stream version 5: d" 0 sh -c "'$SYC' d -q -pS3cret -O '$e3/s5.sylz' > e5.
 cmp -s e5.out "$e3/tree/a" || { echo "FAIL: stream version 5: not the same data"; fail=1; }
 cp "$e3/arc3.syc" a3.syc
 check "format 3: a, a third version" 0 "$SYC" a -q -pS3cret a3.syc tree
-check "format 3: still format 3" 0 sh -c "head -c 5 a3.syc | tail -c 1 | od -An -tu1 | grep -qx ' *3'"
+check "format 3: still format 3" 0 python3 -c "import sys; sys.exit(open('a3.syc', 'rb').read(5)[4] != 3)"
 check "format 3: k" 0 "$SYC" k -q -pS3cret --new-password=N3w a3.syc
 check "format 3: the reference reader" 0 python3 -I "$here/tools/syc_ref.py" -pN3w t a3.syc
 
@@ -370,8 +370,12 @@ for name, tail in (('fe.syc', 24), ('fv.syc', 24), ('fs.sylz', 0)):
         open('fz-' + name, 'wb').write(d)
         run = subprocess.run([syc, 't', '-q', '-pS3cret', 'fz-' + name], capture_output=True)
         r = run.returncode
-        # (a slot's memory made larger: refused before any password, exit 4)
+        # (a slot's memory made larger: refused before any password, exit 4;
+        # the version byte turned into an unencrypted one: refused because
+        # a password was given, exit 2)
         if r == 4 and b'--kdf-mem-max' in run.stderr:
+            continue
+        if r == 2 and b'not encrypted, but a password was given' in run.stderr:
             continue
         if r != 3 and not (r == 1 and k >= len(orig) - tail):
             print('FAIL: %s: byte %d flipped: t exit %d' % (name, k, r)); bad += 1
