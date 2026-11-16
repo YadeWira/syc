@@ -61,12 +61,34 @@ has no sylz counterpart.
 - `bench/sylztable.pas` — derives SYLZ_TOKENS from sample blocks
 - `tests/sylzfuzz.pas` — roundtrip + corrupt/truncated input, guard-page buffers
 - `tests/fuzzarc.py` — damaged whole archives and streams through syc t/l/i/x/d
+- `bench/modest.sh` — speed and peak memory per level, threads, block size, key
 - `build.sh` — builds the CLI and the benchmark into `out/`
 - `legacy/rust/` — syc v0.1.x (Rust), with its own NOTES.md
 
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## Memory and speed on modest hardware (2026-11-16)
+
+`bench/modest.sh SYC INPUT DIR WORK [RUNNER]`: c/d at every level (one
+thread), c -b 1..64, a/x at -t 1/2/4, the key at --kdf-mem 8/64/256,
+from syc's own --stats. Run on x86-64 and i386 (one core of the Xeon,
+taskset), Windows 7 with the 32-bit exe (win7 VM, 8 vCPU) and arm64
+(emulated VM: memory only). Tables in the wiki's "Memory and speed".
+
+- Streams: ~15 MiB to compress, ~10 to decompress, any level (4 MiB
+  blocks: ~3.5 blocks to compress, ~2.5 to decompress); the optimal
+  parser adds a few MiB. 32-bit: same memory, 20-35% slower.
+- Archives, one thread: a 70-85 MiB, x 25-30 MiB (16 MiB blocks); a
+  keeps three 8 MiB hashing buffers, so a -b 1 is still 34 MiB.
+- Threads: TPipeline has 2·N slots, each a block plus its packed form:
+  a -t 4 260-330 MiB, x -t 4 ~180 MiB, c -t 8 162, d -t 8 102. By design
+  (keeps workers fed); documented: fewer threads or a smaller -b on a
+  machine short of memory.
+- Windows XP cannot run syc: BCryptGenRandom (bcrypt.dll) and
+  CreateSymbolicLinkW are static imports, both Vista+ (and
+  BCRYPT_USE_SYSTEM_PREFERRED_RNG is 7+). Windows 7 is the floor.
 
 ## Fuzzing whole archives and streams (2026-11-16)
 

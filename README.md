@@ -39,7 +39,11 @@ own format. CI reads files written by the released binaries of 0.2.2 to
 
 "Modest hardware" is taken literally:
 
-- bounded memory, small match-finder tables, reusable contexts;
+- bounded memory, small match-finder tables, reusable contexts: a stream
+  takes about 15 MiB to compress and 10 MiB to decompress at any level, an
+  archive with one thread 70–85 MiB to write and 25–30 MiB to extract
+  (each thread adds about two blocks; numbers per level, 64- and 32-bit,
+  in the wiki's [Memory and speed](https://github.com/YadeWira/syc/wiki/Memory-and-speed));
 - good on 1–4 cores rather than needing 16;
 - no AVX2 requirement: x86-64 baseline (SSE2) is enough;
 - 32-bit targets supported (the Pascal code paths run anywhere FPC does);
@@ -407,7 +411,8 @@ included.
 src/           sylz codec (sylz.pas, and sylzc.c: its C part), its Huffman
                coder (sylzhuf.pas), the syc CLI (syc.pas; sycdev.pas: bench,
                self-test, report; sycui.pas: terminal, colours, times)
-bench/         sylzbench, sylzstats (sequence histograms of a block)
+bench/         sylzbench, sylzstats (sequence histograms of a block), modest.sh
+               (speed and peak memory of every level, threads, block size)
 tests/         sylzfuzz, sylzedge, sylzvectors (test vectors for other decoders),
                arctest.sh and clitest.sh (the commands end to end)
 tools/         sylz_ref.py: a reference decoder in Python
