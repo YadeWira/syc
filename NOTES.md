@@ -60,12 +60,60 @@ has no sylz counterpart.
 - `bench/sylzstats.pas` — literal/match/offset histograms of a block
 - `bench/sylztable.pas` — derives SYLZ_TOKENS from sample blocks
 - `tests/sylzfuzz.pas` — roundtrip + corrupt/truncated input, guard-page buffers
+- `tests/fuzzarc.py` — damaged whole archives and streams through syc t/l/i/x/d
 - `build.sh` — builds the CLI and the benchmark into `out/`
 - `legacy/rust/` — syc v0.1.x (Rust), with its own NOTES.md
 
 Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
+
+## Fuzzing whole archives and streams (2026-11-16)
+
+`tests/fuzzarc.py SYC WORKDIR`: seeds of every format (archives of three
+versions: plain, -ec -9, -F 2, -F 2 -ec, several blocks, encrypted,
+--visible-names; seven streams; the 18 files of tests/compat/), damaged
+and run through t, l, i and x (streams: t, i, d) with a time and memory
+limit. Mutations: bytes (flips, edge values, u32s, cut, insert, splice,
+truncate, append), and through the format: a version's index re-emitted
+with a valid CRC-32, or sealed again with the key (hostile paths, a
+symlink with a file under it, counts in the billions, references and
+sizes out of range, order, types, times), and a block damaged with its
+CRC-32 or seal made valid (the fragment hashes must catch it). Checks:
+no signal, runtime error, hang or exit other than 0/1/3; x exit 0 gives
+one of the seed's versions; t ok means x ok; nothing written outside
+-o; agreement with tools/syc_ref.py (t's verdict and the last version).
+`--chk` runs every other case on a build with -Cr -Co -CR -Ct, `--vg` a
+share under valgrind on a build with -Facmem (the C heap, which memcheck
+sees). CI runs it a minute on Linux.
+
+Found and fixed:
+- **A stream with bytes after its end** was decoded as if they were not
+  there, exit 0, when not encrypted: `cat a.sylz b.sylz | syc d` gave a
+  alone. The format says nothing follows `end`; now exit 3 (it already
+  was for encrypted streams).
+- **`syc i`/`l` on a version time no date can show** (the version head
+  has no checksum of its own in format 2): "Invalid floating point
+  operation", exit 4. `FormatTime` shows `????-??-?? ??:??:??` outside
+  years 1-9999.
+- Range checks (harmless in the release build, where the value wrapped
+  and was refused anyway): a block size above 2^63 compared signed; a
+  reference step that could overflow Int64 (now checked before it is
+  added); a version number above 2^31 passed to Format.
+- **Paths not in UTF-8:** on Unix syc stores the bytes the system gives
+  (a Latin-1 name, say), as every version did; the wiki said UTF-8 and
+  the reference reader failed on them. Both now say and do the same
+  (surrogateescape in syc_ref.py).
+- sycdev's run generator wrapped a byte under -Cr (self-test only).
+
+Not changed: an index can put an entry under a file or a symlink (no
+writer makes one); t passes it, x cannot make that directory (exit 4) or
+symlink (exit 1). Nothing is written outside -o: symlinks are made last,
+and a directory on the way that is a symlink is skipped.
+
+The run: 60 minutes, 24 processes, about 958,000 cases (half on the
+checked build, 3% under valgrind, 30% and every index case against the
+reference reader): no findings after the fixes.
 
 ## Names on Windows; long paths; UTF-8 output; "\" on Unix (2026-11-15)
 

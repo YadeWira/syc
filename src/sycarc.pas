@@ -50,9 +50,20 @@ end;
 {$endif}
 
 function FormatTime(unixSec: Int64; seconds: Boolean): string;
+const
+  { years 1 to 9999, what TDateTime formats (a damaged or crafted
+    archive can hold any 64-bit time) }
+  FIRST = -62135596800 + 86400;
+  LAST = 253402300799 - 86400;
 var
   dt: TDateTime;
 begin
+  if (unixSec < FIRST) or (unixSec > LAST) then
+  begin
+    if seconds then
+      Exit('????-??-?? ??:??:??');
+    Exit('????-??-?? ??:??');
+  end;
   dt := UnixDateDelta + unixSec / 86400 - GetLocalTimeOffset / 1440;
   if seconds then
     Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', dt)
@@ -1255,7 +1266,7 @@ begin
   if fmt >= 2 then
     Move(head[0], v^.vhead[0], VHEAD_SIZE);
   if v^.vnum <> k + 1 then
-    Corrupt(Format('version %d numbered %d', [k + 1, v^.vnum]));
+    Corrupt(Format('version %d numbered %d', [k + 1, Int64(v^.vnum)]));
   { format 3: the time is in the index, the header's is 0 }
   if enc and (v^.time <> 0) then
     Corrupt(Format('version %d: bad header', [k + 1]));

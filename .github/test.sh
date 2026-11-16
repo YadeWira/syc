@@ -49,6 +49,13 @@ if [ -z "$WINDOWS" ]; then
   "$PY" tests/syc_vectors.py "$SYC" "$W/vectors" "$W/sample" >/dev/null
   "$PY" tools/syc_ref.py --check "$W/vectors"
 fi
+if [ "$(uname -s)" = Linux ]; then
+  # a minute of tests/fuzzarc.py (for hours: by hand, see its header)
+  echo '== fuzzarc: damaged archives and streams, one minute'
+  "$PY" tests/fuzzarc.py "$SYC" "$W/fuzzarc" --jobs 4 --minutes 1 --ref 0.2 > "$W/fuzzarc.out" ||
+    { cat "$W/fuzzarc.out" "$W/fuzzarc/fuzz.log"; exit 1; }
+  grep '^cases' "$W/fuzzarc.out"
+fi
 
 echo '== what released versions wrote (0.2.2 to 0.9.0), still read'
 if [ -n "$WINDOWS" ]; then

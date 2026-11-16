@@ -378,9 +378,11 @@ begin
         PutU64(aad, UInt64(blocks));
         if not OpenData(sealer.keys.aead, aad, nil, 0, @seal[0]) then
           Fail(EXIT_CORRUPT, name + ': the end does not authenticate (cut, or blocks added)');
-        if ReadFull(fin, @extra, 1) <> 0 then
-          Fail(EXIT_CORRUPT, name + ': bytes after the end');
       end;
+      { nothing follows the end (two streams joined with cat would
+        otherwise decode as the first one alone) }
+      if ReadFull(fin, @extra, 1) <> 0 then
+        Fail(EXIT_CORRUPT, name + ': bytes after the end');
     except
       on EReadError do
         Fail(EXIT_CORRUPT, name + ': truncated');

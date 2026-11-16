@@ -289,6 +289,17 @@ for F in 4 5; do
   check "c -F $F" 0 "$SYC" c -q -f -F $F -3 -o s$F.sylz "$first"
   check "t (format v$F stream)" 0 "$SYC" t -q s$F.sylz
 done
+# nothing follows a stream's end: two joined with cat are refused (they
+# decoded as the first one alone, exit 0, before 0.10.2)
+cat s4.sylz s5.sylz > joined.sylz
+check "t, two streams joined" 3 "$SYC" t -q joined.sylz
+check "d, two streams joined, from a pipe" 3 sh -c "'$SYC' d -q < joined.sylz > /dev/null"
+# a version's time out of what a date can show (damage: the version head
+# has no checksum of its own in format 2): i and l -u show ????, no crash
+cp t1.syc tt.syc
+python3 -c "import struct, sys; b = bytearray(open(sys.argv[1], 'rb').read()); struct.pack_into('<q', b, 16, (1 << 63) - 1); open(sys.argv[1], 'wb').write(b)" tt.syc
+check "i, a version time out of range" 0 "$SYC" i tt.syc
+grep -q '????-??-??' out.txt || { echo "FAIL: i, a version time out of range: no ????"; fail=1; }
 
 # refusals
 echo notanarchive > fake.syc

@@ -319,7 +319,7 @@ var
   r: TByteReader;
   count, i, k: SizeInt;
   v: UInt64;
-  sum, lastFrag, ref: Int64;
+  sum, lastFrag, ref, d: Int64;
   e: ^TEntry;
 begin
   idx := Default(TIndex);
@@ -330,7 +330,7 @@ begin
   for i := 0 to count - 1 do
   begin
     v := ReadVarint(r);
-    if (v < BLOCKHDR_SIZE + blockExtra) or (v > BLOCKHDR_SIZE + blockExtra + MAX_BLOCK) then
+    if (v < UInt64(BLOCKHDR_SIZE + blockExtra)) or (v > UInt64(BLOCKHDR_SIZE + blockExtra + MAX_BLOCK)) then
       Corrupt(r, 'block size');
     idx.blocks[i].bytes := v;
     v := ReadVarint(r);
@@ -412,7 +412,13 @@ begin
               ref := v;
             end
             else
-              ref := ref + 1 + UnZigZag(v);
+            begin
+              { the step checked before it is added: no overflow }
+              d := UnZigZag(v);
+              if (d < -ref) or (d > lastFrag - ref - 1) then
+                Corrupt(r, 'fragment reference');
+              ref := ref + 1 + d;
+            end;
             if (ref < 1) or (ref > lastFrag) then
               Corrupt(r, 'fragment reference');
             e^.refs[k] := ref;

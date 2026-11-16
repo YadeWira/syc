@@ -309,7 +309,7 @@ begin
     period := 1 + Rnd mod 7;
     v := Byte(Rnd);
     for k := 0 to len - 1 do
-      Result[at + k] := v + Byte(k mod period);
+      Result[at + k] := Byte(v + k mod period);
     Inc(at, len);
   end;
 end;

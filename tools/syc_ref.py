@@ -267,7 +267,14 @@ class Reader:
     def text(self, lo, hi, what):
         n = self.varint()
         need(lo <= n <= hi, what + ' length out of range')
-        return self.raw(n).decode('utf-8')
+        # UTF-8 as a rule; on Unix the bytes the system gave, which need
+        # not be: kept as they are (surrogateescape)
+        return self.raw(n).decode('utf-8', 'surrogateescape')
+
+
+def B(s):
+    """a path or target back to its bytes"""
+    return s.encode('utf-8', 'surrogateescape')
 
 
 def valid_path(p):
@@ -291,7 +298,7 @@ def parse_index(b, first_frag, max_frag, extra=0):
     for _ in range(r.varint()):
         path = r.text(1, 65535, 'path')
         need(valid_path(path), 'bad path')
-        need(not entries or entries[-1]['path'].encode() < path.encode(), 'paths out of order')
+        need(not entries or B(entries[-1]['path']) < B(path), 'paths out of order')
         e = {'path': path, 'type': r.byte()}
         entries.append(e)
         if e['type'] == DELETED:
@@ -470,7 +477,7 @@ def state_at(versions, n):
                 state.pop(e['path'], None)
             else:
                 state[e['path']] = e
-    return [state[p] for p in sorted(state, key=lambda s: s.encode())]
+    return [state[p] for p in sorted(state, key=B)]
 
 
 def describe(e, frag_data):
@@ -570,7 +577,7 @@ def main(argv):
             if argv[1] == 'l':
                 n = int(argv[3]) if len(argv) > 3 else len(versions)
                 for e in state_at(versions, n):
-                    print(json.dumps(describe(e, frags), ensure_ascii=False))
+                    sys.stdout.buffer.write(B(json.dumps(describe(e, frags), ensure_ascii=False)) + b'\n')
                 return 0
             if argv[1] == 'x' and len(argv) >= 4:
                 n = int(argv[4]) if len(argv) > 4 else len(versions)
