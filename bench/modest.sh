@@ -32,7 +32,7 @@ stats() {
     /^  time /        { t = $2 }
     /^  speed /       { si = $2; so = $5 }
     /^  peak memory / { m = $3; if ($4 == "GiB") m *= 1024; if ($4 == "KiB") m /= 1024 }
-    /^  (out \/ in|in \/ out) / { r = $NF; sub("%", "", r) }
+    /^  ratio /       { r = $2; sub("%", "", r) }
     END { printf "%s %s %s %s\n", t, (cmd == "d" ? so : si), m, r }' cmd="$1" <<< "$err"
 }
 

@@ -561,7 +561,7 @@ begin
     Exit;
   if not GetMeta(local, m) then
   begin
-    Warn(opts, local + ': cannot read, skipped');
+    Warn(opts, local + ': cannot read (' + SysErrorMessage(GetLastOSError) + '), skipped');
     status := Max(status, EXIT_WARN);
     SetLength(unreadPaths, Length(unreadPaths) + 1);
     unreadPaths[High(unreadPaths)] := stored;
@@ -1574,6 +1574,26 @@ begin
 end;
 
 { opens ARCHIVE, from stdin through a temporary copy }
+{ the file starts as a .sylz stream does }
+function StartsWithStreamMagic(const path: string): Boolean;
+var
+  f: TFileStream;
+  m: array[0..3] of Char;
+begin
+  Result := False;
+  try
+    f := TFileStream.Create(path, fmOpenRead or fmShareDenyNone);
+    try
+      Result := (f.Read(m, 4) = 4) and (m = 'SYZ0');
+    finally
+      f.Free;
+    end;
+  except
+    on EStreamError do
+      Result := False;
+  end;
+end;
+
 function OpenArchive(const path: string; out tmp: string; needData: Boolean;
   const opts: TOptions): TArchive;
 var
@@ -1591,6 +1611,9 @@ begin
       s.Free;
     end;
     try
+      if StartsWithStreamMagic(tmp) then
+        Fail(EXIT_USAGE, 'stdin holds a ' + '.sylz stream: syc i takes a stream as a FILE '
+          + '(syc t and syc d read one from stdin)');
       Result := TArchive.Open(tmp, '(stdin)', False, needData, opts);
     except
       { the copy of stdin goes with the failure (callers delete it once
@@ -2587,6 +2610,8 @@ begin
   x.opts := opts;
   x.status := EXIT_OK;
   x.outDir := opts.outPath;
+  if (x.outDir <> '') and PathExists(x.outDir) and not DirectoryExists(LongPath(x.outDir)) then
+    Fail(EXIT_USAGE, x.outDir + ': -o names a directory to extract into, not a file');
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
     filters[i - 1] := FilterPath(opts.operands[i]);

@@ -357,7 +357,14 @@ begin
     m.kind := ET_OTHER;
   if m.kind = ET_FILE then
     m.size := st.st_size;
-  m.mtime := Int64(st.st_mtime) * 1000000000 + Int64(st.{$ifdef darwin}st_mtimensec{$else}st_mtime_nsec{$endif});
+  { nanoseconds in an Int64 reach 1677..2262: a time outside is kept at
+    the nearest end, not wrapped around }
+  if Int64(st.st_mtime) >= High(Int64) div 1000000000 then
+    m.mtime := High(Int64) div 1000000000 * 1000000000
+  else if Int64(st.st_mtime) <= Low(Int64) div 1000000000 then
+    m.mtime := Low(Int64) div 1000000000 * 1000000000
+  else
+    m.mtime := Int64(st.st_mtime) * 1000000000 + Int64(st.{$ifdef darwin}st_mtimensec{$else}st_mtime_nsec{$endif});
   m.attrKind := AK_UNIX;
   m.attrs := st.st_mode and $FFF;
   m.uid := st.st_uid;

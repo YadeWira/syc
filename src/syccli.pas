@@ -654,8 +654,16 @@ begin
 end;
 
 function IntArg(const name, s: string; lo, hi: Integer): Integer;
+var
+  i: Integer;
+  digits: Boolean;
 begin
-  if not TryStrToInt(s, Result) or (Result < lo) or (Result > hi) then
+  { decimal digits only (TryStrToInt also takes $4, 0x4 and spaces) }
+  digits := (s <> '') and (Length(s) <= 9);
+  for i := 1 to Length(s) do
+    if not (s[i] in ['0'..'9']) and not ((i = 1) and (s[i] = '-') and (Length(s) > 1)) then
+      digits := False;
+  if not digits or not TryStrToInt(s, Result) or (Result < lo) or (Result > hi) then
     UsageError(Format('%s takes a number %d..%d, not "%s"', [name, lo, hi, s]));
 end;
 
@@ -695,8 +703,10 @@ var
   hasValue, noMore: Boolean;
   progressSet: Integer;   { -1: not given }
   paths: string;
+  fmtEc: Integer;         { the last -F: 1 an -ec format (3, 5), 0 not, -1 none }
 begin
   progressSet := -1;
+  fmtEc := -1;
   { SYC_PATHS first, so that syc -V tells what it selects; a wrong value
     is reported below }
   paths := SysUtils.GetEnvironmentVariable('SYC_PATHS');
@@ -721,8 +731,12 @@ begin
   arg := CmdArg(1);
   if (arg = '-h') or (arg = '--help') or (arg = 'h') or (arg = 'help') then
   begin
-    if (CmdArgCount >= 2) and (CommandOf(CmdArg(2)) <> #0) then
-      CmdUsage(CommandOf(CmdArg(2)))
+    if CmdArgCount >= 2 then
+    begin
+      if CommandOf(CmdArg(2)) = #0 then
+        UsageError('unknown command "' + CmdArg(2) + '"');
+      CmdUsage(CommandOf(CmdArg(2)));
+    end
     else
       Usage;
     CheckOutput;
@@ -842,11 +856,13 @@ begin
       oEc: opts.flags := opts.flags or SYLZ_ENTROPY;
       oFormat:
         { 2 and 4 are the plain formats, 3 and 5 those with -ec }
-        case IntArg(shown, value, 2, 5) of
-          2: opts.flags := opts.flags and not SYLZ_V4;
-          3: opts.flags := opts.flags and not SYLZ_V4 or SYLZ_ENTROPY;
-          4: opts.flags := opts.flags or SYLZ_V4;
-          5: opts.flags := opts.flags or SYLZ_V4 or SYLZ_ENTROPY;
+        begin
+          { the last -F decides; -ec adds entropy coding whatever -F says }
+          case IntArg(shown, value, 2, 5) of
+            2, 3: opts.flags := opts.flags and not SYLZ_V4;
+            4, 5: opts.flags := opts.flags or SYLZ_V4;
+          end;
+          fmtEc := Ord(value[Length(value)] in ['3', '5']);
         end;
       oBlock: opts.blockMiB := IntArg(shown, value, 1, MAX_BLOCK shr 20);
       oThreads: opts.threads := IntArg(shown, value, 1, MAX_THREADS);
@@ -917,8 +933,15 @@ begin
       oLevels: ParseLevels(shown, value, opts.benchLevels);
       oTime:
         begin
-          Val(value, opts.benchSeconds, k);
-          if (k <> 0) or (opts.benchSeconds < 0) or (opts.benchSeconds > 3600) then
+          { digits and a point only: Val takes "nan" and "inf", and
+            comparing a NaN raises }
+          k := 0;
+          for j := 1 to Length(value) do
+            if not (value[j] in ['0'..'9', '.']) then
+              k := j;
+          if (k = 0) and (value <> '') then
+            Val(value, opts.benchSeconds, k);
+          if (k <> 0) or (value = '') or (opts.benchSeconds > 3600) then
             UsageError(Format('%s takes seconds, 0..3600, not "%s"', [shown, value]));
         end;
       oStats: opts.stats := True;
@@ -945,6 +968,13 @@ begin
   end;
 
   SycDebug := opts.debug;
+  if fmtEc = 1 then
+    opts.flags := opts.flags or SYLZ_ENTROPY;
+  { a key that needs more memory than readers allow by default: each of
+    them will have to give --kdf-mem-max }
+  if opts.kdfMemSet and (opts.cmd in ['a', 'c', 'k']) and (opts.kdfMemMiB > 1024) then
+    WriteLn(StdErr, WarnTag, Format('--kdf-mem %d: reading it will need --kdf-mem-max %d '
+      + '(the default limit is 1024)', [opts.kdfMemMiB, opts.kdfMemMiB]));
   if (paths <> '') and not SetCodePaths(paths) then
     UsageError(Format('--paths (or SYC_PATHS) takes auto, c or pascal, not "%s"', [paths]));
   if (opts.flags and SYLZ_ENTROPY <> 0) and (opts.level > SYLZ_EC_MAXLEVEL) then

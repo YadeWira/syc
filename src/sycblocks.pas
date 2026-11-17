@@ -163,6 +163,7 @@ type
     procedure Add(n: Int64);
     procedure Show;
     procedure Finish;   { clears the line }
+    destructor Destroy; override;
   end;
 
   { Runs proc(0) .. proc(count - 1) on N threads (the calling one among
@@ -749,12 +750,24 @@ end;
 
 function Human(n: Double): string;
 begin
-  if n < 1e6 then
+  if n < 1e4 then
+    Result := Format('%.0f B', [n])
+  else if n < 1e6 then
     Result := Format('%.0f kB', [n / 1e3])
   else if n < 1e9 then
     Result := Format('%.1f MB', [n / 1e6])
   else
     Result := Format('%.2f GB', [n / 1e9]);
+end;
+
+var
+  { the progress line on screen, cleared before a warning is written }
+  current: TProgress = nil;
+
+procedure ClearCurrent;
+begin
+  if current <> nil then
+    current.Finish;
 end;
 
 constructor TProgress.Create(aEnabled: Boolean; aTotal: Int64);
@@ -767,6 +780,11 @@ begin
   { a bar only where the line is rewritten in place and there is room }
   if enabled and IsTerminal(2) then
     columns := TermWidth(2);
+  if enabled then
+  begin
+    current := Self;
+    BeforeMessage := @ClearCurrent;
+  end;
 end;
 
 procedure TProgress.Add(n: Int64);
@@ -819,13 +837,21 @@ begin
     pct := -1;
     tail := Human(done) + '  ' + Human(speed) + '/s';
   end;
+  { a narrow terminal: the line must not wrap (each rewrite would leave
+    a line behind); the time left goes first, then the speed }
+  if (columns > 0) and (2 + DisplayWidth(tail) > columns - 1) and (total > 0) then
+  begin
+    tail := Format('%3d%%  %s', [pct, Human(done)]);
+    if 2 + DisplayWidth(tail) > columns - 1 then
+      tail := Format('%3d%%', [pct]);
+  end;
   { the file's name, then the bar in the room left (on a terminal) }
   head := '';
   bar := '';
   if columns > 0 then
   begin
     room := columns - 1 - DisplayWidth(tail) - 2;
-    if title <> '' then
+    if (title <> '') and (room >= 12) then
     begin
       nameW := Min(DisplayWidth(title), Max(8, room div 3));
       head := Ellipsize(2, title, nameW);
@@ -848,6 +874,13 @@ begin
     line := line + StringOfChar(' ', width - DisplayWidth(line));
   width := Max(width, DisplayWidth(line));
   Write(StdErr, #13, line);
+end;
+
+destructor TProgress.Destroy;
+begin
+  if current = Self then
+    current := nil;
+  inherited Destroy;
 end;
 
 procedure TProgress.Finish;

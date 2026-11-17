@@ -173,27 +173,33 @@ end;
 function RunBenchCommand(const opts: TOptions): Integer;
 var
   levels: TIntArray;
-  i: Integer;
+  i, nDone: Integer;
 begin
   levels := opts.benchLevels;
   if opts.levelSet then
-  begin
-    SetLength(levels, Length(levels) + 1);
-    levels[High(levels)] := opts.level;
-  end;
+    levels := [opts.level];   { -N: only level N, as the help says }
   if Length(levels) = 0 then
   begin
     SetLength(levels, SYLZ_MAXLEVEL - SYLZ_MINLEVEL + 1);
     for i := 0 to High(levels) do
       levels[i] := SYLZ_MINLEVEL + i;
   end;
+  Result := EXIT_OK;
+  nDone := 0;
   for i := 0 to High(opts.operands) do
   begin
-    if i > 0 then
+    { a file that is not there is skipped, as c and t skip it }
+    if not FileExists(opts.operands[i]) then
+    begin
+      WriteLn(StdErr, WarnTag, Shown(2, opts.operands[i]), ': cannot open, skipped');
+      Result := EXIT_WARN;
+      Continue;
+    end;
+    if nDone > 0 then
       WriteLn;
     BenchFile(opts, opts.operands[i], levels, UInt64(Round(opts.benchSeconds * 1e9)));
+    Inc(nDone);
   end;
-  Result := EXIT_OK;
 end;
 
 { ── syc s ──────────────────────────────────────────────────────────────── }

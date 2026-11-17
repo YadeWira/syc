@@ -139,7 +139,7 @@ has "b: a row per level" out.txt '^ *3  *[0-9][0-9]*  *[0-9.]*%  *[0-9.]* MB/s  
 check "b -ec -N -b" 0 "$SYC" b -ec -1 -b 1 --time 0 data data
 [ "$(grep -c 'MB/s' out.txt)" = 2 ] || { echo "FAIL: b -1 on two files did not print 2 rows"; cat out.txt; fail=1; }
 has "b -ec" out.txt 'sylz format v5'
-check "b on a missing file" 4 "$SYC" b --time 0 no-such-file
+check "b on a missing file" 1 "$SYC" b --time 0 no-such-file
 check "b, wrong levels" 2 "$SYC" b --levels 3-1 data
 check "b without a file" 2 "$SYC" b
 

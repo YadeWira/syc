@@ -29,6 +29,11 @@ procedure SetColorMode(mode: TColorMode);
 function UseColor(std: Integer): Boolean;
 { s in a style, for stdout (1) or stderr (2); s itself without colours }
 function Paint(std: Integer; st: TStyle; const s: string): string;
+var
+  { called before an error or a warning is written: a progress line
+    clears itself, so the message starts on a clean line }
+  BeforeMessage: procedure = nil;
+
 { the start of an error or a warning on stderr: "✗ " / "⚠ " on a
   terminal that shows Unicode, else "syc: " }
 function ErrTag: string;
@@ -121,7 +126,7 @@ procedure ShowPhases;
 
 { --stats: what a command read and wrote }
 procedure StatAdd(bytesIn, bytesOut: Int64);
-procedure ShowStats(threads: Integer; startNs: UInt64);
+procedure ShowStats(threads: Integer; startNs: UInt64; compressing: Boolean);
 
 implementation
 
@@ -170,9 +175,16 @@ begin
 end;
 
 function IsTerminal(std: Integer): Boolean;
+{$ifdef windows}
+var
+  mode: DWORD;
+{$endif}
 begin
 {$ifdef windows}
-  Result := GetFileType(StdHandle(std)) = FILE_TYPE_CHAR;
+  { a console: a character device that has a console mode (NUL is a
+    character device too, but not a console) }
+  Result := (GetFileType(StdHandle(std)) = FILE_TYPE_CHAR)
+    and GetConsoleMode(StdHandle(std), mode);
 {$else}
   Result := IsATTY(StdHandle(std)) = 1;
 {$endif}
@@ -328,6 +340,8 @@ end;
 
 function ErrTag: string;
 begin
+  if Assigned(BeforeMessage) then
+    BeforeMessage;
   if Fancy(2) then
     Result := MarkOf(2, mkErr) + ' '
   else
@@ -336,6 +350,8 @@ end;
 
 function WarnTag: string;
 begin
+  if Assigned(BeforeMessage) then
+    BeforeMessage;
   if Fancy(2) then
     Result := MarkOf(2, mkWarn) + ' '
   else
@@ -583,7 +599,8 @@ var
   secs: Double;
 begin
   secs := (NowNs - startNs) / 1e9;
-  if (n > 0) and (secs >= 0.001) then
+  { under a megabyte or a twentieth of a second, a speed says nothing }
+  if (n >= 1000000) and (secs >= 0.05) then
     Result := HumanSpeed(n, secs)
   else
     Result := '';
@@ -770,7 +787,7 @@ begin
   Inc(statOut, bytesOut);
 end;
 
-procedure ShowStats(threads: Integer; startNs: UInt64);
+procedure ShowStats(threads: Integer; startNs: UInt64; compressing: Boolean);
 var
   secs: Double;
   mem: Int64;
@@ -785,11 +802,12 @@ begin
   WriteLn(StdErr, Paint(2, stHead, 'stats'));
   Row('in', Format('%d bytes (%s)', [statIn, HumanSize(statIn)]));
   Row('out', Format('%d bytes (%s)', [statOut, HumanSize(statOut)]));
-  { the compressed side over the other, whichever way the data went }
-  if (statIn > 0) and (statOut <= statIn) then
-    Row('out / in', Format('%.2f%%', [statOut * 100.0 / statIn]))
-  else if statOut > 0 then
-    Row('in / out', Format('%.2f%%', [statIn * 100.0 / statOut]));
+  { the compressed size over the raw one: out over in when compressing,
+    in over out when decompressing (also when one grew) }
+  if compressing and (statIn > 0) then
+    Row('ratio', Format('%.2f%% (out / in)', [statOut * 100.0 / statIn]))
+  else if not compressing and (statOut > 0) then
+    Row('ratio', Format('%.2f%% (in / out)', [statIn * 100.0 / statOut]));
   Row('time', HumanTime(secs));
   if secs >= 0.001 then
     Row('speed', Format('%s in, %s out', [HumanSpeed(statIn, secs), HumanSpeed(statOut, secs)]));

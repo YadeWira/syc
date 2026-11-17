@@ -78,7 +78,7 @@ begin
   if ExitCode <> EXIT_USAGE then
   begin
     if opts.stats then
-      ShowStats(opts.threads, t0);
+      ShowStats(opts.threads, t0, opts.cmd in ['a', 'c']);
     ShowPhases;
   end;
   { stderr written out before the RTL closes stdout (whose failure would
