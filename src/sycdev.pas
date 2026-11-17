@@ -214,7 +214,14 @@ begin
     Inc(stFailed);
   if stSilent or (ok and (stVerbosity = vQuiet)) then
     Exit;
-  if ok then
+  if Fancy(1) then
+  begin
+    if ok then
+      WriteLn(Paint(1, stOk, '✓'), ' ', stPrefix, what)
+    else
+      WriteLn(Paint(1, stErr, '✗ FAILED'), ' ', stPrefix, what);
+  end
+  else if ok then
     WriteLn(Paint(1, stOk, 'ok     '), stPrefix, what)
   else
     WriteLn(Paint(1, stErr, 'FAILED '), stPrefix, what);
@@ -927,6 +934,11 @@ begin
     Result := Format('ok: %d checks passed in %s', [stPassed, HumanTime((NowNs - startNs) / 1e9)])
   else
     Result := Format('FAILED: %d of %d checks failed', [stFailed, stPassed + stFailed]);
+  if Fancy(1) then
+    if stFailed = 0 then
+      Result := '✓ ' + Result
+    else
+      Result := '✗ ' + Result;
 end;
 
 function RunSelfTestCommand(const opts: TOptions): Integer;

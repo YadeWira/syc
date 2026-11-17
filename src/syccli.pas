@@ -275,13 +275,88 @@ begin
         [BUILD_COMMIT, BUILD_DATE, BUILD_FPC, BUILD_TARGET, CodePathsInUse]);
 end;
 
-procedure Usage;
+{ ── help ───────────────────────────────────────────────────────────────── }
 
-  procedure Head(const title: string);
+const
+  OPT_COL = 26;   { where an option's text starts }
+
+{ the width help is wrapped to: the terminal's, at most 100 }
+function HelpWidth: Integer;
+begin
+  if IsTerminal(1) then
+    Result := TermWidth(1)
+  else
+    Result := 80;
+  if Result > 100 then
+    Result := 100;
+end;
+
+{ text wrapped at the help's width, its lines starting at column indent;
+  the first line starts at column first (where the cursor already is) }
+procedure Wrapped(const text: string; first, indent: Integer);
+var
+  words: TStringArray;
+  col, i: Integer;
+begin
+  words := text.Split([' '], TStringSplitOptions.ExcludeEmpty);
+  col := first;
+  for i := 0 to High(words) do
+  begin
+    if (col > indent) and (col + 1 + DisplayWidth(words[i]) > HelpWidth) then
+    begin
+      WriteLn;
+      Write(StringOfChar(' ', indent));
+      col := indent;
+    end
+    else if col > indent then
+    begin
+      Write(' ');
+      Inc(col);
+    end;
+    Write(words[i]);
+    Inc(col, DisplayWidth(words[i]));
+  end;
+  WriteLn;
+end;
+
+procedure Section(const title: string);
+begin
+  WriteLn;
+  WriteLn(Paint(1, stHead, title));
+end;
+
+{ "  -t, --threads N        what it does ..." }
+procedure Opt(const flags, text: string);
+var
+  w: Integer;
+begin
+  w := 2 + DisplayWidth(flags);
+  Write('  ', Paint(1, stOk, flags));
+  if w + 2 > OPT_COL then
   begin
     WriteLn;
-    WriteLn(Paint(1, stHead, title));
-  end;
+    Write(StringOfChar(' ', OPT_COL));
+  end
+  else
+    Write(StringOfChar(' ', OPT_COL - w));
+  Wrapped(text, OPT_COL, OPT_COL);
+end;
+
+procedure Para(const text: string);
+begin
+  Write('  ');
+  Wrapped(text, 2, 2);
+end;
+
+{ "syc a — what it does", then "Usage: syc a [options] ARCHIVE PATH..." }
+procedure Title(cmd: Char; const args, what: string);
+begin
+  WriteLn(Paint(1, stHead, 'syc ' + cmd), ' — ', what);
+  WriteLn;
+  WriteLn(Paint(1, stHead, 'Usage: '), Paint(1, stOk, 'syc ' + cmd), ' ', args);
+end;
+
+procedure Usage;
 
   procedure Cmd(const cmd, args, what: string);
   begin
@@ -290,18 +365,18 @@ procedure Usage;
 
 begin
   WriteLn(Paint(1, stHead, 'syc ' + SYC_VERSION), ' — sylz archiver and compressor. Tuned for modest hardware.');
-  Head('Archives (.syc: files and directories, versions, deduplicated)');
+  Section('Archives (.syc: files and directories, versions, deduplicated)');
   Cmd('syc a, add', '[options] ARCHIVE PATH...', 'a new archive, or a new version');
   Cmd('syc x, extract', '[options] ARCHIVE [FILTER...]', 'extract');
   Cmd('syc l, list', '[options] ARCHIVE [FILTER...]', 'list');
-  Head('One file (.sylz stream; no FILE or -: stdin to stdout)');
+  Section('One file (.sylz stream; no FILE or -: stdin to stdout)');
   Cmd('syc c, compress', '[options] [FILE...]', 'FILE to FILE' + STREAM_SUFFIX);
   Cmd('syc d, decompress', '[options] [FILE...]', 'FILE' + STREAM_SUFFIX + ' to FILE');
-  Head('Archives and streams');
+  Section('Archives and streams');
   Cmd('syc t, test', '[options] [FILE...]', 'check them, write nothing');
   Cmd('syc i, info', '[options] FILE', 'versions, blocks, sizes, deduplication');
   Cmd('syc k, key', '[options] FILE...', 'change the password of encrypted ones');
-  Head('This build, on this machine');
+  Section('This build, on this machine');
   Cmd('syc b, bench', '[options] FILE...', 'speed and ratio of each level, in memory');
   Cmd('syc s, selftest', '', 'check that this build works here');
   Cmd('syc r, report', '', 'what to paste into a bug report');
@@ -309,79 +384,73 @@ begin
   Cmd('syc h CMD', '(or syc CMD -h)', 'a command''s options');
   Cmd('syc -V', '(or --version)', 'the version and the build');
   WriteLn;
-  WriteLn('Every command takes -q / -v, --color auto|always|never, --debug and');
-  WriteLn('--paths auto|c|pascal; a, x, c, d and t also --stats and --progress.');
-  WriteLn('An ARCHIVE of - is stdin (stdout for a new one). Exit status: 0 ok,');
-  WriteLn('1 something skipped or unreadable, 2 usage, 3 corrupt data, 4 I/O error');
-  WriteLn('or out of memory.');
+  Wrapped('Every command takes -q / -v, --color auto|always|never, --debug and '
+    + '--paths auto|c|pascal; a, x, c, d and t also --stats and --progress. '
+    + 'An ARCHIVE of - is stdin (stdout for a new one).', 0, 0);
+  WriteLn;
+  WriteLn(Paint(1, stHead, 'Exit status: '), '0 ok, 1 something skipped or unreadable, 2 usage,');
+  WriteLn('  3 corrupt data, 4 I/O error or out of memory');
 end;
 
 procedure LevelUsage;
 begin
-  WriteLn('  -0 .. -', SYLZ_MAXLEVEL, ', --level N');
-  WriteLn('              level: 0 fastest .. ', SYLZ_MAXLEVEL, ' best ratio, default ',
-    SYLZ_DEFLEVEL);
-  WriteLn('              (0-1 single hash, 2-3 two hashes, 4-8 hash chains,');
-  WriteLn('              9-10 optimal parsing)');
-  WriteLn('  -ec, --ec   extra compression: entropy-coded literals (sylz format v5;');
-  WriteLn('              v3 with -F 2), smaller, slower to decode; levels 0..', SYLZ_EC_MAXLEVEL, ':');
-  WriteLn('              0-8 parse as -', SYLZ_EC_SHIFT, '..-', SYLZ_MAXLEVEL,
-    ' do, 9-10 price literals by their Huffman codes');
-  WriteLn('  -F, --format N   the sylz block format: 4 (default; 5 with -ec), read by');
-  WriteLn('              syc 0.7.0 and later; or 2 (3 with -ec), larger and slower');
-  WriteLn('              but read by every syc since 0.2.14');
+  Opt('-0 .. -' + IntToStr(SYLZ_MAXLEVEL) + ', --level N',
+    Format('level: 0 fastest .. %d best ratio, default %d (0-1 single hash, 2-3 two hashes, '
+      + '4-8 hash chains, 9-10 optimal parsing)', [SYLZ_MAXLEVEL, SYLZ_DEFLEVEL]));
+  Opt('-ec, --ec', Format('extra compression: entropy-coded literals (sylz format v5; v3 with -F 2), '
+    + 'smaller, slower to decode; levels 0..%d: 0-8 parse as -%d..-%d do, 9-10 price literals '
+    + 'by their Huffman codes', [SYLZ_EC_MAXLEVEL, SYLZ_EC_SHIFT, SYLZ_MAXLEVEL]));
+  Opt('-F, --format N', 'the sylz block format: 4 (default; 5 with -ec), read by syc 0.7.0 and '
+    + 'later; or 2 (3 with -ec), larger and slower but read by every syc since 0.2.14');
 end;
 
 procedure PasswordUsage(cmd: Char);
 begin
   if cmd in ['a', 'c'] then
   begin
-    WriteLn('  -p, --password         encrypt (XChaCha20-Poly1305, key from Argon2id); the');
-    WriteLn('                         password comes from -pPASSWORD / --password=PASSWORD');
-    WriteLn('                         (seen by other users: avoid), --password-file FILE,');
-    WriteLn('                         SYC_PASSWORD, else the terminal');
-    WriteLn('  --kdf-mem MIB          Argon2id''s memory, default 64');
+    Opt('-p, --password', 'encrypt (XChaCha20-Poly1305, key from Argon2id); the password comes '
+      + 'from -pPASSWORD / --password=PASSWORD (seen by other users: avoid), --password-file FILE, '
+      + 'SYC_PASSWORD, else the terminal');
+    Opt('--kdf-mem MIB', 'Argon2id''s memory, default 64');
     if cmd = 'a' then
-      WriteLn('  --visible-names        encrypt the data only: names, sizes, dates stay listable');
+      Opt('--visible-names', 'encrypt the data only: names, sizes, dates stay listable');
   end
   else if cmd in ['x', 'l', 'i', 't', 'd'] then
-    WriteLn('  -pPASSWORD, --password-file FILE   for encrypted files (or SYC_PASSWORD, or asked)')
+    Opt('-pPASSWORD, --password-file FILE', 'for encrypted files (or SYC_PASSWORD, or asked)')
   else if cmd = 'k' then
   begin
-    WriteLn('  -pPASSWORD, --password-file FILE   the current password (or SYC_PASSWORD,');
-    WriteLn('                         or asked)');
-    WriteLn('  --new-password=PASSWORD, --new-password-file FILE   the new one (or');
-    WriteLn('                         SYC_NEW_PASSWORD, or asked twice)');
-    WriteLn('  --kdf-mem MIB          Argon2id''s memory for the new password, default: as');
-    WriteLn('                         the current one''s');
+    Opt('-pPASSWORD, --password-file FILE', 'the current password (or SYC_PASSWORD, or asked)');
+    Opt('--new-password=PASSWORD, --new-password-file FILE',
+      'the new one (or SYC_NEW_PASSWORD, or asked twice)');
+    Opt('--kdf-mem MIB', 'Argon2id''s memory for the new password, default: as the current one''s');
   end;
   if cmd in ['a', 'x', 'l', 'i', 't', 'd', 'k'] then
-    WriteLn('  --kdf-mem-max MIB      refuse files whose key needs more memory, default 1024');
+    Opt('--kdf-mem-max MIB', 'refuse files whose key needs more memory, default 1024');
 end;
 
 { the options every command takes }
-procedure CommonUsage;
+procedure CommonUsage(cmd: Char);
 begin
-  WriteLn('  --color WHEN           colours: auto (on a terminal, unless NO_COLOR is set),');
-  WriteLn('                         always, never');
-  WriteLn('  --debug                an error says its kind and where it happened; the');
-  WriteLn('                         time each phase took, at the end');
-  WriteLn('  --paths WHICH          auto: the fastest code built in; c: C instead of');
-  WriteLn('                         assembler; pascal: the reference Pascal only (the');
-  WriteLn('                         same bytes, slower: to tell a fast path''s bug from');
-  WriteLn('                         a format''s). Also SYC_PATHS');
-end;
-
-procedure ProgressUsage(cmd: Char);
-begin
-  PasswordUsage(cmd);
+  Section('Output');
+  Opt('-q, --quiet', 'only errors and warnings');
+  Opt('-v, --verbose', 'more detail: exact bytes, every step');
   if cmd in ['a', 'x', 'c', 'd', 't'] then
   begin
-    WriteLn('  --progress, --no-progress   progress on stderr (default: if it is a terminal)');
-    WriteLn('  --stats                at the end: bytes in and out, time, speed, threads,');
-    WriteLn('                         peak memory');
+    Opt('--progress, --no-progress', 'progress on stderr (default: if it is a terminal)');
+    Opt('--stats', 'at the end: bytes in and out, time, speed, threads, peak memory');
   end;
-  CommonUsage;
+  Opt('--color WHEN', 'colours: auto (on a terminal, unless NO_COLOR is set), always, never');
+  Opt('--debug', 'an error says its kind and where it happened; the time each phase took, '
+    + 'at the end');
+  Opt('--paths WHICH', 'auto: the fastest code built in; c: C instead of assembler; pascal: '
+    + 'the reference Pascal only (the same bytes, slower: to tell a fast path''s bug from '
+    + 'a format''s). Also SYC_PATHS');
+end;
+
+procedure EncryptionUsage(cmd: Char);
+begin
+  Section('Encryption');
+  PasswordUsage(cmd);
 end;
 
 procedure CmdUsage(cmd: Char);
@@ -389,172 +458,172 @@ begin
   case cmd of
     'a':
       begin
-        WriteLn('syc a [options] ARCHIVE PATH...   add files and directories (recursively):');
-        WriteLn('                                  a new ARCHIVE, or a new version at the end');
-        WriteLn('                                  of an existing one with what changed since');
-        WriteLn('                                  its last version; - writes a new one to stdout');
+        Title(cmd, '[options] ARCHIVE PATH...', 'add files and directories (recursively)');
         WriteLn;
+        Para('A new ARCHIVE, or a new version at the end of an existing one with what changed '
+          + 'since its last version; - writes a new one to stdout. Paths are stored relative: '
+          + 'a leading / or drive letter is dropped, and a path with .. is refused (use -C).');
+        Section('Compression');
         LevelUsage;
-        WriteLn('  -b, --block-size MIB   solid block size, default ', DEFAULT_ARCHIVE_BLOCK_MIB,
-          ', 1..', MAX_BLOCK shr 20);
-        WriteLn('  -t, --threads N        blocks compressed N at a time, default 1');
-        WriteLn('                         (the archive is the same whatever N)');
-        WriteLn('  -C, --cd DIR           PATHs are relative to DIR (stored without it)');
-        WriteLn('  -X, --exclude PATTERN  skip what matches (repeatable): * and ? within');
-        WriteLn('                         a name, ** across directories; a PATTERN');
-        WriteLn('                         without / matches names, with / whole paths');
-        WriteLn('  --no-dedup             store repeated fragments again');
-        WriteLn('  --no-delete            what is gone from under the PATHs stays in the new');
-        WriteLn('                         version (by default it is marked deleted; older');
-        WriteLn('                         versions keep it either way: syc x -u)');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
-        WriteLn;
-        WriteLn('Paths are stored relative: a leading / or drive letter is dropped, and');
-        WriteLn('a path with .. is refused (use -C).');
+        Opt('-b, --block-size MIB', Format('solid block size, default %d, 1..%d',
+          [DEFAULT_ARCHIVE_BLOCK_MIB, MAX_BLOCK shr 20]));
+        Opt('-t, --threads N', 'blocks compressed N at a time, default 1 (the archive is the '
+          + 'same whatever N)');
+        Section('What goes in');
+        Opt('-C, --cd DIR', 'PATHs are relative to DIR (stored without it)');
+        Opt('-X, --exclude PATTERN', 'skip what matches (repeatable): * and ? within a name, '
+          + '** across directories; a PATTERN without / matches names, with / whole paths');
+        Opt('--no-dedup', 'store repeated fragments again');
+        Opt('--no-delete', 'what is gone from under the PATHs stays in the new version (by '
+          + 'default it is marked deleted; older versions keep it either way: syc x -u)');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'x':
       begin
-        WriteLn('syc x [options] ARCHIVE [FILTER...]   extract (everything, or what the');
-        WriteLn('                                      FILTERs select: as in syc l)');
+        Title(cmd, '[options] ARCHIVE [FILTER...]', 'extract');
         WriteLn;
-        WriteLn('  -o, --out DIR          extract under DIR, default the current directory');
-        WriteLn('  -f, --force            replace files that exist');
-        WriteLn('  --skip                 leave files that exist, silently');
-        WriteLn('                         (neither: they are left, with a warning, exit 1)');
-        WriteLn('  -O, --stdout           write the one selected file to stdout');
-        WriteLn('  -u, --until V          the archive as of version V (a number, or a date:');
-        WriteLn('                         YYYY-MM-DD[THH:MM[:SS]], local time)');
-        WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
-        WriteLn('  --no-perms             do not set permissions / attributes');
-        WriteLn('  --no-owner             do not set the owner (only root sets it anyway)');
-        WriteLn('  -t, --threads N        blocks decompressed N at a time, default 1');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
+        Para('Everything, or what the FILTERs select (as in syc l).');
+        Section('Where and how');
+        Opt('-o, --out DIR', 'extract under DIR, default the current directory');
+        Opt('-f, --force', 'replace files that exist');
+        Opt('--skip', 'leave files that exist, silently (neither: they are left, with a '
+          + 'warning, exit 1)');
+        Opt('-O, --stdout', 'write the one selected file to stdout');
+        Opt('-u, --until V', 'the archive as of version V (a number, or a date: '
+          + 'YYYY-MM-DD[THH:MM[:SS]], local time)');
+        Opt('-X, --exclude PATTERN', 'leave out what matches (repeatable)');
+        Opt('--no-perms', 'do not set permissions / attributes');
+        Opt('--no-owner', 'do not set the owner (only root sets it anyway)');
+        Opt('-t, --threads N', 'blocks decompressed N at a time, default 1');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'l':
       begin
-        WriteLn('syc l [options] ARCHIVE [FILTER...]   list the files (a FILTER is a path,');
-        WriteLn('                                      a directory with everything in it,');
-        WriteLn('                                      or a pattern as in -X)');
+        Title(cmd, '[options] ARCHIVE [FILTER...]', 'list the files');
         WriteLn;
-        WriteLn('  -l, --long             permissions, size, date (on a terminal sizes are');
-        WriteLn('                         rounded and a total follows; -v: exact bytes)');
-        WriteLn('  -u, --until V          as of version V (a number or a date, as in syc x)');
-        WriteLn('  --all                  every version of each path, deletions included');
-        WriteLn('  --null                 end each entry with a NUL byte, not a newline (for');
-        WriteLn('                         scripts: names may hold newlines; plain, no colours)');
-        WriteLn('  -X, --exclude PATTERN  leave out what matches (repeatable)');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
+        Para('A FILTER is a path, a directory with everything in it, or a pattern as in -X.');
+        Section('What and how');
+        Opt('-l, --long', 'permissions, size, date (on a terminal sizes are rounded and a '
+          + 'total follows; -v: exact bytes)');
+        Opt('-u, --until V', 'as of version V (a number or a date, as in syc x)');
+        Opt('--all', 'every version of each path, deletions included');
+        Opt('--null', 'end each entry with a NUL byte, not a newline (for scripts: names '
+          + 'may hold newlines; plain, no colours)');
+        Opt('-X, --exclude PATTERN', 'leave out what matches (repeatable)');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'i':
       begin
-        WriteLn('syc i [options] FILE   an archive: each version''s date, entries, data added,');
-        WriteLn('                       stored size, and the deduplication; a ', STREAM_SUFFIX, ' stream:');
-        WriteLn('                       its format, level, blocks and sizes (no password');
-        WriteLn('                       needed)');
+        Title(cmd, '[options] FILE', 'what an archive or a stream holds');
         WriteLn;
-        WriteLn('  -v, --verbose          exact bytes; an archive''s blocks per version, each');
-        WriteLn('                         block of a stream');
-        ProgressUsage(cmd);
+        Para('An archive: each version''s date, entries, data added, stored size, and the '
+          + 'deduplication. A ' + STREAM_SUFFIX + ' stream: its format, level, blocks and '
+          + 'sizes (no password needed). -v: exact bytes; an archive''s blocks per version, '
+          + 'each block of a stream.');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'b':
       begin
-        WriteLn('syc b [options] FILE...   benchmark: each FILE compressed and decompressed');
-        WriteLn('                          in memory at each level, on one thread; the best');
-        WriteLn('                          of the repetitions, in MB/s (10^6 bytes) of FILE');
+        Title(cmd, '[options] FILE...', 'benchmark');
         WriteLn;
-        WriteLn('  --levels LIST          levels to run: 1,4,9 or 0-10 or both; default all');
-        WriteLn('                         (-N: only level N)');
-        WriteLn('  -ec, --ec              entropy-coded literals (format v5; v3 with -F 2)');
-        WriteLn('  -F, --format N         the sylz block format: 4 (default; 5 with -ec) or 2');
-        WriteLn('  --time SECONDS         least time per measurement, default 1');
-        WriteLn('  -b, --block-size MIB   blocks of MIB, as syc c makes them; default: FILE as');
-        WriteLn('                         one block (up to ', MAX_BLOCK shr 20, ' MiB)');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        CommonUsage;
+        Para('Each FILE compressed and decompressed in memory at each level, on one thread; '
+          + 'the best of the repetitions, in MB/s (10^6 bytes) of FILE.');
+        Section('What to measure');
+        Opt('--levels LIST', 'levels to run: 1,4,9 or 0-10 or both; default all (-N: only '
+          + 'level N)');
+        Opt('-ec, --ec', 'entropy-coded literals (format v5; v3 with -F 2)');
+        Opt('-F, --format N', 'the sylz block format: 4 (default; 5 with -ec) or 2');
+        Opt('--time SECONDS', 'least time per measurement, default 1');
+        Opt('-b, --block-size MIB', Format('blocks of MIB, as syc c makes them; default: FILE '
+          + 'as one block (up to %d MiB)', [MAX_BLOCK shr 20]));
+        CommonUsage(cmd);
       end;
     's':
       begin
-        WriteLn('syc s [options]   self-test: the codec at every level and format through');
-        WriteLn('                  every code path built in (the same bytes from each),');
-        WriteLn('                  damaged input, the checksums, hashes and ciphers against');
-        WriteLn('                  known answers, and a stream and an archive written and');
-        WriteLn('                  read back in the temporary directory. Exit status 0, or');
-        WriteLn('                  4 when a check fails');
+        Title(cmd, '[options]', 'self-test');
         WriteLn;
-        WriteLn('  -q, --quiet            only the failures and the summary');
-        WriteLn('  -v, --verbose          every check');
-        CommonUsage;
+        Para('The codec at every level and format through every code path built in (the '
+          + 'same bytes from each), damaged input, the checksums, hashes and ciphers against '
+          + 'known answers, and a stream and an archive written and read back in the '
+          + 'temporary directory. Exit status 0, or 4 when a check fails. -q: only the '
+          + 'failures and the summary; -v: every check.');
+        CommonUsage(cmd);
       end;
     'r':
       begin
-        WriteLn('syc r [options]   report: this build (version, commit, compiler, target,');
-        WriteLn('                  code paths), this machine (system, CPU, memory), the');
-        WriteLn('                  SYC_* variables that are set (their names only) and the');
-        WriteLn('                  self-test''s result, to paste into a bug report at');
-        WriteLn('                  https://github.com/YadeWira/syc/issues');
+        Title(cmd, '[options]', 'what to paste into a bug report');
         WriteLn;
-        CommonUsage;
+        Para('This build (version, commit, compiler, target, code paths), this machine '
+          + '(system, CPU, memory), the SYC_* variables that are set (their names only) and '
+          + 'the self-test''s result, to paste into a bug report at '
+          + 'https://github.com/YadeWira/syc/issues');
+        CommonUsage(cmd);
       end;
     'c':
       begin
-        WriteLn('syc c [options] [FILE...]   compress: FILE -> FILE', STREAM_SUFFIX,
-          '; no FILE or -: stdin -> stdout');
+        Title(cmd, '[options] [FILE...]', 'compress');
         WriteLn;
+        Para('FILE ' + Arrow(1) + ' FILE' + STREAM_SUFFIX + '; no FILE or -: stdin '
+          + Arrow(1) + ' stdout.');
+        Section('Compression');
         LevelUsage;
-        WriteLn('  -b, --block-size MIB   block size, default ', DEFAULT_STREAM_BLOCK_MIB,
-          ', 1..', MAX_BLOCK shr 20);
-        WriteLn('  -t, --threads N        blocks compressed N at a time, default 1');
-        WriteLn('                         (the output is the same whatever N)');
-        WriteLn('  -o, --out FILE         output file (one FILE only); - is stdout');
-        WriteLn('  -O, --stdout           write to stdout');
-        WriteLn('  -f, --force            overwrite an existing output; write to a terminal');
-        WriteLn('  --rm                   delete FILE once it is compressed');
-        WriteLn('  --raw                  one bare sylz block (v4, v5 with -ec; -F 2: v2, v3),');
-        WriteLn('                         what the zpaq-std plugins'' compress() returns: no header,');
-        WriteLn('                         size or CRC; FILE up to ', MAX_BLOCK shr 20, ' MiB, -> FILE', RAW_SUFFIX);
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
+        Opt('-b, --block-size MIB', Format('block size, default %d, 1..%d',
+          [DEFAULT_STREAM_BLOCK_MIB, MAX_BLOCK shr 20]));
+        Opt('-t, --threads N', 'blocks compressed N at a time, default 1 (the output is the '
+          + 'same whatever N)');
+        Opt('--raw', Format('one bare sylz block (v4, v5 with -ec; -F 2: v2, v3), what the '
+          + 'zpaq-std plugins'' compress() returns: no header, size or CRC; FILE up to %d MiB, '
+          + '%s FILE%s', [MAX_BLOCK shr 20, Arrow(1), RAW_SUFFIX]));
+        Section('Where');
+        Opt('-o, --out FILE', 'output file (one FILE only); - is stdout');
+        Opt('-O, --stdout', 'write to stdout');
+        Opt('-f, --force', 'overwrite an existing output; write to a terminal');
+        Opt('--rm', 'delete FILE once it is compressed');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'd':
       begin
-        WriteLn('syc d [options] [FILE...]   decompress: FILE', STREAM_SUFFIX,
-          ' -> FILE; no FILE or -: stdin -> stdout');
+        Title(cmd, '[options] [FILE...]', 'decompress');
         WriteLn;
-        WriteLn('  -t, --threads N        blocks decompressed N at a time, default 1');
-        WriteLn('  -o, --out FILE         output file (one FILE only); - is stdout');
-        WriteLn('  -O, --stdout           write to stdout');
-        WriteLn('  -f, --force            overwrite an existing output');
-        WriteLn('  --rm                   delete FILE once it is decompressed');
-        WriteLn('  --raw --size N         FILE is one bare sylz block of N bytes decoded');
-        WriteLn('                         (syc c --raw; FILE', RAW_SUFFIX, ' -> FILE)');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
+        Para('FILE' + STREAM_SUFFIX + ' ' + Arrow(1) + ' FILE; no FILE or -: stdin '
+          + Arrow(1) + ' stdout.');
+        Section('Where and how');
+        Opt('-t, --threads N', 'blocks decompressed N at a time, default 1');
+        Opt('-o, --out FILE', 'output file (one FILE only); - is stdout');
+        Opt('-O, --stdout', 'write to stdout');
+        Opt('-f, --force', 'overwrite an existing output');
+        Opt('--rm', 'delete FILE once it is decompressed');
+        Opt('--raw --size N', 'FILE is one bare sylz block of N bytes decoded (syc c --raw; '
+          + 'FILE' + RAW_SUFFIX + ' ' + Arrow(1) + ' FILE)');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     'k':
       begin
-        WriteLn('syc k [options] FILE...   change the password of encrypted archives and');
-        WriteLn('                          streams in place, without recompressing: the data');
-        WriteLn('                          key is wrapped again; if interrupted, the old or');
-        WriteLn('                          the new password opens FILE, never neither');
+        Title(cmd, '[options] FILE...', 'change the password of encrypted files');
         WriteLn;
-        PasswordUsage(cmd);
-        WriteLn('  -q, --quiet / -v, --verbose');
-        CommonUsage;
+        Para('Archives and streams, in place, without recompressing: the data key is wrapped '
+          + 'again. If interrupted, the old or the new password opens FILE, never neither.');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
     't':
       begin
-        WriteLn('syc t [options] [FILE...]   check archives (.syc) and streams (', STREAM_SUFFIX, '),');
-        WriteLn('                            write nothing; no FILE or -: stdin');
-        WriteLn('                            (every block''s CRC-32; in an archive also the');
-        WriteLn('                            index and each fragment''s BLAKE2s-256)');
+        Title(cmd, '[options] [FILE...]', 'check archives and streams');
         WriteLn;
-        WriteLn('  -t, --threads N        blocks checked N at a time, default 1');
-        WriteLn('  --raw --size N         FILE is one bare sylz block of N bytes decoded');
-        WriteLn('  -q, --quiet / -v, --verbose');
-        ProgressUsage(cmd);
+        Para('Archives (.syc) and streams (' + STREAM_SUFFIX + '), writing nothing; no FILE '
+          + 'or -: stdin. Every block''s CRC-32 (or, encrypted, its tag); in an archive also '
+          + 'the index and each fragment''s BLAKE2s-256.');
+        Section('How');
+        Opt('-t, --threads N', 'blocks checked N at a time, default 1');
+        Opt('--raw --size N', 'FILE is one bare sylz block of N bytes decoded');
+        EncryptionUsage(cmd);
+        CommonUsage(cmd);
       end;
   end;
 end;

@@ -1710,8 +1710,8 @@ begin
       if appending then
       begin
         if opts.verbosity <> vQuiet then
-          WriteLn(StdErr, Format('%s: no changes (%d entries unchanged), no version added',
-            [arcPath, nSame]));
+          WriteLn(StdErr, Summary(2, mkOk, arcPath, ['no changes',
+            Count(nSame, 'entry', 'entries') + ' unchanged', 'no version added']));
         Exit(a.status);
       end;
       Warn(opts, 'nothing to add: no archive written');
@@ -1810,6 +1810,7 @@ begin
         if a.entries[i].kind = ET_FILE then
           Inc(total, a.entries[i].meta.size);
       a.prog := TProgress.Create(opts.progress, total);
+      a.prog.title := ExtractFileName(arcPath);
       Phase('a: read, hash, compress');
       SetWhere(arcPath, -1, -1);
       a.ReadAll;
@@ -1867,13 +1868,18 @@ begin
     StatAdd(a.totalIn, a.pos - vstart);
     if opts.verbosity <> vQuiet then
     begin
-      WriteLn(StdErr, Format('%s: version %d: %d files, %d directories, %d links added or changed, '
-        + '%d deleted, %d unchanged; %d bytes read, %d written, %d in repeated fragments',
-        [arcPath, vnum, a.nFiles, a.nDirs, a.nLinks, nDeleted, nSame, a.totalIn, a.pos - vstart,
-         a.dupBytes]));
-      WriteLn(StdErr, Format('%s: %s -> %s (%.2f%%)%s', [arcPath, HumanSize(a.totalIn),
-        HumanSize(a.pos - vstart), (a.pos - vstart) * 100.0 / Max(a.totalIn, 1),
-        TimeAndSpeed(a.totalIn, t0)]));
+      { what the new version added or changed, then the data }
+      WriteLn(StdErr, Summary(2, mkOk, arcPath, ['version ' + IntToStr(vnum),
+        Count(a.nFiles, 'file'), Count(a.nDirs, 'directory', 'directories'),
+        When(a.nLinks > 0, Count(a.nLinks, 'link')),
+        When(nDeleted > 0, IntToStr(nDeleted) + ' deleted'),
+        When(nSame > 0, IntToStr(nSame) + ' unchanged')]));
+      WriteLn(StdErr, Detail(2, [SizeChange(2, a.totalIn, a.pos - vstart),
+        When(a.dupBytes > 0, HumanSize(a.dupBytes) + ' repeated'),
+        Elapsed(t0), SpeedSince(a.totalIn, t0)]));
+      if opts.verbosity = vVerbose then
+        WriteLn(StdErr, Detail(2, [IntToStr(a.totalIn) + ' bytes read',
+          IntToStr(a.pos - vstart) + ' written', IntToStr(a.dupBytes) + ' in repeated fragments']));
     end;
     Result := a.status;
   except
@@ -2045,8 +2051,8 @@ begin
       Result := Max(Result, EXIT_WARN);
     end
     else if pretty and opts.longList and (opts.verbosity <> vQuiet) then
-      WriteLn(Paint(1, stDim, Format('%d entries, %d files, %s (%d bytes)',
-        [shown, shownFiles, HumanSize(shownBytes), shownBytes])));
+      WriteLn(Paint(1, stDim, Format('%s, %s, %s (%d bytes)',
+        [Count(shown, 'entry', 'entries'), Count(shownFiles, 'file'), HumanSize(shownBytes), shownBytes])));
   finally
     a.Free;
     if tmp <> '' then
@@ -2067,6 +2073,26 @@ var
   pretty: Boolean;
   nBlocks, rawBytes, packedBytes: Int64;
   what: string;
+  sizeW: Integer;
+
+  { rounded on a terminal, exact bytes elsewhere and with -v }
+  function Size(n: Int64): string;
+  begin
+    if pretty then
+      Result := HumanSize(n)
+    else
+      Result := IntToStr(n);
+  end;
+
+  { the same, in a sentence }
+  function SizeText(n: Int64): string;
+  begin
+    if pretty then
+      Result := HumanSize(n)
+    else
+      Result := IntToStr(n) + ' bytes';
+  end;
+
 begin
   Result := EXIT_OK;
   a := OpenArchive(opts.operands[0], tmp, False, opts);
@@ -2075,25 +2101,25 @@ begin
     { on a terminal rounded sizes (-v: exact); elsewhere the exact ones,
       as scripts read them }
     pretty := IsTerminal(1) and (opts.verbosity <> vVerbose);
-    WriteLn(Paint(1, stHead, a.name), Format(': %d version(s), %d bytes, fragments %d / %d / %d KiB (min / average / max)',
-      [Length(a.versions), a.size, a.prm.minSize shr 10, a.prm.avgSize shr 10,
-       a.prm.maxSize shr 10]));
-    if opts.verbosity = vVerbose then
-    begin
-      what := Format('archive format %d', [a.fmt]);
-      if a.enc and a.indexEnc then
-        what := what + ', encrypted (data and index)'
-      else if a.enc then
-        what := what + ', encrypted (data; the index is readable)'
-      else
-        what := what + ', not encrypted';
-      WriteLn(what);
-    end;
-    WriteLn;
     if pretty then
-      WriteLn(Paint(1, stHead, 'version  date                   files   dirs  links  deleted       added    new data      stored'))
+      sizeW := 9
     else
-      WriteLn('version  date                   files   dirs  links  deleted           added        new data          stored');
+      sizeW := 15;
+    { what it is }
+    if a.enc and a.indexEnc then
+      what := 'encrypted'
+    else if a.enc then
+      what := 'encrypted (the index is readable)'
+    else
+      what := 'not encrypted';
+    WriteLn(Paint(1, stHead, a.name), '  ', Joined(1, [Format('archive format %d', [a.fmt]), what,
+      Count(Length(a.versions), 'version'), SizeText(a.size)]));
+    WriteLn(Paint(1, stDim, Format('  fragments %d / %d / %d KiB (min / average / max)',
+      [a.prm.minSize shr 10, a.prm.avgSize shr 10, a.prm.maxSize shr 10])));
+    WriteLn;
+    WriteLn(Paint(1, stHead, Format('%7s  %-19s  %6s %6s %6s %8s %*s %*s %*s',
+      ['version', 'date', 'files', 'dirs', 'links', 'deleted', sizeW, 'added', sizeW, 'new data',
+       sizeW, 'stored'])));
     for i := 0 to High(a.versions) do
       with a.versions[i] do
       begin
@@ -2112,13 +2138,9 @@ begin
         for j := 0 to High(idx.frags) do
           Inc(newData, idx.frags[j].size);
         stored := commitPos + COMMIT_SIZE - vstart;
-        if pretty then
-          WriteLn(Format('%7d  %s  %6d %6d %6d %8d %11s %11s %11s',
-            [vnum, FormatTime(time, True), files, dirs, links, deleted, HumanSize(added),
-             HumanSize(newData), HumanSize(stored)]))
-        else
-          WriteLn(Format('%7d  %s  %6d %6d %6d %8d %15d %15d %15d',
-            [vnum, FormatTime(time, True), files, dirs, links, deleted, added, newData, stored]));
+        WriteLn(Format('%7d  %-19s  %6d %6d %6d %8d %*s %*s %*s',
+          [vnum, FormatTime(time, True), files, dirs, links, deleted, sizeW, Size(added),
+           sizeW, Size(newData), sizeW, Size(stored)]));
         if opts.verbosity = vVerbose then
         begin
           { the version's blocks, and its index }
@@ -2132,9 +2154,11 @@ begin
               Inc(rawBytes, a.blocks[j].rawLen);
               Inc(packedBytes, a.blocks[j].bytes);
             end;
-          WriteLn(Format('         %d block(s): %d -> %d bytes (%.2f%%); %d new fragment(s); index %d bytes; at offset %d',
-            [nBlocks, rawBytes, packedBytes, packedBytes * 100.0 / Max(rawBytes, 1),
-             Length(idx.frags), indexBytes, vstart]));
+          WriteLn(Paint(1, stDim, '         ' + Joined(1, [Count(nBlocks, 'block'),
+            Format('%d %s %d bytes (%.2f%%)', [rawBytes, Arrow(1), packedBytes,
+              packedBytes * 100.0 / Max(rawBytes, 1)]),
+            Count(Length(idx.frags), 'new fragment'), Format('index %d bytes', [indexBytes]),
+            Format('at offset %d', [vstart])])));
         end;
       end;
     st := a.State(Length(a.versions));
@@ -2150,10 +2174,11 @@ begin
     for i := 0 to High(a.fragSize) do
       Inc(uniq, a.fragSize[i]);
     WriteLn;
-    WriteLn(Format('latest version: %d files, %s; all versions hold %s of unique data in %d fragments,',
-      [totalFiles, HumanSize(totalSize), HumanSize(uniq), Length(a.fragSize)]));
-    WriteLn(Format('stored in %s (%.2f%% of the unique data)',
-      [HumanSize(a.size), a.size * 100.0 / Max(uniq, 1)]));
+    WriteLn(Paint(1, stHead, 'latest  '), Joined(1, [Count(totalFiles, 'file'), SizeText(totalSize)]));
+    WriteLn(Paint(1, stHead, 'unique  '), Joined(1, [SizeText(uniq),
+      'in ' + Count(Length(a.fragSize), 'fragment'), 'all versions']));
+    WriteLn(Paint(1, stHead, 'stored  '), Format('%s (%.2f%% of the unique data)',
+      [SizeText(a.size), a.size * 100.0 / Max(uniq, 1)]));
   finally
     a.Free;
     if tmp <> '' then
@@ -2258,6 +2283,7 @@ begin
     for b := 0 to nb - 1 do
       Inc(total, a.blocks[b].rawLen);
     prog := TProgress.Create(opts.progress, total);
+    prog.title := ExtractFileName(name);
     Phase('t: the blocks of ' + name);
     done := 0;
     checkedBytes := 0;
@@ -2275,9 +2301,9 @@ begin
     ClearWhere;
     StatAdd(a.size, checkedBytes);
     if opts.verbosity <> vQuiet then
-      WriteLn(StdErr, Format('%s: %s, %d version(s), %d fragments, %d bytes checked%s',
-        [name, Paint(2, stOk, 'ok'), Length(a.versions), Length(a.fragSize), checkedBytes,
-         TimeAndSpeed(checkedBytes, t0)]));
+      WriteLn(StdErr, Summary(2, mkOk, name, [Paint(2, stOk, 'ok'),
+        Count(Length(a.versions), 'version'), Count(Length(a.fragSize), 'fragment'),
+        HumanSize(checkedBytes) + ' checked', Elapsed(t0), SpeedSince(checkedBytes, t0)]));
   finally
     if prog <> nil then
       prog.Finish;
@@ -2313,6 +2339,7 @@ type
     access: array of SizeInt;     { block numbers, in the order used }
     nAccess, cur: SizeInt;
     nFiles, nDirs, nLinks, bytesOut: Int64;
+    nSkipped: Int64;   { left out: they exist, or cannot be made here }
     prog: TProgress;
     procedure StartAccess(k: SizeInt);
     function JobFor(blk: SizeInt): TJob;
@@ -2390,8 +2417,12 @@ begin
 end;
 
 function ExtractCommand(const opts: TOptions): Integer;
+const
+  SHOW_EXISTING = 5;   { "exists, skipped" by name; the rest are counted }
 var
   x: TExtractor;
+  nExisting: Int64;
+  mark: TMark;
   tmp, local, part: string;
   st, sel: TEntries;
   act: array of TAction;
@@ -2403,6 +2434,7 @@ var
   t0: UInt64;
 begin
   t0 := NowNs;
+  nExisting := 0;
   Phase('x: the index, what to extract');
   x := TExtractor.Create;
   x.opts := opts;
@@ -2459,6 +2491,7 @@ begin
           WriteLn(StdErr, WarnTag, sel[i].path, ': not a valid name on Windows, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
+          Inc(x.nSkipped);
           Continue;
         end;
 {$endif}
@@ -2467,6 +2500,7 @@ begin
           WriteLn(StdErr, WarnTag, local, ': a directory on the way is a symlink, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
+          Inc(x.nSkipped);
           Continue;
         end;
         if sel[i].kind = ET_DIR then
@@ -2479,19 +2513,28 @@ begin
           WriteLn(StdErr, WarnTag, local, ': a directory is in the way, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
+          Inc(x.nSkipped);
         end
         else if opts.force then
           act[i] := acReplace
         else
         begin
           act[i] := acSkip;
+          Inc(x.nSkipped);
           if not opts.skipExisting then
           begin
-            WriteLn(StdErr, WarnTag, local, ' exists, skipped (-f replaces, --skip is silent)');
+            { the first few by name (all with -v), then how many more }
+            Inc(nExisting);
+            if (nExisting <= SHOW_EXISTING) or (opts.verbosity = vVerbose) then
+              WriteLn(StdErr, WarnTag, local, ' exists, skipped (-f replaces, --skip is silent)');
             x.status := Max(x.status, EXIT_WARN);
           end;
         end;
       end;
+    if nExisting > SHOW_EXISTING then
+      if opts.verbosity <> vVerbose then
+        WriteLn(StdErr, WarnTag, Format('%s exist, skipped too (-v names them all)',
+          [Count(nExisting - SHOW_EXISTING, 'more file')]));
 
     { the blocks, in the order the files to write need them }
     last := -1;
@@ -2521,6 +2564,7 @@ begin
       if (act[i] <> acSkip) and (sel[i].kind = ET_FILE) then
         Inc(total, sel[i].meta.size);
     x.prog := TProgress.Create(opts.progress, total);
+    x.prog.title := ExtractFileName(x.a.name);
     Phase('x: read, decompress, write');
     SetWhere(x.a.name, -1, -1);
     for k := 0 to x.pipe.Slots - 1 do
@@ -2638,8 +2682,18 @@ begin
           ApplyMeta(LocalPath(x.outDir, sel[i].path), sel[i].meta, opts.noPerms, opts.noOwner);
       StatAdd(x.a.size, x.bytesOut);
       if opts.verbosity <> vQuiet then
-        WriteLn(StdErr, Format('%s: %d files, %d directories, %d links extracted (%d bytes)%s',
-          [x.a.name, x.nFiles, x.nDirs, x.nLinks, x.bytesOut, TimeAndSpeed(x.bytesOut, t0)]));
+      begin
+        if x.status = EXIT_OK then
+          mark := mkOk
+        else
+          mark := mkWarn;
+        WriteLn(StdErr, Summary(2, mark, x.a.name, [Count(x.nFiles, 'file'),
+          Count(x.nDirs, 'directory', 'directories'), When(x.nLinks > 0, Count(x.nLinks, 'link')),
+          'extracted', When(x.nSkipped > 0, IntToStr(x.nSkipped) + ' skipped')]));
+        WriteLn(StdErr, Detail(2, [HumanSize(x.bytesOut), Elapsed(t0), SpeedSince(x.bytesOut, t0)]));
+        if opts.verbosity = vVerbose then
+          WriteLn(StdErr, Detail(2, [IntToStr(x.bytesOut) + ' bytes written']));
+      end;
     end;
     Result := x.status;
   finally

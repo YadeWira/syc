@@ -82,7 +82,7 @@ check "a wrong --paths" 2 "$SYC" t -q --paths fastest w.sylz
 
 # syc i on streams, without a password for an encrypted one
 check "i on a stream" 0 "$SYC" i w.sylz
-has "i: the header" out.txt 'stream, format version 4, codec sylz (block formats v4 and v5), written at level 1; not encrypted'
+has "i: the header" out.txt 'stream, format version 4, codec sylz (block formats v4 and v5), level 1, not encrypted'
 has "i: the blocks" out.txt '^blocks'
 has "i: the raw size" out.txt "^raw size *$(wc -c < data | tr -d ' ') bytes"
 check "c -b 1 -pPASSWORD" 0 "$SYC" c -q -b 1 -pclitest --kdf-mem 8 -o enc.sylz data
@@ -94,8 +94,8 @@ has "i -v: the blocks' format" out.txt '  sylz v[2345]'
 check "i on an archive" 0 "$SYC" i w.syc
 has "i: the archive's versions" out.txt '^ *1  [0-9][0-9][0-9][0-9]-'
 check "i -v on an archive" 0 "$SYC" i -v w.syc
-has "i -v: the archive's format" out.txt '^archive format 2, not encrypted'
-has "i -v: the version's blocks" out.txt 'block(s): .* new fragment(s); index '
+has "i -v: the archive's format" out.txt 'archive format 2, not encrypted'
+has "i -v: the version's blocks" out.txt 'block.*, .* new fragment.*, index '
 head -c 100 w.sylz > cut.sylz
 check "i on a cut stream" 3 "$SYC" i cut.sylz
 
@@ -103,7 +103,7 @@ check "i on a cut stream" 3 "$SYC" i cut.sylz
 check "c --stats" 0 "$SYC" c -f --stats -t 2 -o s.sylz data
 has "--stats: bytes in" err.txt "^  in  *$(wc -c < data | tr -d ' ') bytes"
 has "--stats: threads" err.txt '^  threads  *2'
-has "the summary has the time" err.txt 'bytes (.*%), [0-9]'
+has "the summary has the time" err.txt ' -> .* (.*%), [0-9.]* s'
 check "t --stats" 0 "$SYC" t --stats w.syc
 has "t --stats on an archive" err.txt '^  out  *[1-9]'
 check "x --stats" 0 "$SYC" x -f --stats -o ox2 w.syc

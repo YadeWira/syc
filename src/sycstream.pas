@@ -548,6 +548,7 @@ begin
       end
       else
         prog := TProgress.Create(opts.progress, 0);
+      prog.title := ExtractFileName(inName);
       if toStdout then
         fout := StdStream(1)
       else if outPath <> '' then
@@ -634,21 +635,28 @@ begin
     else
       StatAdd(0, total);
     if opts.verbosity <> vQuiet then
+    begin
       case opts.cmd of
-        'c': if opts.raw then
-               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)%s, one sylz block: decode with --raw --size %d',
-                 [inName, total, written, written * 100.0 / Max(total, 1), TimeAndSpeed(total, t0), total]))
-             else
-               WriteLn(StdErr, Format('%s: %d -> %d bytes (%.2f%%)%s',
-                 [inName, total, written, written * 100.0 / Max(total, 1), TimeAndSpeed(total, t0)]));
-        'd': WriteLn(StdErr, Format('%s: %d bytes%s', [inName, total, TimeAndSpeed(total, t0)]));
-        't': WriteLn(StdErr, Format('%s: %s, %d bytes%s', [inName, Paint(2, stOk, 'ok'), total,
-               TimeAndSpeed(total, t0)]));
+        'c': WriteLn(StdErr, Summary(2, mkOk, inName, [SizeChange(2, total, written),
+               Elapsed(t0), SpeedSince(total, t0)]));
+        'd': WriteLn(StdErr, Summary(2, mkOk, inName, [HumanSize(total), Elapsed(t0),
+               SpeedSince(total, t0)]));
+        't': WriteLn(StdErr, Summary(2, mkOk, inName, [Paint(2, stOk, 'ok'),
+               HumanSize(total) + ' checked', Elapsed(t0), SpeedSince(total, t0)]));
       end;
-    if (opts.verbosity = vVerbose) and (opts.cmd = 'c') and not opts.raw then
-      WriteLn(StdErr, Format('  level %d%s, blocks of %d MiB, %d thread(s), %s -> %s',
-        [opts.level, EcNote(opts.flags), opts.blockMiB, opts.threads, HumanSize(total),
-         HumanSize(written)]));
+      if (opts.cmd = 'c') and opts.raw then
+        WriteLn(StdErr, Detail(2, [Format('one sylz block: decode with --raw --size %d', [total])]));
+    end;
+    if opts.verbosity = vVerbose then
+    begin
+      if (opts.cmd = 'c') and not opts.raw then
+        WriteLn(StdErr, Detail(2, [Format('level %d%s', [opts.level, EcNote(opts.flags)]),
+          Format('blocks of %d MiB', [opts.blockMiB]), Count(opts.threads, 'thread')]));
+      if opts.cmd = 'c' then
+        WriteLn(StdErr, Detail(2, [Format('%d bytes %s %d', [total, Arrow(2), written])]))
+      else
+        WriteLn(StdErr, Detail(2, [Format('%d bytes', [total])]));
+    end;
   except
     { no partial output left behind; an existing output stays as it was }
     on E: Exception do
@@ -697,7 +705,7 @@ var
   nFmt: array['2'..'5'] of Int64;   { blocks of each sylz format }
   c: Char;
   enc, pretty: Boolean;
-  what, kind: string;
+  what, kind, codecWhat: string;
   i, recHead: Integer;
 
   procedure Need(p: Pointer; n: SizeInt);
@@ -731,11 +739,9 @@ begin
       hdr[6] := hdr[5];
     enc := hdr[4] >= FORMAT_ENC1;
     extra := 0;
-    what := Format('%s stream, format version %d, codec sylz, written at level %d',
-      [STREAM_SUFFIX, hdr[4], hdr[6]]);
+    codecWhat := 'codec sylz';
     if (hdr[4] >= 4) and (hdr[5] = CODEC_SYLZ4) then
-      what := Format('%s stream, format version %d, codec sylz (block formats v4 and v5), written at level %d',
-        [STREAM_SUFFIX, hdr[4], hdr[6]]);
+      codecWhat := 'codec sylz (block formats v4 and v5)';
     if enc then
     begin
       { the key record: "SYCK", flags, then two slots; the one of the
@@ -756,13 +762,14 @@ begin
           memKiB := LEtoN(PUInt32(@rec[recHead + i * SLOT_SIZE + 8])^);
         end;
       end;
-      what := what + Format('; encrypted (XChaCha20-Poly1305, key from Argon2id over %d MiB)',
+      what := Format('encrypted (XChaCha20-Poly1305, key from Argon2id over %d MiB)',
         [memKiB shr 10]);
       extra := SEAL_SIZE;
     end
     else
-      what := what + '; not encrypted';
-    WriteLn(Paint(1, stHead, path), ': ', what);
+      what := 'not encrypted';
+    WriteLn(Paint(1, stHead, path), '  ', Joined(1, [STREAM_SUFFIX + ' stream',
+      Format('format version %d', [hdr[4]]), codecWhat, Format('level %d', [hdr[6]]), what]));
     pretty := IsTerminal(1) and (opts.verbosity <> vVerbose);
     if opts.verbosity = vVerbose then
       WriteLn(Paint(1, stHead, '   block    at offset         raw      stored    ratio  kind'));

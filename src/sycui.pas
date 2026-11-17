@@ -29,9 +29,40 @@ procedure SetColorMode(mode: TColorMode);
 function UseColor(std: Integer): Boolean;
 { s in a style, for stdout (1) or stderr (2); s itself without colours }
 function Paint(std: Integer; st: TStyle; const s: string): string;
-{ the "syc: " that starts an error or a warning on stderr }
+{ the start of an error or a warning on stderr: "✗ " / "⚠ " on a
+  terminal that shows Unicode, else "syc: " }
 function ErrTag: string;
 function WarnTag: string;
+
+{ Symbols and separators. "Fancy" output (✓, →, ·) goes to a terminal
+  that shows Unicode: on Unix a UTF-8 locale and a TERM other than linux
+  or dumb, on Windows a console that takes escape sequences (Windows 10
+  and later). Elsewhere, and into pipes and files, plain ASCII. }
+function Fancy(std: Integer): Boolean;
+{ "→" or "->" }
+function Arrow(std: Integer): string;
+
+type
+  TMark = (mkOk, mkWarn, mkErr, mkNone);
+
+{ A command's result line: fancy "✓ name  a · b · c", plain "name: a, b, c". }
+function Summary(std: Integer; mark: TMark; const name: string;
+  const parts: array of string): string;
+{ the parts with " · " (fancy) or ", " between them; '' parts left out }
+function Joined(std: Integer; const parts: array of string): string;
+{ a line under it: "  a · b" / "  a, b" }
+function Detail(std: Integer; const parts: array of string): string;
+{ s when c, else '' (a part a summary leaves out) }
+function When(c: Boolean; const s: string): string;
+{ "1 file", "2 files"; plural '' adds an s }
+function Count(n: Int64; const singular: string; const plural: string = ''): string;
+{ the columns s takes on a terminal: escape sequences take none, a UTF-8
+  character one }
+function DisplayWidth(const s: string): Integer;
+{ s n times (a multi-byte character too) }
+function Repeated(const s: string; n: Integer): string;
+{ s cut to at most width columns, with "…" (or "...") where it was cut }
+function Ellipsize(std: Integer; const s: string; width: Integer): string;
 
 { 1234567 -> "1.2 MB" }
 function HumanSize(n: Int64): string;
@@ -41,6 +72,13 @@ function HumanTime(seconds: Double): string;
 function HumanSpeed(n: Int64; seconds: Double): string;
 { ", 0.68 s, 311.7 MB/s" after a summary: what n bytes took since startNs }
 function TimeAndSpeed(n: Int64; startNs: UInt64): string;
+
+{ the time since startNs, "0.68 s"; and the speed of n bytes in it,
+  "311.7 MB/s" ('' when n is 0 or it took no time) }
+function Elapsed(startNs: UInt64): string;
+function SpeedSince(n: Int64; startNs: UInt64): string;
+{ "747.4 kB → 287.2 kB (38.43%)": a size before and after }
+function SizeChange(std: Integer; before, after: Int64): string;
 
 { a clock that only goes forward, in nanoseconds }
 function NowNs: UInt64;
@@ -215,14 +253,197 @@ begin
     Result := #27'[' + CODES[st] + 'm' + s + #27'[0m';
 end;
 
+{ ── symbols ────────────────────────────────────────────────────────────── }
+
+var
+  fancyKnown: array[1..2] of Boolean;
+  fancyOn: array[1..2] of Boolean;
+
+function LocaleIsUtf8: Boolean;
+{$ifdef unix}
+var
+  v: string;
+begin
+  { the first of these that is set decides, as setlocale() does }
+  v := GetEnvironmentVariable('LC_ALL');
+  if v = '' then
+    v := GetEnvironmentVariable('LC_CTYPE');
+  if v = '' then
+    v := GetEnvironmentVariable('LANG');
+  v := UpperCase(v);
+  Result := (Pos('UTF-8', v) > 0) or (Pos('UTF8', v) > 0);
+end;
+{$else}
+begin
+  Result := True;   { syc sets the console's output code page to UTF-8 }
+end;
+{$endif}
+
+function Fancy(std: Integer): Boolean;
+var
+  term: string;
+begin
+  if (std < 1) or (std > 2) then
+    Exit(False);
+  if not fancyKnown[std] then
+  begin
+    term := GetEnvironmentVariable('TERM');
+    fancyOn[std] := IsTerminal(std) and LocaleIsUtf8
+      {$ifdef unix}and (term <> 'dumb') and (term <> 'linux'){$endif}
+      {$ifdef windows}and TerminalTakesColors(std){$endif};
+    fancyKnown[std] := True;
+  end;
+  Result := fancyOn[std];
+end;
+
+function Arrow(std: Integer): string;
+begin
+  if Fancy(std) then
+    Result := '→'
+  else
+    Result := '->';
+end;
+
+function MarkOf(std: Integer; mark: TMark): string;
+begin
+  case mark of
+    mkOk: Result := Paint(std, stOk, '✓');
+    mkWarn: Result := Paint(std, stWarn, '⚠');
+    mkErr: Result := Paint(std, stErr, '✗');
+  else
+    Result := ' ';
+  end;
+end;
+
 function ErrTag: string;
 begin
-  Result := Paint(2, stErr, 'syc:') + ' ';
+  if Fancy(2) then
+    Result := MarkOf(2, mkErr) + ' '
+  else
+    Result := Paint(2, stErr, 'syc:') + ' ';
 end;
 
 function WarnTag: string;
 begin
-  Result := Paint(2, stWarn, 'syc:') + ' ';
+  if Fancy(2) then
+    Result := MarkOf(2, mkWarn) + ' '
+  else
+    Result := Paint(2, stWarn, 'syc:') + ' ';
+end;
+
+function Joined(std: Integer; const parts: array of string): string;
+var
+  i: Integer;
+  sep: string;
+begin
+  if Fancy(std) then
+    sep := Paint(std, stDim, ' · ')
+  else
+    sep := ', ';
+  Result := '';
+  for i := 0 to High(parts) do
+    if parts[i] <> '' then
+    begin
+      if Result <> '' then
+        Result := Result + sep;
+      Result := Result + parts[i];
+    end;
+end;
+
+function Summary(std: Integer; mark: TMark; const name: string;
+  const parts: array of string): string;
+begin
+  if Fancy(std) then
+  begin
+    Result := MarkOf(std, mark) + ' ' + Paint(std, stHead, name);
+    if Length(parts) > 0 then
+      Result := Result + '  ' + Joined(std, parts);
+  end
+  else
+  begin
+    Result := name;
+    if Length(parts) > 0 then
+      Result := Result + ': ' + Joined(std, parts);
+  end;
+end;
+
+function Detail(std: Integer; const parts: array of string): string;
+begin
+  Result := '  ' + Joined(std, parts);
+end;
+
+function When(c: Boolean; const s: string): string;
+begin
+  if c then
+    Result := s
+  else
+    Result := '';
+end;
+
+function Count(n: Int64; const singular: string; const plural: string): string;
+begin
+  if n = 1 then
+    Result := '1 ' + singular
+  else if plural <> '' then
+    Result := IntToStr(n) + ' ' + plural
+  else
+    Result := IntToStr(n) + ' ' + singular + 's';
+end;
+
+function DisplayWidth(const s: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  i := 1;
+  while i <= Length(s) do
+  begin
+    if s[i] = #27 then
+    begin
+      { ESC [ ... a letter }
+      Inc(i);
+      while (i <= Length(s)) and not (s[i] in ['A'..'Z', 'a'..'z']) do
+        Inc(i);
+    end
+    else if Byte(s[i]) and $C0 <> $80 then   { not a UTF-8 continuation byte }
+      Inc(Result);
+    Inc(i);
+  end;
+end;
+
+function Repeated(const s: string; n: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to n do
+    Result := Result + s;
+end;
+
+function Ellipsize(std: Integer; const s: string; width: Integer): string;
+var
+  dots: string;
+  keep, i, w: Integer;
+begin
+  if DisplayWidth(s) <= width then
+    Exit(s);
+  if Fancy(std) then
+    dots := '…'
+  else
+    dots := '...';
+  keep := width - DisplayWidth(dots);
+  if keep < 1 then
+    Exit(Copy(dots, 1, Length(dots)));
+  { keep the end, the part of a path that tells most: "…/dir/name" }
+  i := Length(s) + 1;
+  w := 0;
+  while (i > 1) and (w < keep) do
+  begin
+    Dec(i);
+    if Byte(s[i]) and $C0 <> $80 then
+      Inc(w);
+  end;
+  Result := dots + Copy(s, i, MaxInt);
 end;
 
 { ── sizes and times ────────────────────────────────────────────────────── }
@@ -267,6 +488,33 @@ begin
   Result := ', ' + HumanTime(secs);
   if (n > 0) and (secs >= 0.001) then
     Result := Result + ', ' + HumanSpeed(n, secs);
+end;
+
+function Elapsed(startNs: UInt64): string;
+begin
+  Result := HumanTime((NowNs - startNs) / 1e9);
+end;
+
+function SpeedSince(n: Int64; startNs: UInt64): string;
+var
+  secs: Double;
+begin
+  secs := (NowNs - startNs) / 1e9;
+  if (n > 0) and (secs >= 0.001) then
+    Result := HumanSpeed(n, secs)
+  else
+    Result := '';
+end;
+
+function SizeChange(std: Integer; before, after: Int64): string;
+var
+  pct: Double;
+begin
+  if before > 0 then
+    pct := after * 100.0 / before
+  else
+    pct := 0;
+  Result := Format('%s %s %s (%.2f%%)', [HumanSize(before), Arrow(std), HumanSize(after), pct]);
 end;
 
 function NowNs: UInt64;

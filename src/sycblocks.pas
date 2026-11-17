@@ -130,6 +130,7 @@ type
     enough), bytes, speed, time left. Nothing when disabled. }
   TProgress = class
     enabled: Boolean;
+    title: string;      { shown before the bar: the file worked on }
     total, done: Int64;
     started, lastShown: QWord;
     width: Integer;
@@ -544,47 +545,69 @@ begin
 end;
 
 procedure TProgress.Show;
-const
-  BAR = 24;
 var
   secs, speed, left: Double;
-  line, shown: string;
-  pct, filled: Integer;
+  head, tail, bar, line: string;
+  pct, room, barW, filled, nameW: Integer;
+  fancy: Boolean;
 begin
   secs := (GetTickCount64 - started) / 1000;
   if secs <= 0 then
     secs := 0.001;
   speed := done / secs;
-  shown := '';
+  fancy := sycui.Fancy(2);
+  { the numbers after the bar }
   if total > 0 then
   begin
     pct := Min(100, done * 100 div total);
-    line := Format('%3d%%  ', [pct]);
-    if columns >= 78 then
-    begin
-      filled := pct * BAR div 100;
-      line := line + '[' + StringOfChar('=', filled) + StringOfChar(' ', BAR - filled) + ']  ';
-      shown := Format('%3d%%  ', [pct]) + '[' + Paint(2, stBar, StringOfChar('=', filled))
-        + StringOfChar(' ', BAR - filled) + ']  ';
-    end;
-    line := line + Format('%s / %s  %s/s', [Human(done), Human(total), Human(speed)]);
+    tail := Format('%3d%%  %s', [pct, Human(done)]);
+    if fancy then
+      tail := tail + '/' + Human(total)
+    else
+      tail := tail + ' / ' + Human(total);
+    tail := tail + '  ' + Human(speed) + '/s';
     if (speed > 0) and (done < total) then
     begin
       left := (total - done) / speed;
-      line := line + Format('  %d:%.2d left', [Trunc(left) div 60, Trunc(left) mod 60]);
+      tail := tail + Format('  %d:%.2d', [Trunc(left) div 60, Trunc(left) mod 60]);
+      if not fancy then
+        tail := tail + ' left';
     end;
-    { the same line, its bar coloured }
-    if shown <> '' then
-      shown := shown + Copy(line, 6 + BAR + 4 + 1, MaxInt);
   end
   else
-    line := Format('%s  %s/s', [Human(done), Human(speed)]);
-  if shown = '' then
-    shown := line;
-  if Length(line) < width then
-    shown := shown + StringOfChar(' ', width - Length(line));
-  width := Max(width, Length(line));
-  Write(StdErr, #13, shown);
+  begin
+    pct := -1;
+    tail := Human(done) + '  ' + Human(speed) + '/s';
+  end;
+  { the file's name, then the bar in the room left (on a terminal) }
+  head := '';
+  bar := '';
+  if columns > 0 then
+  begin
+    room := columns - 1 - DisplayWidth(tail) - 2;
+    if title <> '' then
+    begin
+      nameW := Min(DisplayWidth(title), Max(8, room div 3));
+      head := Ellipsize(2, title, nameW);
+      head := Paint(2, stHead, head) + StringOfChar(' ', nameW - DisplayWidth(head)) + '  ';
+      Dec(room, nameW + 2);
+    end;
+    barW := Min(40, room - 2);
+    if (pct >= 0) and (barW >= 10) then
+    begin
+      filled := pct * barW div 100;
+      if fancy then
+        bar := Paint(2, stBar, Repeated('━', filled)) + Paint(2, stDim, Repeated('─', barW - filled))
+      else
+        bar := '[' + Paint(2, stBar, StringOfChar('#', filled)) + StringOfChar('.', barW - filled) + ']';
+      bar := bar + '  ';
+    end;
+  end;
+  line := '  ' + head + bar + tail;
+  if DisplayWidth(line) < width then
+    line := line + StringOfChar(' ', width - DisplayWidth(line));
+  width := Max(width, DisplayWidth(line));
+  Write(StdErr, #13, line);
 end;
 
 procedure TProgress.Finish;
