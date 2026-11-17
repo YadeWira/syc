@@ -23,14 +23,17 @@ for modest hardware.
 CI builds and tests every platform above and checks they all compress to
 the same bytes, also with the Pascal-only build (`-dSYLZ_PUREPASCAL`).
 
-**Status: v0.10.x, pre-release.** Every release stays a pre-release until
-v1.0.0. syc v0.1.x was a Rust archiver; its sources are archived in
+**Status: v1.0.0.** Through 1.x the commands, their options, the exit
+status, what scripts read from `syc l` and every file format stay as they
+are ([Usage: what stays the same](https://github.com/YadeWira/syc/wiki/Usage#what-stays-the-same-for-scripts)).
+syc v0.1.x was a Rust archiver; its sources are archived in
 [`legacy/rust/`](legacy/rust/). v0.2 restarted the project in Free Pascal.
 
 **Compatibility:** every later syc reads what an earlier one wrote, back
 to 0.2.2; a frozen format never changes; `syc a` appends in the archive's
-own format. CI reads files written by the released binaries of 0.2.2 to
-0.9.0 (`tests/compat/`) on every platform. The whole promise:
+own format, and no format stops being read within 1.x. CI reads files
+written by the released binaries of 0.2.2 to 0.9.0 (`tests/compat/`) on
+every platform. The whole promise:
 [Versioning and releases](https://github.com/YadeWira/syc/wiki/Versioning-and-releases#compatibility).
 
 ## Goals
@@ -58,7 +61,8 @@ the main language.
 **syc writes sylz format v4 by default since v0.9.0, and v5 with `-ec`**
 (below: [Formats v4 and v5](#formats-v4-and-v5-frozen-at-v080)); `-F 2`
 writes the older formats v2 and v3, larger and slower but readable by
-every syc since 0.2.14. What follows first describes v2 and v3.
+every syc since 0.2.14. The design below starts with v2 and v3, which v4
+and v5 build on; the speed tables are v4 and v5.
 
 The first codec: a fast LZ with separate control and literal streams, so
 the decoder finds the next sequence at a fixed distance whatever the
@@ -77,78 +81,77 @@ loops have x86-64 assembler versions (Linux and Win64) next to the Pascal
 ones, the optimal parser's DP a C one, and the fuzzer checks that every
 path produces the same bytes.
 
-silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz),
-everything in one session (2026-10-23; the machine was moderately busy,
-load ~4, so speeds vary by ~10%). Fast and middle levels:
+silesia.tar, in memory, one block, one core (Xeon E5-2697A v4, 2.6 GHz,
+Broadwell, 2016; pinned with `taskset`), 2026-11-17: sylz in its default
+format v4 (`syc b`), the others in lzbench 2.4.1 (gcc 14.2), both best of
+several runs. misa77's decoder is its unsafe one (UB on invalid input; its
+safe one decodes `-1` at 3910 MB/s here); sylz's always checks its input.
+On a newer CPU misa77 does better than here (its README: 5348 MB/s at
+`-1` on a 14th-generation Core).
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4 1.10.0 | 507 MB/s | 3132 MB/s | 47.59% |
-| misa77 0.6.0 --1 | 265 MB/s | 4069 MB/s | 46.74% |
-| zxc 0.15.0 -3 | 155 MB/s | 3457 MB/s | 46.65% |
-| **sylz -0** | 480 MB/s | 3070 MB/s | 46.51% |
-| misa77 0.6.0 -0 | 166 MB/s | 3961 MB/s | 44.60% |
-| **sylz -1** | **442 MB/s** | 3136 MB/s | 44.55% |
-| zxc 0.15.0 -4 | 114 MB/s | 3442 MB/s | 43.43% |
-| lz4hc 1.10.0 -2 | 224 MB/s | 2805 MB/s | 42.05% |
-| **sylz -2** | **235 MB/s** | 2978 MB/s | **40.89%** |
-| zxc 0.15.0 -5 | 68.8 MB/s | 3431 MB/s | 40.83% |
-| lizard 2.1 -12 | 115 MB/s | 2791 MB/s | 40.68% |
-| **sylz -3** | **187 MB/s** | 2958 MB/s | **39.99%** |
-| **sylz -4** | **85.9 MB/s** | 2976 MB/s | 38.80% |
-| lz4hc 1.10.0 -3 | 67.9 MB/s | 2823 MB/s | 38.38% |
-| **sylz -5** | 61.9 MB/s | 3029 MB/s | 37.78% |
-| misa77 0.6.0 -3 | 10.3 MB/s | 3874 MB/s | 37.76% |
-| lz4hc 1.10.0 -4 | 57.6 MB/s | 2878 MB/s | 37.65% |
-| **sylz -6** | 46.2 MB/s | 3061 MB/s | 37.13% |
-| lz4hc 1.10.0 -6 | 42.4 MB/s | 3064 MB/s | 36.98% |
+| lz4 1.10.0 | 511 MB/s | 3122 MB/s | 47.59% |
+| misa77 0.7.0 --1 | 256 MB/s | 3801 MB/s | 46.74% |
+| zxc 0.15.0 -3 | 148 MB/s | 3464 MB/s | 46.65% |
+| **sylz -0** | **587 MB/s** | **4642 MB/s** | 44.67% |
+| misa77 0.7.0 -0 | 157 MB/s | 3734 MB/s | 44.60% |
+| zxc 0.15.0 -4 | 111 MB/s | 3427 MB/s | 43.43% |
+| **sylz -1** (default) | **525 MB/s** | **4476 MB/s** | 42.82% |
+| misa77 0.7.0 -1 | 46.7 MB/s | 3996 MB/s | 42.64% |
+| lz4hc 1.10.0 -2 | 222 MB/s | 2874 MB/s | 42.05% |
+| zxc 0.15.0 -5 | 68.7 MB/s | 3382 MB/s | 40.83% |
+| lizard 2.1 -12 | 109 MB/s | 2631 MB/s | 40.68% |
+| misa77 0.7.0 -2 | 37.7 MB/s | 3807 MB/s | 40.33% |
+| **sylz -2** | **286 MB/s** | **3842 MB/s** | **39.39%** |
+| **sylz -3** | 223 MB/s | 3948 MB/s | 38.59% |
+| misa77 0.7.0 -3 | 10.4 MB/s | 3691 MB/s | 37.76% |
+| lz4hc 1.10.0 -4 | 62.1 MB/s | 2685 MB/s | 37.65% |
+| **sylz -4** | **99.0 MB/s** | **4010 MB/s** | **37.48%** |
+| lz4hc 1.10.0 -6 | 39.7 MB/s | 2857 MB/s | 36.98% |
+| lz4hc 1.10.0 -9 | 28.5 MB/s | 3053 MB/s | 36.75% |
+| **sylz -5** | 70.2 MB/s | 3898 MB/s | 36.58% |
+| lizard 2.1 -19 | 3.67 MB/s | 2809 MB/s | 36.52% |
+| lz4hc 1.10.0 -12 | 9.40 MB/s | 3209 MB/s | 36.45% |
+| zxc 0.15.0 -6 | 8.49 MB/s | 2780 MB/s | 36.28% |
+| **sylz -6** | 52.6 MB/s | 3979 MB/s | 36.00% |
+| **sylz -7** | 40.6 MB/s | 3951 MB/s | 35.65% |
+| **sylz -8** | 25.6 MB/s | 3925 MB/s | 35.35% |
+| **sylz -9** | 8.2 MB/s | 4228 MB/s | 34.92% |
+| **sylz -10** | 7.3 MB/s | **4322 MB/s** | **34.91%** |
+| zstd 1.5.7 -1 | 315 MB/s | 1028 MB/s | 34.53% |
 
-High ratios:
+With `-ec` (format v5: Huffman-coded literals; `-ec -0` .. `-8` parse as
+`-2` .. `-10` do, `-ec -9` / `-10` price each literal by its code), same
+session:
 
 | codec | compress | decompress | ratio |
 |---|---|---|---|
-| lz4hc 1.10.0 -9 | 27.0 MB/s | 3050 MB/s | 36.75% |
-| **sylz -7** | 35.7 MB/s | 3113 MB/s | 36.73% |
-| lizard 2.1 -19 | 3.78 MB/s | 2879 MB/s | 36.52% |
-| lz4hc 1.10.0 -12 | 9.39 MB/s | 3200 MB/s | 36.45% |
-| **sylz -8** | 22.0 MB/s | 3135 MB/s | 36.38% |
-| zxc 0.15.0 -6 | 9.31 MB/s | 2891 MB/s | 36.28% |
-| **sylz -9** | 7.65 MB/s | **3449 MB/s** | **36.04%** |
-| **sylz -10** | 6.45 MB/s | 3393 MB/s | **36.03%** |
-| zstd 1.5.7 -1 | 350 MB/s | 1135 MB/s | 34.53% |
+| **sylz -ec -0** | 252 MB/s | 2908 MB/s | 37.22% |
+| **sylz -ec -1** | 195 MB/s | 2939 MB/s | 36.52% |
+| **sylz -ec -2** | 92.9 MB/s | 2986 MB/s | 35.37% |
+| **sylz -ec -3** | 69.5 MB/s | 3048 MB/s | 34.55% |
+| zstd 1.5.7 -1 | 315 MB/s | 1028 MB/s | 34.53% |
+| **sylz -ec -4** | 52.4 MB/s | 3099 MB/s | 34.00% |
+| **sylz -ec -5** | 40.9 MB/s | 3103 MB/s | 33.68% |
+| **sylz -ec -6** | 26.2 MB/s | 3149 MB/s | 33.39% |
+| zxc 0.15.0 -7 | 6.13 MB/s | 1895 MB/s | 33.09% |
+| **sylz -ec -7** | 8.4 MB/s | 3439 MB/s | 32.78% |
+| **sylz -ec -8** | 7.5 MB/s | 3410 MB/s | 32.78% |
+| zstd 1.5.7 -2 | 224 MB/s | 784 MB/s | 32.70% |
+| **sylz -ec -9** | 5.8 MB/s | 3356 MB/s | 32.36% |
+| **sylz -ec -10** | 5.1 MB/s | 3344 MB/s | 32.36% |
+| misa77 0.7.0 -4 | 1.75 MB/s | 1502 MB/s | 32.34% |
+| zstd 1.5.7 -3 | 158 MB/s | 676 MB/s | 31.20% |
 
 On very redundant data -10 searches deeper than -9 and pays for it: zpaq-std's mixed sample 17.73% (-9) -> 17.59% (-10).
 
 32-bit Windows and arm64 have no assembler: there the C paths run.
-Windows 7 32-bit (a VM, mozilla): compress -1 282 MB/s, -4 66.6 MB/s,
+Windows 7 32-bit (a VM, mozilla, format v2, v0.2.11): compress -1 282 MB/s, -4 66.6 MB/s,
 -8 18.6 MB/s, decode 1640-2370 MB/s; the Pascal paths made 177, 39.8 and
 11.1 MB/s, decode 850-1150 MB/s.
 [Benchmarks](https://github.com/YadeWira/syc/wiki/Benchmarks#32-bit-windows-v0211).
 
-Format v3 (`-F 2 -ec`, Huffman-coded literals), every level, in
-another session (load ~4): `-ec -0` .. `-8` parse as `-2` .. `-10` do
-(v2's `-0` and `-1` leave so many literals that, Huffman-coded, they
-decode slower and compress worse than `-2`'s parse); `-ec -9` / `-10` run
-the optimal parser with each literal priced by its Huffman code (two
-parses).
-
-| codec | compress | decompress | ratio |
-|---|---|---|---|
-| **sylz -ec -0** | 179 MB/s | 2121 MB/s | 38.80% |
-| **sylz -ec -2** | 75.5 MB/s | 1979 MB/s | 36.72% |
-| **sylz -ec -4** | 44.0 MB/s | 2140 MB/s | 35.18% |
-| zstd 1.5.7 -1 | 329 MB/s | 1061 MB/s | 34.53% |
-| **sylz -ec -6** | 20.8 MB/s | 2164 MB/s | 34.47% |
-| **sylz -ec -8** | 6.35 MB/s | **2282 MB/s** | 33.98% |
-| **sylz -ec -9** | 3.75 MB/s | 2126 MB/s | 33.61% |
-| **sylz -ec -10** | 3.13 MB/s | 2107 MB/s | **33.60%** |
-| zxc 0.15.0 -7 | 6.04 MB/s | 1905 MB/s | 33.09% |
-| zstd 1.5.7 -2 | 230 MB/s | 793 MB/s | 32.70% |
-| zstd 1.5.7 -3 | 157 MB/s | 693 MB/s | 31.20% |
-
-Same session, v2 `-10`: 36.03% at 3498 MB/s decode. With one thread v3
-decodes at 60-65% of v2's speed on silesia.tar, at twice zstd -1's; on
-mixed data zstd -1 is still smaller.
 
 ### Formats v4 and v5 (frozen at v0.8.0)
 
@@ -300,8 +303,8 @@ Setting up the cross compilers: [Building](https://github.com/YadeWira/syc/wiki/
 ## Use
 
 Every command and option: [Usage](https://github.com/YadeWira/syc/wiki/Usage) (and `syc h CMD`).
-The archive (`.syc`, format 2) and stream (`.sylz`, version 4) formats are
-frozen since v0.4.0: [syc archive format](https://github.com/YadeWira/syc/wiki/syc-archive-format),
+The archive (`.syc`, format 2; encrypted: 4) and stream (`.sylz`, version 4;
+encrypted: 6) formats are frozen, and read by every 1.x: [syc archive format](https://github.com/YadeWira/syc/wiki/syc-archive-format),
 [syc stream format](https://github.com/YadeWira/syc/wiki/syc-stream-format).
 
 ```sh
@@ -327,8 +330,10 @@ out/syc h a                # every option of a command
 
 Each command also goes by its word (`syc add`, `extract`, `list`, `info`,
 `compress`, `decompress`, `test`, `key`). On a terminal there is a progress
-bar, and `l -l` and `i` round their sizes (`-v`: exact); into a pipe or a
-file the output is plain, as before. An existing output is not overwritten
+bar, results read `✓ backup.syc  version 2 · 3 files · 1 directory` (on one
+that shows Unicode; elsewhere ASCII), names come out with control
+characters escaped, and `l -l` and `i` round their sizes (`-v`: exact);
+into a pipe or a file the output is plain, as scripts read it. An existing output is not overwritten
 without `-f`. Exit status: 0 ok, 1 an input skipped, 2 usage, 3 corrupt
 data, 4 I/O error.
 
@@ -348,8 +353,8 @@ out/sylzbench -l 1,9 FILE  # the benchmark as a program of its own, lzbench-styl
 
 `syc s` runs the codec at every level and format through every code path
 built in, damaged blocks, the checksums, hashes and ciphers against their
-known answers, and a stream and an archive through the commands, in a few
-seconds. `syc r` lists the `SYC_*` variables that are set by name only,
+known answers, and a stream and an archive through the commands, in
+about ten seconds. `syc r` lists the `SYC_*` variables that are set by name only,
 never their values. `--color auto|always|never` (and `NO_COLOR`) decides
 the colours.
 
