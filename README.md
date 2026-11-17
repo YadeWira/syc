@@ -8,8 +8,6 @@ for modest hardware.
 |---|---|
 | CI | [![CI][ciBadge]][ciLink] |
 | Latest release | [![Release][relBadge]][relLink] |
-| Language | Free Pascal 3.2.2, with C and assembler beside a Pascal reference |
-| Formats | `.syc` 2 and `.sylz` 4 frozen; encrypted `.syc` 4 and `.sylz` 6 frozen (3 and 5 of v0.5–0.9 still read); sylz blocks v2, v3, v4 and v5 frozen |
 
 [ciBadge]: https://github.com/YadeWira/syc/actions/workflows/ci.yml/badge.svg "Continuous Integration"
 [ciLink]: https://github.com/YadeWira/syc/actions/workflows/ci.yml
