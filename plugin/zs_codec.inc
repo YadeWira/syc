@@ -7,8 +7,10 @@ const
   ZS_ERR_MEMORY = -2;
 
   { Blocks larger than this are refused (bound returns 0): match finder
-    positions are 32-bit, and the block header's control length is a u32. }
-  MAX_BLOCK = SizeUInt($7FFF0000);
+    positions are 32-bit, and the block header's control length is a u32.
+    32-bit targets: under 1 GiB, as a length the decoder adds up there
+    must stay below 2^30 (and SylzBound positive). }
+  MAX_BLOCK = {$ifdef CPU64}SizeUInt($7FFF0000){$else}SizeUInt($3FFFFFFF){$endif};
   { Formats v4 and v5 (sylz4, sylz5): blocks of at most 512 MiB, the
     format's limit (a length in a block always fits 30 bits, on 32-bit
     targets too) }

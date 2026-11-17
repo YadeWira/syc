@@ -88,7 +88,114 @@ function LongPath(const path: string): string;
 { ForceDirectories, through LongPath on Windows }
 function ForceDirs(const dir: string): Boolean;
 
+{ An exclusive lock on the file at path, held until Unlock (for a change
+  in place: syc a appending, syc k). False when another process holds
+  it. A file system without locks: True, unlocked (h = -1). }
+function LockFile(const path: string; out h: THandle): Boolean;
+procedure Unlock(h: THandle);
+
 implementation
+
+{$ifdef windows}
+function LockFileEx(hFile: THandle; dwFlags, dwReserved, nLow, nHigh: DWORD;
+  var ov: TOverlapped): BOOL; stdcall; external 'kernel32.dll' name 'LockFileEx';
+
+const
+  LOCKFILE_FAIL_IMMEDIATELY = 1;
+  LOCKFILE_EXCLUSIVE_LOCK = 2;
+
+function LockFile(const path: string; out h: THandle): Boolean;
+var
+  ov: TOverlapped;
+begin
+  Result := True;
+  h := CreateFileW(PWideChar(UnicodeString(LongPath(path))), GENERIC_READ,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil, OPEN_EXISTING, 0, 0);
+  if h = INVALID_HANDLE_VALUE then
+  begin
+    h := THandle(-1);
+    Exit;
+  end;
+  { one byte far past any data: the lock stops other lockers, not writes }
+  FillChar(ov, SizeOf(ov), 0);
+  ov.Offset := $FFFFFFFE;
+  ov.OffsetHigh := $7FFFFFFF;
+  if not LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ov) then
+  begin
+    Result := GetLastError <> ERROR_LOCK_VIOLATION;
+    CloseHandle(h);
+    h := THandle(-1);
+  end;
+end;
+
+procedure Unlock(h: THandle);
+begin
+  if h <> THandle(-1) then
+    CloseHandle(h);   { the lock goes with the handle }
+end;
+{$else}
+{$ifdef linux}
+{ An "open file description" lock (Linux 3.15 and later): unlike a flock()
+  (which FPC's own share modes take) and a classic fcntl() lock (which goes
+  when the process closes any of its descriptors of the file), it belongs
+  to this descriptor only. }
+type
+  TFlock64 = {$ifdef CPU32}packed{$endif} record
+    l_type, l_whence: SmallInt;
+    l_start, l_len: Int64;
+    l_pid: LongInt;
+    pad: LongInt;
+  end;
+
+const
+  F_OFD_SETLK = 37;
+  F_WRLCK = 1;
+
+function fcntl_lock(fd, cmd: LongInt; lk: Pointer): LongInt; cdecl;
+  external 'c' name {$ifdef CPU32}'fcntl64'{$else}'fcntl'{$endif};
+{ libc's errno (fpgeterrno is the RTL's own, which a libc call leaves alone) }
+function errno_location: PLongInt; cdecl; external 'c' name '__errno_location';
+
+function LockFile(const path: string; out h: THandle): Boolean;
+var
+  lk: TFlock64;
+  err: LongInt;
+begin
+  Result := True;
+  h := fpOpen(path, O_RDWR);
+  if LongInt(h) < 0 then
+  begin
+    h := THandle(-1);
+    Exit;
+  end;
+  FillChar(lk, SizeOf(lk), 0);
+  lk.l_type := F_WRLCK;   { the whole file (l_len 0); advisory: no read or write is stopped }
+  if fcntl_lock(h, F_OFD_SETLK, @lk) <> 0 then
+  begin
+    err := errno_location^;
+    { held by another (EAGAIN, EACCES); an older kernel or a file system
+      without locks: go on unlocked }
+    Result := (err <> ESysEAGAIN) and (err <> ESysEACCES);
+    fpClose(h);
+    h := THandle(-1);
+  end;
+end;
+{$else}
+{ macOS and the BSDs: no lock of a descriptor's own that FPC's flock()
+  share modes leave alone; appends are not locked there }
+function LockFile(const path: string; out h: THandle): Boolean;
+begin
+  h := THandle(-1);
+  Result := True;
+end;
+{$endif}
+
+procedure Unlock(h: THandle);
+begin
+  if h <> THandle(-1) then
+    fpClose(h);
+end;
+{$endif}
 
 function ComparePaths(const a, b: string): Integer;
 var

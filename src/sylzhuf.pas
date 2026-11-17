@@ -579,7 +579,9 @@ end;
 { Bits this stream took, and whether that fits its bytes. }
 function RdEndsInside(const r: THufReader): Boolean; inline;
 begin
-  Result := (r.p - r.start) * 8 - r.count <= (r.pend - r.start) * 8;
+  { in Int64: on 32-bit targets bytes * 8 overflows from 256 MiB on, and
+    a mode-1 chunk's last stream ends at the block's end }
+  Result := Int64(r.p - r.start) * 8 - r.count <= Int64(r.pend - r.start) * 8;
 end;
 
 {$ifdef HUF_BULK}

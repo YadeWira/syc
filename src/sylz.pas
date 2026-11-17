@@ -7212,6 +7212,11 @@ function sylzc_decode(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt;
 
 function DecodeStreams(ctrl, cend, lit, lend, dst: PByte; dstLen: SizeInt): SizeInt;
 begin
+  { too little output for the fast loops' margin: their limit, dst +
+    dstLen - OUT_MARGIN, would wrap below dst (to a huge address when dst
+    is nil, as a host's empty buffer may be) }
+  if dstLen < OUT_MARGIN then
+    Exit(DecodeSafe(ctrl, cend, lit, lend, dst, dst + dstLen, dst));
 {$ifdef SYLZ_ASM_X64}
   if SylzUseAsm and not SylzPreferC then
     Exit(DecodeAsm(ctrl, cend, lit, lend, dst, dstLen));

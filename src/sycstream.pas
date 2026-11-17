@@ -20,6 +20,7 @@ unit sycstream;
 interface
 
 uses
+  {$ifdef unix}BaseUnix,{$endif}
   SysUtils, Classes, Math, sylz, syccrypto, sycblocks, sycui, syccli, sycenc, sycarc;
 
 { runs syc c, d or t on every operand; returns the exit code }
@@ -473,6 +474,9 @@ var
   arcPath, suffix: string;
   t0: UInt64;
   inSize: Int64;   { the input file's size; -1: stdin }
+{$ifdef unix}
+  st: Stat;
+{$endif}
 begin
   inSize := -1;
   Result := EXIT_OK;
@@ -553,8 +557,7 @@ begin
         fout := StdStream(1)
       else if outPath <> '' then
       begin
-        tmpPath := outPath + TMP_SUFFIX;
-        fout := TFileStream.Create(tmpPath, fmCreate);
+        fout := CreateTemp(outPath, tmpPath);
       end;
 
       if opts.raw then
@@ -612,6 +615,12 @@ begin
       stays under its temporary name, and the output as it was. }
     if tmpPath <> '' then
     begin
+{$ifdef unix}
+      { the output gets the input's permissions, as gzip's and zstd's do
+        (a private file stays private) }
+      if not fromStdin and (fpStat(input, st) = 0) then
+        fpChmod(tmpPath, st.st_mode and &7777);
+{$endif}
       if not ReplaceFile(tmpPath, outPath) then
       begin
         keep := tmpPath;

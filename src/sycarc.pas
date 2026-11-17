@@ -728,7 +728,26 @@ begin
       Move(rdBuf[rdStart], rdBuf[0], rdLen - rdStart);
       rdLen := rdLen - rdStart;
       rdStart := 0;
-      got := ReadFull(rdFile, @rdBuf[rdLen], Length(rdBuf) - rdLen);
+      try
+        got := ReadFull(rdFile, @rdBuf[rdLen], Length(rdBuf) - rdLen);
+      except
+        on E: ESycError do
+        begin
+          { unreadable from the start (no permission, a directory, a
+            file of /sys): skipped as one that does not open. Halfway:
+            the archive is left as it was, rather than holding a file
+            cut short }
+          if rdTotal + rdLen > 0 then
+            Fail(EXIT_FATAL, entries[rdEntry].local + ': ' + E.Message
+              + ' (the archive is left as it was)');
+          Warn(opts, entries[rdEntry].local + ': cannot read (' + E.Message + '), skipped');
+          status := Max(status, EXIT_WARN);
+          entries[rdEntry].kind := ET_OTHER;
+          FreeAndNil(rdFile);
+          Inc(rdEntry);
+          Continue;
+        end;
+      end;
       prog.Add(got);
       rdEof := rdLen + got < Length(rdBuf);
       Inc(rdLen, got);
@@ -1051,6 +1070,7 @@ var
   list: array of TVersion;
   n, i: SizeInt;
   ok: Boolean;
+  w: array[0..11] of Byte;
   pw: TBytes;
   keys: TSycKeys;
 begin
@@ -1120,7 +1140,16 @@ begin
   ok := True;
   while at > dataStart do
   begin
-    if not ReadCommit(Self, at - COMMIT_SIZE, vstart, istart) or (vstart >= at - COMMIT_SIZE) then
+    { a commit is taken only if what it points at is there: a version
+      header at vstart, and an index at istart that ends right at the
+      commit. (An archive stored inside this one, cut by an interrupted
+      append, ends with a commit of its own, pointing elsewhere.) }
+    if not ReadCommit(Self, at - COMMIT_SIZE, vstart, istart) or (vstart < dataStart)
+       or (vstart >= at - COMMIT_SIZE) or (istart <= vstart) or (istart >= at - COMMIT_SIZE)
+       or not ReadAt(vstart, @w, 4) or (CompareByte(w[0], VHEAD_MAGIC[1], 4) <> 0)
+       or not ReadAt(istart, @w, 4 + 8) or (CompareByte(w[0], INDEX_MAGIC[1], 4) <> 0)
+       or (istart + 4 + BLOCKHDR_SIZE + indexExtra + (LEtoN(PUInt32(@w[8])^) and $7FFFFFFF)
+           <> at - COMMIT_SIZE) then
     begin
       ok := False;
       Break;
@@ -1555,6 +1584,7 @@ var
   fs: TFileStream;
   hdrB, pw, rec: TBytes;
   t0: UInt64;
+  lockH: THandle;
 begin
   t0 := NowNs;
   Phase('a: the archive as it is, the files');
@@ -1563,6 +1593,10 @@ begin
   appending := not toStdout and FileExists(arcPath);
   if toStdout and IsTerminal(1) then
     Fail(EXIT_USAGE, 'an archive is not written to a terminal');
+  { two appends at once would each cut what the other wrote }
+  lockH := THandle(-1);
+  if appending and not LockFile(arcPath, lockH) then
+    Fail(EXIT_FATAL, arcPath + ': another syc is adding to it (try again when it is done)');
   tmpPath := '';
   arc := nil;
   a := TAdder.Create(opts);
@@ -1731,8 +1765,8 @@ begin
     end
     else
     begin
-      tmpPath := arcPath + TMP_SUFFIX;
-      a.fout := TFileStream.Create(tmpPath, fmCreate);
+      a.fout := CreateTemp(arcPath, tmpPath);
+      a.tmpFull := ExpandFileName(tmpPath);
     end;
     try
       if not appending then
@@ -1777,7 +1811,11 @@ begin
       end;
       vstart := goodEnd;
       if fmt = 1 then
-        vheadSize := VHEAD_SIZE_1
+      begin
+        vheadSize := VHEAD_SIZE_1;
+        { format 1 has no codec byte: its blocks are v2 or v3 }
+        a.opts.flags := a.opts.flags and not SYLZ_V4;
+      end
       else
         vheadSize := VHEAD_SIZE;
       FillChar(vhead, SizeOf(vhead), 0);
@@ -1786,7 +1824,7 @@ begin
       if not (fmt in [ARC_FMT_ENC, ARC_FMT_ENC2]) then
         PInt64(@vhead[8])^ := NtoLE(UnixNow);   { formats 3, 4: 0, the time is in the index }
       vhead[16] := CODEC_SYLZ;   { format 2 only: format 1 ends before }
-      if opts.flags and SYLZ_V4 <> 0 then
+      if a.opts.flags and SYLZ_V4 <> 0 then
         vhead[16] := CODEC_SYLZ4;
       if a.enc then
         Move(vhead, a.sealer.vhead, VHEAD_SIZE);
@@ -1794,7 +1832,7 @@ begin
       a.pos := vstart + vheadSize;
 
       a.blockSize := SizeInt(opts.blockMiB) shl 20;
-      a.pipe := TPipeline.Create(opts.threads, False, opts.level, opts.flags);
+      a.pipe := TPipeline.Create(opts.threads, False, opts.level, a.opts.flags);
       for i := 0 to a.pipe.Slots - 1 do
         a.pipe.jobs[i].Reserve(a.blockSize, SylzBound(a.blockSize));
       if a.enc then
@@ -1898,6 +1936,7 @@ begin
   end;
   finally
     a.Free;
+    Unlock(lockH);
   end;
 end;
 
@@ -2422,6 +2461,7 @@ const
 var
   x: TExtractor;
   nExisting: Int64;
+  tmpLocal: string;
   mark: TMark;
   tmp, local, part: string;
   st, sel: TEntries;
@@ -2498,6 +2538,15 @@ begin
         if not x.SafeParents(sel[i].path) then
         begin
           WriteLn(StdErr, WarnTag, local, ': a directory on the way is a symlink, skipped');
+          x.status := Max(x.status, EXIT_WARN);
+          act[i] := acSkip;
+          Inc(x.nSkipped);
+          Continue;
+        end;
+        if (sel[i].kind = ET_DIR) and IsLink(local) then
+        begin
+          { its permissions and times would land on what the link points at }
+          WriteLn(StdErr, WarnTag, local, ': a symlink is where the directory goes, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Inc(x.nSkipped);
@@ -2608,7 +2657,7 @@ begin
                 Fail(EXIT_FATAL, 'cannot go on: the files under it would be out of order');
               end;
               try
-                fout := TFileStream.Create(LongPath(local + TMP_SUFFIX), fmCreate);
+                fout := CreateTemp(local, tmpLocal);
               except
                 on EFCreateError do
                 begin
@@ -2628,21 +2677,29 @@ begin
               except
                 fout.Free;
                 fout := nil;
-                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
+                SysUtils.DeleteFile(LongPath(tmpLocal));
                 raise;
               end;
               fout.Free;
               if (act[i] = acReplace) and not RemoveFile(local) then
               begin
-                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
+                SysUtils.DeleteFile(LongPath(tmpLocal));
                 WriteLn(StdErr, WarnTag, local, ': cannot replace it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
-              if not ReplaceFile(local + TMP_SUFFIX, local) then
+              { a new name: nothing may be there now (another entry of
+                this archive, under another case where case is ignored) }
+              if not RenameNew(tmpLocal, local) then
               begin
-                SysUtils.DeleteFile(LongPath(local + TMP_SUFFIX));
-                WriteLn(StdErr, WarnTag, local, ': cannot create it (from ', local + TMP_SUFFIX, ')');
+                SysUtils.DeleteFile(LongPath(tmpLocal));
+                if PathExists(local) then
+                begin
+                  Inc(x.nSkipped);
+                  WriteLn(StdErr, WarnTag, local, ' exists (another name for it in this archive?), skipped');
+                end
+                else
+                  WriteLn(StdErr, WarnTag, local, ': cannot create it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;

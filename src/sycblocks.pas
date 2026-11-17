@@ -10,6 +10,7 @@ interface
 uses
   {$ifdef windows}Windows,{$endif}
   {$ifdef unix}termio,{$endif}
+  {$ifdef unix}BaseUnix,{$endif}
   SysUtils, Classes, Math, sylz, sycui, sycfs;
 
 const
@@ -41,10 +42,22 @@ var
 
 procedure WriteU32(s: TStream; v: UInt32);
 function ReadU32(s: TStream): UInt32;
-{ Reads up to n bytes; fewer only at the end of the stream. }
+{ Reads up to n bytes; fewer only at the end of the stream. A read that
+  fails raises ESycError(EXIT_FATAL) (TStream.Read of a file or a pipe
+  would return 0, as at the end). }
 function ReadFull(s: TStream; p: PByte; n: SizeInt): SizeInt;
+{ one read: what s.Read does, but a failure raises as in ReadFull }
+function ReadSome(s: TStream; var buf; n: LongInt): LongInt;
 { Moves src over dst in one step, replacing it. }
 function ReplaceFile(const src, dst: string): Boolean;
+{ Moves src to dst unless something is at dst (also a name that differs
+  only in case, where the file system ignores case). }
+function RenameNew(const src, dst: string): Boolean;
+{ A new file to write final's data into before it is renamed over final:
+  final + TMP_SUFFIX, or final.N + TMP_SUFFIX when that name is taken. It
+  is created exclusively, so never through a symlink, nor over a file
+  that is already there. Raises EFCreateError when it cannot be made. }
+function CreateTemp(const final: string; out tmp: string): THandleStream;
 function StdStream(std: Integer): THandleStream;
 
 type
@@ -261,6 +274,32 @@ begin
   Result := LEtoN(Result);
 end;
 
+function ReadSome(s: TStream; var buf; n: LongInt): LongInt;
+{$ifdef windows}
+var
+  err: DWORD;
+{$endif}
+begin
+  if not (s is THandleStream) then
+    Exit(s.Read(buf, n));
+  repeat
+    Result := FileRead(THandleStream(s).Handle, buf, n);
+    if Result >= 0 then
+      Exit;
+{$ifdef unix}
+    if fpgeterrno = ESysEINTR then
+      Continue;
+    Fail(EXIT_FATAL, 'read error: ' + SysErrorMessage(fpgeterrno));
+{$else}
+    err := GetLastError;
+    { a pipe whose writer is done }
+    if (err = ERROR_BROKEN_PIPE) or (err = ERROR_HANDLE_EOF) then
+      Exit(0);
+    Fail(EXIT_FATAL, 'read error: ' + SysErrorMessage(err));
+{$endif}
+  until False;
+end;
+
 function ReadFull(s: TStream; p: PByte; n: SizeInt): SizeInt;
 var
   got: SizeInt;
@@ -268,11 +307,78 @@ begin
   Result := 0;
   while Result < n do
   begin
-    got := s.Read(p[Result], n - Result);
+    got := ReadSome(s, p[Result], n - Result);
     if got <= 0 then
       Break;
     Inc(Result, got);
   end;
+end;
+
+type
+  { a file handle, closed when the stream is freed }
+  TOwnedHandleStream = class(THandleStream)
+    destructor Destroy; override;
+  end;
+
+destructor TOwnedHandleStream.Destroy;
+begin
+  if Handle <> THandle(-1) then
+    FileClose(Handle);
+  inherited Destroy;
+end;
+
+function CreateTemp(const final: string; out tmp: string): THandleStream;
+var
+  k: Integer;
+  h: THandle;
+{$ifdef windows}
+  err: DWORD;
+{$else}
+  err: LongInt;
+{$endif}
+begin
+  for k := 0 to 99 do
+  begin
+    if k = 0 then
+      tmp := final + TMP_SUFFIX
+    else
+      tmp := final + '.' + IntToStr(k) + TMP_SUFFIX;
+{$ifdef windows}
+    h := CreateFileW(PWideChar(UnicodeString(LongPath(tmp))), GENERIC_READ or GENERIC_WRITE,
+      FILE_SHARE_READ, nil, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+    if h <> INVALID_HANDLE_VALUE then
+      Exit(TOwnedHandleStream.Create(h));
+    err := GetLastError;
+    if (err <> ERROR_FILE_EXISTS) and (err <> ERROR_ALREADY_EXISTS) then
+      Break;
+{$else}
+    { O_EXCL: a symlink at tmp is not followed, the open fails }
+    h := fpOpen(tmp, O_RDWR or O_CREAT or O_EXCL, &666);
+    if h >= 0 then
+      Exit(TOwnedHandleStream.Create(h));
+    err := fpgeterrno;
+    if err <> ESysEEXIST then
+      Break;
+{$endif}
+  end;
+  tmp := '';
+  raise EFCreateError.CreateFmt('Unable to create file "%s": %s', [final + TMP_SUFFIX,
+    SysErrorMessage(err)]);
+end;
+
+function RenameNew(const src, dst: string): Boolean;
+begin
+{$ifdef windows}
+  { without MOVEFILE_REPLACE_EXISTING it fails when dst is there }
+  Result := MoveFileExW(PWideChar(UnicodeString(LongPath(src))), PWideChar(UnicodeString(LongPath(dst))), 0);
+{$else}
+  { rename() replaces; what the name would replace is looked for right
+    before (lstat finds it under another case on a file system that
+    ignores case) }
+  if PathExists(dst) then
+    Exit(False);
+  Result := RenameFile(src, dst);
+{$endif}
 end;
 
 { rename does it on Unix; on Windows it fails when dst exists, MoveFileEx
@@ -318,7 +424,7 @@ begin
     if n = Count then
       Exit(n);
   end;
-  Result := n + inner.Read(PByte(@Buffer)[n], Count - n);
+  Result := n + ReadSome(inner, PByte(@Buffer)[n], Count - n);
 end;
 
 { ── the pipeline ───────────────────────────────────────────────────────── }
