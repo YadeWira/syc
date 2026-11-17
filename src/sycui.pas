@@ -59,6 +59,13 @@ function Count(n: Int64; const singular: string; const plural: string = ''): str
 { the columns s takes on a terminal: escape sequences take none, a UTF-8
   character one }
 function DisplayWidth(const s: string): Integer;
+{ s as it may go to a terminal: control characters (escape sequences
+  could set the title, the clipboard, hide lines) and bytes that are not
+  UTF-8 as \xNN }
+function Printable(const s: string): string;
+{ Printable(s) when std is a terminal, else s as it is (pipes and files
+  get the bytes the archive holds) }
+function Shown(std: Integer; const s: string): string;
 { s n times (a multi-byte character too) }
 function Repeated(const s: string; n: Integer): string;
 { s cut to at most width columns, with "…" (or "...") where it was cut }
@@ -95,6 +102,10 @@ var
   { False: ShowError shows nothing (the self-test runs commands that
     must fail) }
   ErrorsShown: Boolean = True;
+
+{ Flushes stdout; raises EInOutError when a write to it failed (Text
+  writes do not raise: a full disk would go unsaid) }
+procedure CheckOutput;
 
 { --debug's context, kept by the main thread: the file being worked on,
   and the block and offset when there are any (-1: none) }
@@ -411,6 +422,78 @@ begin
   end;
 end;
 
+function Printable(const s: string): string;
+var
+  i, n, k: Integer;
+  c: Byte;
+  cp: UInt32;
+  ok: Boolean;
+
+  procedure Hex(b: Byte);
+  begin
+    Result := Result + '\x' + IntToHex(b, 2);
+  end;
+
+begin
+  Result := '';
+  i := 1;
+  while i <= Length(s) do
+  begin
+    c := Byte(s[i]);
+    if c < $80 then
+    begin
+      if (c < $20) or (c = $7F) then
+        Hex(c)
+      else
+        Result := Result + s[i];
+      Inc(i);
+      Continue;
+    end;
+    { a UTF-8 sequence: its length from the lead byte, then checked }
+    if c and $E0 = $C0 then
+      n := 2
+    else if c and $F0 = $E0 then
+      n := 3
+    else if c and $F8 = $F0 then
+      n := 4
+    else
+      n := 0;
+    ok := (n > 0) and (i + n - 1 <= Length(s));
+    cp := 0;
+    if ok then
+    begin
+      cp := c and ($7F shr n);
+      for k := 1 to n - 1 do
+        if Byte(s[i + k]) and $C0 <> $80 then
+          ok := False
+        else
+          cp := cp shl 6 or (Byte(s[i + k]) and $3F);
+    end;
+    { overlong forms, surrogates, past U+10FFFF, and the C1 controls }
+    ok := ok and not ((n = 2) and (cp < $80)) and not ((n = 3) and (cp < $800))
+      and not ((n = 4) and (cp < $10000)) and not ((cp >= $D800) and (cp <= $DFFF))
+      and (cp <= $10FFFF) and not ((cp >= $80) and (cp <= $9F));
+    if ok then
+    begin
+      Result := Result + Copy(s, i, n);
+      Inc(i, n);
+    end
+    else
+    begin
+      Hex(c);
+      Inc(i);
+    end;
+  end;
+end;
+
+function Shown(std: Integer; const s: string): string;
+begin
+  if IsTerminal(std) then
+    Result := Printable(s)
+  else
+    Result := s;
+end;
+
 function Repeated(const s: string; n: Integer): string;
 var
   i: Integer;
@@ -576,6 +659,25 @@ begin
 end;
 {$endif}
 
+{ ── stdout ─────────────────────────────────────────────────────────────── }
+
+procedure CheckOutput;
+var
+  r: Integer;
+begin
+  r := IOResult;   { a write that failed (and cleared, so stderr works) }
+  try
+    Flush(Output);
+  except
+    on E: EInOutError do
+      raise EInOutError.Create('cannot write to stdout: ' + E.Message);
+  end;
+  if r = 0 then
+    r := IOResult;
+  if r <> 0 then
+    raise EInOutError.CreateFmt('cannot write to stdout (I/O error %d)', [r]);
+end;
+
 { ── --debug ────────────────────────────────────────────────────────────── }
 
 var
@@ -605,7 +707,9 @@ var
 begin
   if not ErrorsShown then
     Exit;
+  InOutRes := 0;   { a failed write to stdout would skip this one too }
   WriteLn(StdErr, ErrTag, E.Message);
+  Flush(StdErr);   { now: at exit stdout is closed first, and its failure would skip it }
   if not SycDebug then
     Exit;
   where := '';

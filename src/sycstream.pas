@@ -297,7 +297,7 @@ begin
     Fail(EXIT_CORRUPT, Format('%s: stream format version %d not supported by syc %s',
       [name, hdr[4], SYC_VERSION]));
   if (hdr[4] < FORMAT_ENC1) and EncryptionRequested(opts) then
-    Fail(EXIT_USAGE, name + ': not encrypted, but a password was given');
+    raise EInputUsage.Create(EXIT_USAGE, name + ': not encrypted, but a password was given');
   if (hdr[4] < FORMAT_ENC1) and PasswordInEnvironment then
     WriteLn(StdErr, WarnTag, name, ': not encrypted (SYC_PASSWORD was not used)');
   { version 4 and up: hdr[5] is the codec; the level byte follows }
@@ -414,8 +414,21 @@ var
   n, c: SizeInt;
   ctx: TSylzCtx;
 begin
-  SetLength(src, MAX_BLOCK + 1);
-  n := ReadFull(fin, @src[0], MAX_BLOCK + 1);
+  { as big as the input, when its size is known (a pipe: grown as it
+    comes, up to the limit) }
+  if fin is TFileStream then
+    n := Min(fin.Size, MAX_BLOCK) + 1
+  else
+    n := 1 shl 20;
+  SetLength(src, n);
+  n := ReadFull(fin, @src[0], Length(src));
+  while (n = Length(src)) and (n <= MAX_BLOCK) do
+  begin
+    SetLength(src, Min(2 * Length(src), MAX_BLOCK + 1));
+    Inc(n, ReadFull(fin, @src[n], Length(src) - n));
+    if n < Length(src) then
+      Break;
+  end;
   if n > MAX_BLOCK then
     Fail(EXIT_USAGE, Format('%s: --raw takes at most %d MiB (one block)', [name, MAX_BLOCK shr 20]));
   SetLength(src, n + 1);
@@ -517,6 +530,11 @@ begin
       end;
       if not fromStdin and SameFileName(ExpandFileName(input), ExpandFileName(outPath)) then
         Fail(EXIT_USAGE, input + ': the output is the input');
+      if DirectoryExists(outPath) then
+      begin
+        WriteLn(StdErr, WarnTag, outPath, ' is a directory, skipped');
+        Exit(EXIT_WARN);
+      end;
       if FileExists(outPath) and not opts.force then
       begin
         WriteLn(StdErr, WarnTag, outPath, ' exists, skipped (-f overwrites)');
@@ -621,6 +639,7 @@ begin
       if not fromStdin and (fpStat(input, st) = 0) then
         fpChmod(tmpPath, st.st_mode and &7777);
 {$endif}
+      ForgetTemp(tmpPath);
       if not ReplaceFile(tmpPath, outPath) then
       begin
         keep := tmpPath;
@@ -671,7 +690,10 @@ begin
     on E: Exception do
     begin
       if tmpPath <> '' then
+      begin
         SysUtils.DeleteFile(tmpPath);
+        ForgetTemp(tmpPath);
+      end;
       if E is ESycError then
         raise;
       if E is EOutOfMemory then
@@ -878,7 +900,7 @@ begin
     except
       on E: ESycError do
       begin
-        if E.code = EXIT_USAGE then
+        if (E.code = EXIT_USAGE) and not (E is EInputUsage) then
           raise;
         ShowError(E, E.code);
         r := E.code;

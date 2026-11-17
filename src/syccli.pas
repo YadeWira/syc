@@ -628,6 +628,26 @@ begin
   end;
 end;
 
+{ -X as the archive's paths are: "./a/b/", "/a/b" and "a\b" (Windows)
+  match the stored "a/b", as a PATH or a FILTER given that way does }
+function ExcludePattern(const value: string): string;
+begin
+  Result := value;
+{$ifdef windows}
+  Result := StringReplace(Result, '\', '/', [rfReplaceAll]);
+{$endif}
+  if Pos('/', Result) = 0 then
+    Exit;
+  while Copy(Result, 1, 2) = './' do
+    Delete(Result, 1, 2);
+  while Copy(Result, 1, 1) = '/' do
+    Delete(Result, 1, 1);
+  while (Length(Result) > 1) and (Result[Length(Result)] = '/') do
+    SetLength(Result, Length(Result) - 1);
+  if Result = '' then
+    Result := value;
+end;
+
 procedure UsageError(const msg: string);
 begin
   Fail(EXIT_USAGE, msg + ' (syc -h for help)');
@@ -705,11 +725,13 @@ begin
       CmdUsage(CommandOf(CmdArg(2)))
     else
       Usage;
+    CheckOutput;
     Halt(EXIT_OK);
   end;
   if (arg = '-V') or (arg = '--version') then
   begin
     WriteLn(VersionLines);
+    CheckOutput;
     Halt(EXIT_OK);
   end;
   opts.cmd := CommandOf(arg);
@@ -846,7 +868,7 @@ begin
       oExclude:
         begin
           SetLength(opts.excludes, Length(opts.excludes) + 1);
-          opts.excludes[High(opts.excludes)] := value;
+          opts.excludes[High(opts.excludes)] := ExcludePattern(value);
         end;
       oNoDedup: opts.noDedup := True;
       oNoDelete: opts.noDelete := True;
@@ -916,6 +938,7 @@ begin
       oHelp:
         begin
           CmdUsage(opts.cmd);
+          CheckOutput;
           Halt(EXIT_OK);
         end;
     end;
@@ -930,6 +953,17 @@ begin
     UsageError('-o takes one input only');
   if (opts.outPath <> '') and opts.toStdout then
     UsageError('-o and -O together');
+  if opts.cmd = 'c' then
+  begin
+    { two streams one after the other are not a stream: syc d refuses
+      what follows the first one's end }
+    k := 0;
+    for j := 0 to High(opts.operands) do
+      if opts.toStdout or (opts.operands[j] = '-') then
+        Inc(k);
+    if k > 1 then
+      UsageError('syc c writes one stream to stdout, from one input');
+  end;
   if opts.force and opts.skipExisting then
     UsageError('-f and --skip together');
   if opts.raw and (opts.cmd in ['d', 't']) and (opts.rawSize < 0) then

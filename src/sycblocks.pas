@@ -32,6 +32,10 @@ type
     constructor Create(aCode: Integer; const msg: string);
   end;
 
+  { a usage error about one input among several (a password for a file
+    that is not encrypted): exit 2, but the other inputs are still done }
+  EInputUsage = class(ESycError);
+
 procedure Fail(code: Integer; const msg: string);
 
 function crc32(crc: UInt32; p: PByte; n: SizeInt): UInt32;
@@ -58,6 +62,13 @@ function RenameNew(const src, dst: string): Boolean;
   is created exclusively, so never through a symlink, nor over a file
   that is already there. Raises EFCreateError when it cannot be made. }
 function CreateTemp(const final: string; out tmp: string): THandleStream;
+{ CreateTemp's files are deleted if a signal (Ctrl-C, a kill; Windows: the
+  console's Ctrl-C or close) ends the process: InstallCleanup sets that
+  up, ForgetTemp says one was renamed or deleted, CleanTemps (safe in a
+  signal handler) deletes those left. }
+procedure InstallCleanup;
+procedure ForgetTemp(const path: string);
+procedure CleanTemps;
 function StdStream(std: Integer): THandleStream;
 
 type
@@ -327,6 +338,8 @@ begin
   inherited Destroy;
 end;
 
+procedure RememberTemp(const path: string); forward;
+
 function CreateTemp(const final: string; out tmp: string): THandleStream;
 var
   k: Integer;
@@ -345,9 +358,12 @@ begin
       tmp := final + '.' + IntToStr(k) + TMP_SUFFIX;
 {$ifdef windows}
     h := CreateFileW(PWideChar(UnicodeString(LongPath(tmp))), GENERIC_READ or GENERIC_WRITE,
-      FILE_SHARE_READ, nil, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+      FILE_SHARE_READ or FILE_SHARE_DELETE, nil, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
     if h <> INVALID_HANDLE_VALUE then
+    begin
+      RememberTemp(tmp);
       Exit(TOwnedHandleStream.Create(h));
+    end;
     err := GetLastError;
     if (err <> ERROR_FILE_EXISTS) and (err <> ERROR_ALREADY_EXISTS) then
       Break;
@@ -355,7 +371,10 @@ begin
     { O_EXCL: a symlink at tmp is not followed, the open fails }
     h := fpOpen(tmp, O_RDWR or O_CREAT or O_EXCL, &666);
     if h >= 0 then
+    begin
+      RememberTemp(tmp);
       Exit(TOwnedHandleStream.Create(h));
+    end;
     err := fpgeterrno;
     if err <> ESysEEXIST then
       Break;
@@ -365,6 +384,121 @@ begin
   raise EFCreateError.CreateFmt('Unable to create file "%s": %s', [final + TMP_SUFFIX,
     SysErrorMessage(err)]);
 end;
+
+{ ── temporary files ────────────────────────────────────────────────────── }
+
+const
+  MAX_TEMPS = 64;
+
+var
+  { the paths, as the system takes them (Windows: UTF-16), or nil }
+{$ifdef windows}
+  temps: array[0..MAX_TEMPS - 1] of PWideChar;
+{$else}
+  temps: array[0..MAX_TEMPS - 1] of PChar;
+{$endif}
+  tempsLock: TRTLCriticalSection;
+
+procedure RememberTemp(const path: string);
+var
+  i: Integer;
+{$ifdef windows}
+  w: UnicodeString;
+{$endif}
+begin
+  EnterCriticalSection(tempsLock);
+  try
+    for i := 0 to MAX_TEMPS - 1 do
+      if temps[i] = nil then
+      begin
+{$ifdef windows}
+        w := UnicodeString(LongPath(path));
+        temps[i] := GetMem((Length(w) + 1) * 2);
+        Move(PWideChar(w)^, temps[i]^, (Length(w) + 1) * 2);
+{$else}
+        temps[i] := GetMem(Length(path) + 1);
+        Move(PChar(path)^, temps[i]^, Length(path) + 1);
+{$endif}
+        Exit;
+      end;
+  finally
+    LeaveCriticalSection(tempsLock);
+  end;
+end;
+
+procedure ForgetTemp(const path: string);
+var
+  i: Integer;
+  p: Pointer;
+{$ifdef windows}
+  w: UnicodeString;
+{$endif}
+begin
+  if path = '' then
+    Exit;
+{$ifdef windows}
+  w := UnicodeString(LongPath(path));
+{$endif}
+  EnterCriticalSection(tempsLock);
+  try
+    for i := 0 to MAX_TEMPS - 1 do
+      if (temps[i] <> nil)
+{$ifdef windows}
+         and (UnicodeString(temps[i]) = w)
+{$else}
+         and (StrComp(temps[i], PChar(path)) = 0)
+{$endif}
+      then
+      begin
+        p := temps[i];
+        temps[i] := nil;
+        FreeMem(p);
+        Exit;
+      end;
+  finally
+    LeaveCriticalSection(tempsLock);
+  end;
+end;
+
+procedure CleanTemps;
+var
+  i: Integer;
+begin
+  for i := 0 to MAX_TEMPS - 1 do
+    if temps[i] <> nil then
+{$ifdef windows}
+      DeleteFileW(temps[i]);
+{$else}
+      fpUnlink(temps[i]);
+{$endif}
+end;
+
+{$ifdef windows}
+function OnConsoleCtrl(ctrl: DWORD): BOOL; stdcall;
+begin
+  CleanTemps;
+  Result := False;   { then what Windows does by default: the process ends }
+end;
+
+procedure InstallCleanup;
+begin
+  SetConsoleCtrlHandler(@OnConsoleCtrl, True);
+end;
+{$else}
+procedure OnSignal(sig: LongInt); cdecl;
+begin
+  CleanTemps;
+  fpSignal(sig, SignalHandler(SIG_DFL));
+  fpKill(fpGetPid, sig);
+end;
+
+procedure InstallCleanup;
+begin
+  fpSignal(SIGINT, SignalHandler(@OnSignal));
+  fpSignal(SIGTERM, SignalHandler(@OnSignal));
+  fpSignal(SIGHUP, SignalHandler(@OnSignal));
+end;
+{$endif}
 
 function RenameNew(const src, dst: string): Boolean;
 begin
@@ -810,9 +944,10 @@ begin
     Work;
     Exit;
   end;
+  { before the workers start: one that fails at once sets it }
+  failed := False;
   for i := 0 to High(threads) do
     RTLEventSetEvent(startEv[i]);
-  failed := False;
   try
     Work;
   finally
@@ -844,5 +979,6 @@ begin
 end;
 
 initialization
+  InitCriticalSection(tempsLock);
   CrcInit;
 end.

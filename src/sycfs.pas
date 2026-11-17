@@ -88,6 +88,16 @@ function LongPath(const path: string): string;
 { ForceDirectories, through LongPath on Windows }
 function ForceDirs(const dir: string): Boolean;
 
+type
+  { what tells one file from another: device and inode (Windows: volume
+    and file index) }
+  TFileId = record
+    dev, ino: UInt64;
+  end;
+
+{ path's file's id, following symlinks; False when it cannot be read }
+function GetFileId(const path: string; out id: TFileId): Boolean;
+
 { An exclusive lock on the file at path, held until Unlock (for a change
   in place: syc a appending, syc k). False when another process holds
   it. A file system without locks: True, unlocked (h = -1). }
@@ -95,6 +105,44 @@ function LockFile(const path: string; out h: THandle): Boolean;
 procedure Unlock(h: THandle);
 
 implementation
+
+{$ifdef windows}
+function GetFileId(const path: string; out id: TFileId): Boolean;
+var
+  h: THandle;
+  info: TByHandleFileInformation;
+begin
+  id.dev := 0;
+  id.ino := 0;
+  h := CreateFileW(PWideChar(UnicodeString(LongPath(path))), 0,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if h = INVALID_HANDLE_VALUE then
+    Exit(False);
+  Result := GetFileInformationByHandle(h, info);
+  CloseHandle(h);
+  if Result then
+  begin
+    id.dev := info.dwVolumeSerialNumber;
+    id.ino := UInt64(info.nFileIndexHigh) shl 32 or info.nFileIndexLow;
+  end;
+end;
+{$else}
+function GetFileId(const path: string; out id: TFileId): Boolean;
+var
+  st: Stat;
+begin
+  id.dev := 0;
+  id.ino := 0;
+  FillChar(st, SizeOf(st), 0);
+  Result := fpStat(path, st) = 0;
+  if Result then
+  begin
+    id.dev := st.st_dev;
+    id.ino := st.st_ino;
+  end;
+end;
+{$endif}
 
 {$ifdef windows}
 function LockFileEx(hFile: THandle; dwFlags, dwReserved, nLow, nHigh: DWORD;
@@ -738,11 +786,24 @@ begin
   Result := True;
 end;
 
+type
+  { the (pi, si) pairs already found not to match: without it, patterns
+    with several * take exponential time on a long name }
+  TGlobMemo = record
+    width: Integer;
+    failed: array of Boolean;
+  end;
+
 { p[pi..] against s[si..] }
-function GlobAt(const p: string; pi: Integer; const s: string; si: Integer): Boolean;
+function GlobAt(const p: string; pi: Integer; const s: string; si: Integer;
+  var memo: TGlobMemo): Boolean;
 var
-  k: Integer;
+  k, key: Integer;
 begin
+  key := pi * memo.width + si;
+  if memo.failed[key] then
+    Exit(False);
+  Result := False;
   while pi <= Length(p) do
   begin
     case p[pi] of
@@ -751,11 +812,12 @@ begin
         begin
           { **: anything, "/" included; "**/" also matches nothing }
           Inc(pi, 2);
-          if (pi <= Length(p)) and (p[pi] = '/') and GlobAt(p, pi + 1, s, si) then
+          if (pi <= Length(p)) and (p[pi] = '/') and GlobAt(p, pi + 1, s, si, memo) then
             Exit(True);
           for k := si to Length(s) + 1 do
-            if GlobAt(p, pi, s, k) then
+            if GlobAt(p, pi, s, k, memo) then
               Exit(True);
+          memo.failed[key] := True;
           Exit(False);
         end
         else
@@ -764,43 +826,53 @@ begin
           k := si;
           while True do
           begin
-            if GlobAt(p, pi, s, k) then
+            if GlobAt(p, pi, s, k, memo) then
               Exit(True);
             if (k > Length(s)) or (s[k] = '/') then
+            begin
+              memo.failed[key] := True;
               Exit(False);
+            end;
             Inc(k);
           end;
         end;
       '?':
         begin
           if (si > Length(s)) or (s[si] = '/') then
-            Exit(False);
+            Break;
           Inc(pi);
           Inc(si);
         end;
     else
       if (si > Length(s)) or (s[si] <> p[pi]) then
-        Exit(False);
+        Break;
       Inc(pi);
       Inc(si);
     end;
   end;
-  Result := si > Length(s);
+  Result := (pi > Length(p)) and (si > Length(s));
+  if not Result then
+    memo.failed[key] := True;
 end;
 
 function GlobMatch(const pattern, path: string): Boolean;
 var
   k: Integer;
+  name: string;
+  memo: TGlobMemo;
 begin
   if Pos('/', pattern) = 0 then
   begin
     k := Length(path);
     while (k > 0) and (path[k] <> '/') do
       Dec(k);
-    Result := GlobAt(pattern, 1, Copy(path, k + 1, MaxInt), 1);
+    name := Copy(path, k + 1, MaxInt);
   end
   else
-    Result := GlobAt(pattern, 1, path, 1);
+    name := path;
+  memo.width := Length(name) + 2;
+  SetLength(memo.failed, (Length(pattern) + 2) * memo.width);
+  Result := GlobAt(pattern, 1, name, 1, memo);
 end;
 
 end.

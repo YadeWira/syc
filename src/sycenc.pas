@@ -424,6 +424,7 @@ begin
     TCSetAttr(ttyFd, TCSANOW, ttyOld);
     fpWrite(ttyFd, #10, 1);
   end;
+  CleanTemps;
   fpSignal(sig, SignalHandler(SIG_DFL));
   fpKill(fpGetPid, sig);
 end;
@@ -624,11 +625,20 @@ begin
   Wipe(@pw[1], Length(pw));
 end;
 
+function IfThenStr(c: Boolean; const a, b: string): string;
+begin
+  if c then
+    Result := a
+  else
+    Result := b;
+end;
+
 function GetPassword(const opts: TOptions; creating: Boolean; const what: string): TBytes;
 begin
   Result := PasswordFrom(opts.passwordInline, opts.passwordFile, 'SYC_PASSWORD',
     'Password for ' + what + ': ', creating,
-    what + ' is encrypted: give the password (-pPASSWORD, --password-file '
+    IfThenStr(creating, 'to encrypt ' + what, what + ' is encrypted')
+    + ': give the password (-pPASSWORD, --password-file '
     + 'FILE or SYC_PASSWORD), or run where it can be asked');
 end;
 

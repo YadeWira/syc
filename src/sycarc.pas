@@ -49,6 +49,54 @@ begin
 end;
 {$endif}
 
+{ local time minus UTC, in seconds, at the moment unixSec (summer time
+  where it applies then, not where it applies now) }
+{$ifdef windows}
+function SystemTimeToTzSpecificLocalTime(tz: Pointer; const utc: TSystemTime;
+  out local: TSystemTime): BOOL; stdcall; external 'kernel32.dll';
+
+function UtcOffsetAt(unixSec: Int64): Int64;
+var
+  ft: TFileTime;
+  utc, local: TSystemTime;
+  v: Int64;
+begin
+  Result := -Int64(GetLocalTimeOffset) * 60;
+  v := unixSec * 10000000 + 116444736000000000;
+  if v < 0 then
+    Exit;
+  ft.dwLowDateTime := DWORD(v);
+  ft.dwHighDateTime := DWORD(v shr 32);
+  if FileTimeToSystemTime(ft, utc) and SystemTimeToTzSpecificLocalTime(nil, utc, local) then
+    Result := Round((SystemTimeToDateTime(local) - SystemTimeToDateTime(utc)) * 86400);
+end;
+{$else}
+type
+  TTm = record
+    tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst: LongInt;
+    tm_gmtoff: PtrInt;
+    tm_zone: PChar;
+    spare: array[0..7] of PtrInt;
+  end;
+
+function localtime_r(t: PPtrInt; tm: Pointer): Pointer; cdecl; external 'c' name 'localtime_r';
+
+function UtcOffsetAt(unixSec: Int64): Int64;
+var
+  t: PtrInt;
+  tm: TTm;
+begin
+  Result := -Int64(GetLocalTimeOffset) * 60;
+  { time_t is a long: on 32-bit targets, 1901..2038 }
+  if (unixSec < Low(PtrInt)) or (unixSec > High(PtrInt)) then
+    Exit;
+  t := unixSec;
+  FillChar(tm, SizeOf(tm), 0);
+  if localtime_r(@t, @tm) <> nil then
+    Result := tm.tm_gmtoff;
+end;
+{$endif}
+
 function FormatTime(unixSec: Int64; seconds: Boolean): string;
 const
   { years 1 to 9999, what TDateTime formats (a damaged or crafted
@@ -64,22 +112,24 @@ begin
       Exit('????-??-?? ??:??:??');
     Exit('????-??-?? ??:??');
   end;
-  dt := UnixDateDelta + unixSec / 86400 - GetLocalTimeOffset / 1440;
+  dt := UnixDateDelta + (unixSec + UtcOffsetAt(unixSec)) / 86400;
   if seconds then
     Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', dt)
   else
     Result := FormatDateTime('yyyy-mm-dd hh:nn', dt);
 end;
 
+{ (the messages hold paths: on a terminal, their control characters are
+  shown escaped) }
 procedure Warn(const opts: TOptions; const msg: string);
 begin
-  WriteLn(StdErr, WarnTag, msg);
+  WriteLn(StdErr, WarnTag, Shown(2, msg));
 end;
 
 procedure Note(const opts: TOptions; const msg: string);
 begin
   if opts.verbosity = vVerbose then
-    WriteLn(StdErr, msg);
+    WriteLn(StdErr, Shown(2, msg));
 end;
 
 { path or one of its parent directories matches a pattern }
@@ -323,6 +373,8 @@ type
     status: Integer;
     prm: TCdcParams;
     arcFull, tmpFull: string;   { never added to themselves }
+    arcId: TFileId;             { nor under another name (a symlinked directory) }
+    hasArcId: Boolean;
     unreadPaths: array of string;   { could not be read: not deleted }
     entries: TEntries;
     count: SizeInt;
@@ -500,6 +552,7 @@ end;
 procedure TAdder.Walk(const local, stored: string);
 var
   m: TMeta;
+  id: TFileId;
   names: TStringList;
   i: Integer;
   full: string;
@@ -518,6 +571,9 @@ begin
   begin
     full := ExpandFileName(local);
     if SameFileName(full, arcFull) or SameFileName(full, tmpFull) then
+      Exit;
+    if hasArcId and (m.kind = ET_FILE) and GetFileId(local, id)
+       and (id.dev = arcId.dev) and (id.ino = arcId.ino) then
       Exit;
   end;
   case m.kind of
@@ -1129,7 +1185,7 @@ begin
     end;
   end
   else if EncryptionRequested(opts) then
-    raise ESycError.Create(EXIT_USAGE, name + ': not encrypted, but a password was given')
+    raise EInputUsage.Create(EXIT_USAGE, name + ': not encrypted, but a password was given')
   else if PasswordInEnvironment then
     WriteLn(StdErr, WarnTag, name, ': not encrypted (SYC_PASSWORD was not used)');
 
@@ -1476,6 +1532,7 @@ var
   n, y, mo, d, h, mi, sec: Integer;
   t: Int64;
   ok: Boolean;
+  day: TDateTime;
 begin
   Result := Length(a.versions);
   if spec = '' then
@@ -1501,11 +1558,13 @@ begin
   if ok and (Length(spec) = 19) then
     ok := (spec[17] = ':') and TryStrToInt(Copy(spec, 18, 2), sec);
   ok := ok and (mo in [1..12]) and (d in [1..31]) and (h in [0..23]) and (mi in [0..59])
-    and (sec in [0..59]);
+    and (sec in [0..59]) and (y >= 1) and TryEncodeDate(y, mo, d, day);
   if not ok then
     Fail(EXIT_USAGE, '-u takes a version number or a date YYYY-MM-DD[THH:MM[:SS]], not "' + spec + '"');
-  t := Round((EncodeDate(y, mo, d) + EncodeTime(h, mi, sec, 0) - UnixDateDelta) * 86400)
-    + Int64(GetLocalTimeOffset) * 60;
+  { local time to UTC with the offset of that moment (looked up at the
+    moment the current offset gives, then again at the one found) }
+  t := Round((day + EncodeTime(h, mi, sec, 0) - UnixDateDelta) * 86400);
+  t := t - UtcOffsetAt(t - UtcOffsetAt(t));
   Result := 0;
   while (Result < Length(a.versions)) and (a.versions[Result].time <= t) do
     Inc(Result);
@@ -1531,7 +1590,15 @@ begin
     finally
       s.Free;
     end;
-    Result := TArchive.Open(tmp, '(stdin)', False, needData, opts);
+    try
+      Result := TArchive.Open(tmp, '(stdin)', False, needData, opts);
+    except
+      { the copy of stdin goes with the failure (callers delete it once
+        the archive is open) }
+      SysUtils.DeleteFile(tmp);
+      tmp := '';
+      raise;
+    end;
   end
   else
     Result := TArchive.Open(path, path, False, needData, opts);
@@ -1585,16 +1652,20 @@ var
   hdrB, pw, rec: TBytes;
   t0: UInt64;
   lockH: THandle;
+  tail: Int64;   { bytes after the last commit (an interrupted append) }
 begin
   t0 := NowNs;
   Phase('a: the archive as it is, the files');
   arcPath := opts.operands[0];
   toStdout := arcPath = '-';
+  if not toStdout and DirectoryExists(arcPath) then
+    Fail(EXIT_USAGE, arcPath + ': a directory, not an archive (syc a ARCHIVE PATH...)');
   appending := not toStdout and FileExists(arcPath);
   if toStdout and IsTerminal(1) then
     Fail(EXIT_USAGE, 'an archive is not written to a terminal');
   { two appends at once would each cut what the other wrote }
   lockH := THandle(-1);
+  tail := 0;
   if appending and not LockFile(arcPath, lockH) then
     Fail(EXIT_FATAL, arcPath + ': another syc is adding to it (try again when it is done)');
   tmpPath := '';
@@ -1607,6 +1678,7 @@ begin
     begin
       a.arcFull := ExpandFileName(arcPath);
       a.tmpFull := a.arcFull + TMP_SUFFIX;
+      a.hasArcId := appending and GetFileId(arcPath, a.arcId);
     end;
 
     { the archive so far: its last state, its fragments for dedup }
@@ -1635,6 +1707,14 @@ begin
         Fail(EXIT_USAGE, arcPath + ' is not encrypted: a version cannot add a password to it'
           + ' (unset SYC_PASSWORD to add an unencrypted version)');
       a.prm := arc.prm;
+      { the format lets an archive have fragments up to 16 MiB; syc reads
+        files 8 MiB at a time, and a fragment must fit a block }
+      if a.prm.maxSize > BATCH_SIZE div 2 then
+        Fail(EXIT_FATAL, Format('%s: its fragments go up to %d MiB, more than syc a can add to',
+          [arcPath, a.prm.maxSize shr 20]));
+      if a.prm.maxSize > SizeInt(opts.blockMiB) shl 20 then
+        Fail(EXIT_USAGE, Format('%s: its fragments go up to %d KiB: give -b %d or more',
+          [arcPath, a.prm.maxSize shr 10, (a.prm.maxSize + (1 shl 20) - 1) shr 20]));
       fmt := arc.fmt;
       prev := arc.State(Length(arc.versions));
       for i := 0 to High(arc.versions) do
@@ -1647,11 +1727,7 @@ begin
         goodEnd := arc.versions[High(arc.versions)].commitPos + COMMIT_SIZE
       else
         goodEnd := arc.dataStart;
-      if goodEnd < arc.size then
-      begin
-        WriteLn(StdErr, WarnTag, Format('%s: %d bytes after the last complete version (an interrupted '
-          + 'syc a) are cut', [arcPath, arc.size - goodEnd]));
-      end;
+      tail := arc.size - goodEnd;   { said when they are cut, below }
       FreeAndNil(arc);
     end;
 
@@ -1743,6 +1819,12 @@ begin
     begin
       if appending then
       begin
+        if tail > 0 then
+        begin
+          WriteLn(StdErr, WarnTag, Format('%s: %d bytes after the last complete version (an '
+            + 'interrupted syc a?) are left: the next version added cuts them', [arcPath, tail]));
+          a.status := Max(a.status, EXIT_WARN);
+        end;
         if opts.verbosity <> vQuiet then
           WriteLn(StdErr, Summary(2, mkOk, arcPath, ['no changes',
             Count(nSame, 'entry', 'entries') + ' unchanged', 'no version added']));
@@ -1760,6 +1842,9 @@ begin
     begin
       fs := TFileStream.Create(arcPath, fmOpenReadWrite or fmShareDenyWrite);
       a.fout := fs;
+      if tail > 0 then
+        WriteLn(StdErr, WarnTag, Format('%s: %d bytes after the last complete version (an '
+          + 'interrupted syc a?) are cut', [arcPath, tail]));
       fs.Size := goodEnd;
       fs.Position := goodEnd;
     end
@@ -1895,6 +1980,7 @@ begin
     FreeAndNil(a.fout);
     if tmpPath <> '' then
     begin
+      ForgetTemp(tmpPath);
       if not ReplaceFile(tmpPath, arcPath) then
       begin
         keep := tmpPath;
@@ -1924,7 +2010,10 @@ begin
     on E: Exception do
     begin
       if tmpPath <> '' then
+      begin
         SysUtils.DeleteFile(tmpPath);
+        ForgetTemp(tmpPath);
+      end;
       arc.Free;
       FreeAndNil(a.fout);
       if E is ESycError then
@@ -1985,6 +2074,18 @@ begin
 end;
 
 { path is selected by the filters (none: everything) }
+{ a FILTER operand as the archive stores paths; "." (and "./") is '',
+  everything }
+function FilterPath(const s: string): string;
+begin
+  try
+    Result := StoredPath(s);
+  except
+    on E: EConvertError do
+      Fail(EXIT_USAGE, s + ': a FILTER is a path as the archive stores it, without ..');
+  end;
+end;
+
 function Selected(const filters: array of string; const path: string): Boolean;
 var
   i: Integer;
@@ -1992,7 +2093,7 @@ begin
   if Length(filters) = 0 then
     Exit(True);
   for i := 0 to High(filters) do
-    if (path = filters[i]) or GlobMatch(filters[i], path)
+    if (filters[i] = '') or (path = filters[i]) or GlobMatch(filters[i], path)
        or ((Length(path) > Length(filters[i])) and (Copy(path, 1, Length(filters[i]) + 1) = filters[i] + '/')) then
       Exit(True);
   Result := False;
@@ -2001,7 +2102,7 @@ end;
 function ListCommand(const opts: TOptions): Integer;
 var
   a: TArchive;
-  tmp, line, ending: string;
+  tmp, line, ending, target: string;
   st: TEntries;
   filters: array of string;
   i, n, v, upTo: SizeInt;
@@ -2023,7 +2124,7 @@ begin
   shownBytes := 0;
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
-    filters[i - 1] := StoredPath(opts.operands[i]);
+    filters[i - 1] := FilterPath(opts.operands[i]);
   a := OpenArchive(opts.operands[0], tmp, False, opts);
   try
     WarnDamaged(a, Result);
@@ -2054,6 +2155,12 @@ begin
       if not Selected(filters, st[i].path) or Excluded(opts.excludes, st[i].path) then
         Continue;
       line := st[i].path;
+      target := st[i].meta.target;
+      if pretty then
+      begin
+        line := Printable(line);
+        target := Printable(target);
+      end;
       if st[i].kind = ET_DELETED then
       begin
         if opts.nullSep then
@@ -2066,7 +2173,7 @@ begin
       if st[i].kind = ET_DIR then
         line := Paint(1, stDir, line + '/')
       else if st[i].kind = ET_SYMLINK then
-        line := Paint(1, stLink, line) + ' -> ' + st[i].meta.target
+        line := Paint(1, stLink, line) + ' -> ' + target
       else
       begin
         Inc(shownFiles);
@@ -2482,7 +2589,7 @@ begin
   x.outDir := opts.outPath;
   SetLength(filters, Length(opts.operands) - 1);
   for i := 1 to High(opts.operands) do
-    filters[i - 1] := StoredPath(opts.operands[i]);
+    filters[i - 1] := FilterPath(opts.operands[i]);
   x.a := OpenArchive(opts.operands[0], tmp, True, opts);
   try
     WarnDamaged(x.a, x.status);
@@ -2528,7 +2635,7 @@ begin
 {$ifdef windows}
         if not WindowsName(sel[i].path) then
         begin
-          WriteLn(StdErr, WarnTag, sel[i].path, ': not a valid name on Windows, skipped');
+          WriteLn(StdErr, WarnTag, Shown(2, sel[i].path), ': not a valid name on Windows, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Inc(x.nSkipped);
@@ -2537,7 +2644,7 @@ begin
 {$endif}
         if not x.SafeParents(sel[i].path) then
         begin
-          WriteLn(StdErr, WarnTag, local, ': a directory on the way is a symlink, skipped');
+          WriteLn(StdErr, WarnTag, Shown(2, local), ': a directory on the way is a symlink, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Inc(x.nSkipped);
@@ -2546,7 +2653,7 @@ begin
         if (sel[i].kind = ET_DIR) and IsLink(local) then
         begin
           { its permissions and times would land on what the link points at }
-          WriteLn(StdErr, WarnTag, local, ': a symlink is where the directory goes, skipped');
+          WriteLn(StdErr, WarnTag, Shown(2, local), ': a symlink is where the directory goes, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Inc(x.nSkipped);
@@ -2559,7 +2666,7 @@ begin
           Continue;
         if DirectoryExists(LongPath(local)) and not IsLink(local) then
         begin
-          WriteLn(StdErr, WarnTag, local, ': a directory is in the way, skipped');
+          WriteLn(StdErr, WarnTag, Shown(2, local), ': a directory is in the way, skipped');
           x.status := Max(x.status, EXIT_WARN);
           act[i] := acSkip;
           Inc(x.nSkipped);
@@ -2575,7 +2682,7 @@ begin
             { the first few by name (all with -v), then how many more }
             Inc(nExisting);
             if (nExisting <= SHOW_EXISTING) or (opts.verbosity = vVerbose) then
-              WriteLn(StdErr, WarnTag, local, ' exists, skipped (-f replaces, --skip is silent)');
+              WriteLn(StdErr, WarnTag, Shown(2, local), ' exists, skipped (-f replaces, --skip is silent)');
             x.status := Max(x.status, EXIT_WARN);
           end;
         end;
@@ -2643,7 +2750,7 @@ begin
             begin
               if not ForceDirs(local) then
               begin
-                WriteLn(StdErr, WarnTag, local, ': cannot create the directory');
+                WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot create the directory');
                 x.status := Max(x.status, EXIT_WARN);
               end;
               Inc(x.nDirs);
@@ -2653,7 +2760,7 @@ begin
               part := ExtractFileDir(local);
               if (part <> '') and not ForceDirs(part) then
               begin
-                WriteLn(StdErr, WarnTag, part, ': cannot create the directory');
+                WriteLn(StdErr, WarnTag, Shown(2, part), ': cannot create the directory');
                 Fail(EXIT_FATAL, 'cannot go on: the files under it would be out of order');
               end;
               try
@@ -2661,7 +2768,7 @@ begin
               except
                 on EFCreateError do
                 begin
-                  WriteLn(StdErr, WarnTag, local, ': cannot create, skipped');
+                  WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot create, skipped');
                   x.status := Max(x.status, EXIT_WARN);
                   fout := TDiscard.Create;
                   try
@@ -2678,28 +2785,32 @@ begin
                 fout.Free;
                 fout := nil;
                 SysUtils.DeleteFile(LongPath(tmpLocal));
+                ForgetTemp(tmpLocal);
                 raise;
               end;
               fout.Free;
               if (act[i] = acReplace) and not RemoveFile(local) then
               begin
                 SysUtils.DeleteFile(LongPath(tmpLocal));
-                WriteLn(StdErr, WarnTag, local, ': cannot replace it');
+                ForgetTemp(tmpLocal);
+                WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot replace it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
               { a new name: nothing may be there now (another entry of
                 this archive, under another case where case is ignored) }
+              ForgetTemp(tmpLocal);   { renamed, or deleted just below }
               if not RenameNew(tmpLocal, local) then
               begin
                 SysUtils.DeleteFile(LongPath(tmpLocal));
+                ForgetTemp(tmpLocal);
                 if PathExists(local) then
                 begin
                   Inc(x.nSkipped);
-                  WriteLn(StdErr, WarnTag, local, ' exists (another name for it in this archive?), skipped');
+                  WriteLn(StdErr, WarnTag, Shown(2, local), ' exists (another name for it in this archive?), skipped');
                 end
                 else
-                  WriteLn(StdErr, WarnTag, local, ': cannot create it');
+                  WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot create it');
                 x.status := Max(x.status, EXIT_WARN);
                 Continue;
               end;
@@ -2719,13 +2830,13 @@ begin
             ForceDirs(part);
           if (act[i] = acReplace) and not RemoveFile(local) then
           begin
-            WriteLn(StdErr, WarnTag, local, ': cannot replace it');
+            WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot replace it');
             x.status := Max(x.status, EXIT_WARN);
             Continue;
           end;
           if not MakeSymlink(sel[i].meta, local) then
           begin
-            WriteLn(StdErr, WarnTag, local, ': cannot create the symlink');
+            WriteLn(StdErr, WarnTag, Shown(2, local), ': cannot create the symlink');
             x.status := Max(x.status, EXIT_WARN);
             Continue;
           end;

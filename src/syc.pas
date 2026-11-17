@@ -37,6 +37,8 @@ begin
     ForceDirectories) would otherwise split names at it }
   AllowDirectorySeparators := ['/'];
 {$endif}
+  { Ctrl-C or a kill: no half-written output left behind }
+  InstallCleanup;
   try
     ParseCommandLine(opts);
     KdfMemMaxKiB := UInt32(opts.kdfMemMaxMiB) * 1024;
@@ -55,14 +57,19 @@ begin
     else
       ExitCode := RunStreamCommand(opts);
     end;
+    { what is left in stdout's buffer: a failure there (a full disk, a
+      closed pipe's reader gone) is an error too, not lost at exit }
+    CheckOutput;
   except
     on E: ESycError do
     begin
+      InOutRes := 0;   { a failed write to stdout must not silence stderr }
       ShowError(E, E.code);
       ExitCode := E.code;
     end;
     on E: Exception do
     begin
+      InOutRes := 0;
       ShowError(E, EXIT_FATAL);
       ExitCode := EXIT_FATAL;
     end;
@@ -74,6 +81,10 @@ begin
       ShowStats(opts.threads, t0);
     ShowPhases;
   end;
+  { stderr written out before the RTL closes stdout (whose failure would
+    leave stderr's buffer unwritten); stdout's own failure was reported }
+  InOutRes := 0;
+  Flush(StdErr);
   { the passwords given on the command line, cleared (best effort: the
     process's arguments still hold them) }
   if opts.passwordInline <> '' then
