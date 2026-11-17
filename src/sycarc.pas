@@ -1127,6 +1127,7 @@ var
   n, i: SizeInt;
   ok: Boolean;
   w: array[0..11] of Byte;
+  stop: Int64;
   pw: TBytes;
   keys: TSycKeys;
 begin
@@ -1196,16 +1197,7 @@ begin
   ok := True;
   while at > dataStart do
   begin
-    { a commit is taken only if what it points at is there: a version
-      header at vstart, and an index at istart that ends right at the
-      commit. (An archive stored inside this one, cut by an interrupted
-      append, ends with a commit of its own, pointing elsewhere.) }
-    if not ReadCommit(Self, at - COMMIT_SIZE, vstart, istart) or (vstart < dataStart)
-       or (vstart >= at - COMMIT_SIZE) or (istart <= vstart) or (istart >= at - COMMIT_SIZE)
-       or not ReadAt(vstart, @w, 4) or (CompareByte(w[0], VHEAD_MAGIC[1], 4) <> 0)
-       or not ReadAt(istart, @w, 4 + 8) or (CompareByte(w[0], INDEX_MAGIC[1], 4) <> 0)
-       or (istart + 4 + BLOCKHDR_SIZE + indexExtra + (LEtoN(PUInt32(@w[8])^) and $7FFFFFFF)
-           <> at - COMMIT_SIZE) then
+    if not ReadCommit(Self, at - COMMIT_SIZE, vstart, istart) or (vstart >= at - COMMIT_SIZE) then
     begin
       ok := False;
       Break;
@@ -1218,13 +1210,38 @@ begin
     Inc(n);
     at := vstart;
   end;
+  { The last commit should point at a version header and at an index that
+    ends right at it. An archive stored inside this one, cut by an
+    interrupted append, ends with a commit of its own, pointing elsewhere:
+    then the archive is read forward, and what follows is a damaged tail.
+    Unless the forward reading stops right where that commit's version
+    starts: that version is there but damaged (exit 3 when it is loaded),
+    not cut off. }
+  if ok and (at = dataStart) and (n > 0) then
+    with list[0] do
+      if (vstart < dataStart) or (istart <= vstart) or (istart >= commitPos)
+         or not ReadAt(vstart, @w, 4) or (CompareByte(w[0], VHEAD_MAGIC[1], 4) <> 0)
+         or not ReadAt(istart, @w, 4 + 8) or (CompareByte(w[0], INDEX_MAGIC[1], 4) <> 0)
+         or (istart + 4 + BLOCKHDR_SIZE + indexExtra + (LEtoN(PUInt32(@w[8])^) and $7FFFFFFF)
+             <> commitPos) then
+      begin
+        ScanForward;
+        if Length(versions) > 0 then
+          stop := versions[High(versions)].commitPos + COMMIT_SIZE
+        else
+          stop := dataStart;
+        if stop <> list[0].vstart then
+          ok := False   { keep what ScanForward found }
+        else
+          damaged := False;
+      end;
   if ok and (at = dataStart) then
   begin
     SetLength(versions, n);
     for i := 0 to n - 1 do
       versions[i] := list[n - 1 - i];
   end
-  else
+  else if not damaged then
     ScanForward;
   for i := 0 to High(versions) do
     LoadVersion(i);

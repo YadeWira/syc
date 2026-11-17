@@ -653,18 +653,20 @@ begin
   Fail(EXIT_USAGE, msg + ' (syc -h for help)');
 end;
 
-function IntArg(const name, s: string; lo, hi: Integer): Integer;
+function IntArg(const name, s0: string; lo, hi: Integer): Integer;
 var
   i: Integer;
   digits: Boolean;
+  s: string;
 begin
+  s := Trim(s0);   { "  123", as macOS's wc -c prints a size }
   { decimal digits only (TryStrToInt also takes $4, 0x4 and spaces) }
   digits := (s <> '') and (Length(s) <= 9);
   for i := 1 to Length(s) do
     if not (s[i] in ['0'..'9']) and not ((i = 1) and (s[i] = '-') and (Length(s) > 1)) then
       digits := False;
   if not digits or not TryStrToInt(s, Result) or (Result < lo) or (Result > hi) then
-    UsageError(Format('%s takes a number %d..%d, not "%s"', [name, lo, hi, s]));
+    UsageError(Format('%s takes a number %d..%d, not "%s"', [name, lo, hi, s0]));
 end;
 
 { --levels: numbers and ranges, 1,4,9 or 0-10 or 0-3,9 }
