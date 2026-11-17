@@ -8253,13 +8253,18 @@ begin
 end;
 
 function SylzBlockFormat(src: PByte; n: SizeInt): Integer;
+var
+  b: Byte;
 begin
   if n < HEADER_SIZE then
     Exit(0);
+  { one byte read into a variable: FPC compiles "src[3] and $40" as a
+    16-bit load, which reads src[4], past the end of a 4-byte block }
+  b := src[3];
   Result := 2;
-  if src[3] and $40 <> 0 then
+  if b and $40 <> 0 then
     Result := 4;
-  if src[3] and $80 <> 0 then
+  if b and $80 <> 0 then
     Inc(Result);
 end;
 
