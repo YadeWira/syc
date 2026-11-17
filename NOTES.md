@@ -69,6 +69,49 @@ Test data lives outside the repo, in `/mnt/IA_LAB/agentes/syc/`
 (`silesia/`, `silesia.tar`, `mixed/` + `mixed.tar` (the table's training
 mix), and `lzbench/` built from source).
 
+## The audit before 1.0.0, and the CLI's look (2026-11-17)
+
+Four independent reviews (archives, streams and encryption, the CLI and the
+file system, the sylz codec) each reproduced what they reported; 37 findings,
+all fixed or documented (wiki Usage). The ones that mattered:
+
+- **Temporary outputs followed symlinks.** `NAME.syc-partial` was opened with
+  `fmCreate`, which follows a symlink already there: `syc x`, `c` and `d`
+  could write through it outside `-o`, and the cleanup deleted a file syc had
+  not created. `CreateTemp` (sycblocks) creates exclusively (`O_EXCL`,
+  `CREATE_NEW`), numbered when the name is taken, and registers the file for
+  the signal cleanup (Ctrl-C, SIGTERM, SIGHUP; the console's Ctrl-C).
+- **Read errors were the end of the input.** FPC's `THandleStream.Read`
+  returns 0 on a failed read; `ReadFull` now reads with `FileRead` and raises.
+  `syc a` skips a file unreadable from the start and stops (archive unchanged)
+  when one fails halfway.
+- **Two `syc a` on one archive** corrupted it. A lock now: Linux an OFD lock
+  (`fcntl F_OFD_SETLK`, through libc: FPC's share modes already take `flock`
+  on the file, and a classic `fcntl` lock goes when any descriptor of the
+  file is closed), Windows `LockFileEx` far past the data; none on macOS.
+  libc's errno is read with `__errno_location` (`fpgeterrno` is the RTL's).
+- **An archive stored inside one, cut by an interrupted append,** ended with
+  a commit that the backward walk trusted: a commit is now taken only when a
+  version header and an index ending at it are where it points.
+- sylz: decoding into fewer than 64 bytes (dst nil from a plugin host) went
+  to the fast loops, whose limit wrapped; a 32-bit Huffman end check
+  overflowed past 256 MiB; the 32-bit plugin took blocks of 1 GiB it could not
+  decode.
+- `FormatTime` used today's UTC offset for every date; `localtime_r`'s
+  `tm_gmtoff` / `SystemTimeToTzSpecificLocalTime` now (FPC 3.2.2 has no
+  dated `GetLocalTimeOffset`).
+- Text writes run with `{$I-}`: a failed write to stdout set `InOutRes` and
+  every later write, stderr's included, was skipped; at exit stdout was
+  flushed first and stderr's buffer lost. `CheckOutput` and an explicit
+  `Flush(StdErr)`.
+
+The CLI: `✓ ⚠ ✗ → ·` and a `━` bar only where they show (a terminal, a UTF-8
+locale, TERM not linux/dumb; on Windows a console with escape sequences inside
+Windows Terminal or a terminal that names itself, since conhost's fonts lack
+the symbols); ASCII elsewhere, so logs look as before. Help is laid out in
+sections and wrapped to the terminal. Names reach a terminal escaped
+(`Printable`); pipes get the bytes.
+
 ## Memory and speed on modest hardware (2026-11-16)
 
 `bench/modest.sh SYC INPUT DIR WORK [RUNNER]`: c/d at every level (one

@@ -42,7 +42,9 @@ function WarnTag: string;
 { Symbols and separators. "Fancy" output (✓, →, ·) goes to a terminal
   that shows Unicode: on Unix a UTF-8 locale and a TERM other than linux
   or dumb, on Windows a console that takes escape sequences (Windows 10
-  and later). Elsewhere, and into pipes and files, plain ASCII. }
+  and later) inside Windows Terminal or a terminal that names itself
+  (TERM_PROGRAM, ConEmu). Elsewhere, and into pipes and files, plain
+  ASCII. }
 function Fancy(std: Integer): Boolean;
 { "→" or "->" }
 function Arrow(std: Integer): string;
@@ -313,7 +315,12 @@ begin
     term := GetEnvironmentVariable('TERM');
     fancyOn[std] := IsTerminal(std) and LocaleIsUtf8
       {$ifdef unix}and (term <> 'dumb') and (term <> 'linux'){$endif}
-      {$ifdef windows}and TerminalTakesColors(std){$endif};
+      {$ifdef windows}and TerminalTakesColors(std)
+      { the classic console's fonts (Consolas, Lucida Console) lack ✓ and
+        ⚠ and it has no font fallback: Windows Terminal, and terminals
+        that say what they are, do }
+      and ((GetEnvironmentVariable('WT_SESSION') <> '') or (GetEnvironmentVariable('TERM_PROGRAM') <> '')
+        or (GetEnvironmentVariable('ConEmuANSI') = 'ON')){$endif};
     fancyKnown[std] := True;
   end;
   Result := fancyOn[std];
