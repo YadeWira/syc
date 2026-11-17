@@ -265,12 +265,21 @@ begin
   end;
   GuardedFree(bad);
 
-  { truncated input: must be rejected }
-  if csize > 1 then
+  { truncated input: must be rejected; every cut of the first bytes (the
+    header and what follows it), then one at random }
+  for i := 0 to 9 do
   begin
-    cut := RandBelow(csize);
+    if i < 9 then
+      cut := i
+    else
+      cut := RandBelow(csize);
+    if cut >= csize then
+      Continue;
     bad := GuardedAlloc(cut);
     Move(comp.p^, bad.p^, cut);
+    if (cut < 4) and (SylzBlockFormat(bad.p, cut) <> 0)
+       or (cut >= 4) and (SylzBlockFormat(bad.p, cut) <> SylzBlockFormat(comp.p, csize)) then
+      Fail('SylzBlockFormat wrong on a cut block', n, level);
     if SylzDecompress(bad.p, cut, outp.p, n) = n then
       Fail('truncated input accepted', n, level);
     GuardedFree(bad);
@@ -290,6 +299,46 @@ begin
   GuardedFree(outp);
   GuardedFree(comp);
   GuardedFree(input);
+end;
+
+{ Blocks of 0 to 16 bytes, each against a guard page, with every value of
+  the header's top byte (its format bits) and a few fillings: the decoders
+  and SylzBlockFormat must not read past them. A 4-byte block once did:
+  FPC compiled "src[3] and $40" as a 16-bit load. }
+procedure ShortBlocks;
+const
+  FILLS = 4;
+var
+  len, top, fill, i, f: Integer;
+  g: TGuarded;
+begin
+  for len := 0 to 16 do
+    for top := 0 to 255 do
+      for fill := 0 to FILLS - 1 do
+      begin
+        g := GuardedAlloc(len);
+        for i := 0 to len - 1 do
+          case fill of
+            0: g.p[i] := 0;
+            1: g.p[i] := $FF;
+          else
+            g.p[i] := Byte(Rand);
+          end;
+        if len >= 4 then
+          g.p[3] := top
+        else if top > 0 then   { below 4 bytes the top byte is not there }
+        begin
+          GuardedFree(g);
+          Continue;
+        end;
+        f := SylzBlockFormat(g.p, len);
+        if (len < 4) and (f <> 0) or (len >= 4) and ((f < 2) or (f > 5)) then
+          Fail('SylzBlockFormat out of range', len, -1);
+        DecodeAll(g.p, len, 0);
+        DecodeAll(g.p, len, 64);
+        Inc(corrupt, 6);
+        GuardedFree(g);
+      end;
 end;
 
 { HufDecodeChunk, or HufDecodeChunk8 (format v5's chunks) with eight. }
@@ -391,6 +440,7 @@ begin
   for i := first to ParamCount do
     LoadSample(ParamStr(i));
   SylzCtxInit(fctx);
+  ShortBlocks;
   bmi2 := HufUseBmi2;
   k := 0;
   while k < iters do   { not a for: a 64-bit counter is not ordinal on 32-bit targets }

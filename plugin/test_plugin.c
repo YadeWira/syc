@@ -17,6 +17,9 @@
    - each codec reads the block formats it should and refuses the others:
      a v3 block (sylzec, sylz5 read it) and a v4 block with no tokens
      (sylz4, sylz5 read it)
+   - blocks of 0 to 16 bytes, with every value of the header's top byte,
+     placed flush against a page the process may not read: decompress
+     must not read past them (a 4-byte block once did)
    - several threads compress and decompress at the same time
 
    Build (Linux):  cc -O2 -pthread plugin/test_plugin.c -o out/test_plugin -ldl
@@ -34,6 +37,7 @@ typedef HANDLE thread_t;
 #else
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sys/mman.h>
 typedef pthread_t thread_t;
 #endif
 
@@ -87,6 +91,69 @@ static int guard_ok(const unsigned char* p)
 
 static unsigned rng = 12345;
 static unsigned rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
+
+/* n bytes ending exactly at a page with no access; *base and *total for
+   guarded_free. The page size is a multiple of every target's (Apple
+   arm64: 16 KiB). */
+#define GPAGE 16384
+static unsigned char* guarded(size_t n, void** base, size_t* total)
+{
+    size_t body = (n + GPAGE - 1) / GPAGE * GPAGE;
+    if (body == 0) body = GPAGE;
+    *total = body + GPAGE;
+#ifdef _WIN32
+    unsigned char* b = VirtualAlloc(NULL, *total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    DWORD old;
+    if (!b || !VirtualProtect(b + body, GPAGE, PAGE_NOACCESS, &old)) { printf("FAIL: VirtualAlloc\n"); exit(2); }
+#else
+    unsigned char* b = mmap(NULL, *total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (b == MAP_FAILED || mprotect(b + body, GPAGE, PROT_NONE) != 0) { perror("mmap"); exit(2); }
+#endif
+    *base = b;
+    return b + body - n;
+}
+
+static void guarded_free(void* base, size_t total)
+{
+#ifdef _WIN32
+    (void)total;
+    VirtualFree(base, 0, MEM_RELEASE);
+#else
+    munmap(base, total);
+#endif
+}
+
+/* blocks of 0..16 bytes against a guard page, every top byte, a few
+   fillings; into outputs of 0 and 64 bytes, also against a guard page.
+   A read past the block or a write past cap faults. Returns failures. */
+static int short_blocks(void)
+{
+    int bad = 0;
+    void *ob, *ib;
+    size_t ot, it;
+    for (size_t len = 0; len <= 16; len++)
+        for (int top = 0; top < 256; top++) {
+            if (len < 4 && top > 0) break;
+            for (int fill = 0; fill < 4; fill++) {
+                unsigned char* in = guarded(len, &ib, &it);
+                for (size_t i = 0; i < len; i++)
+                    in[i] = fill == 0 ? 0 : fill == 1 ? 0xFF : (unsigned char)rnd();
+                if (len >= 4) in[3] = (unsigned char)top;
+                for (size_t cap = 0; cap <= 64; cap += 64) {
+                    unsigned char* out = guarded(cap, &ob, &ot);
+                    long long r = C->decompress(in, len, out, cap, 0);
+                    if (r > (long long)cap) {
+                        printf("FAIL: a %u-byte block decoded to %lld bytes, cap %u\n",
+                               (unsigned)len, r, (unsigned)cap);
+                        bad++;
+                    }
+                    guarded_free(ob, ot);
+                }
+                guarded_free(ib, it);
+            }
+        }
+    return bad;
+}
 
 /* one file at one level, all checks; returns 0 on success */
 static int check_one(const unsigned char* src, size_t n, int level, int quiet_corrupt)
@@ -255,6 +322,9 @@ int main(int argc, char** argv)
 
     /* empty input */
     failures += check_one((const unsigned char*)"", 0, 1, 1);
+
+    failures += short_blocks();
+    printf("short blocks against a guard page: done\n");
 
     for (int i = 0; i < nfiles; i++)
         for (int level = C->min_level; level <= C->max_level; level++)
